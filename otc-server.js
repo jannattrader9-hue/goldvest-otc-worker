@@ -1,4 +1,4 @@
-// ============================================================
+ // ============================================================
 // otc-server.js — OTC + Forex Candle Generator Server
 // Render.com এ 24/7 চলবে।
 //
@@ -239,15 +239,24 @@ async function initForex(id) {
   }
   set(ref(db, `otc_status/${id}`), { enabled:true }).catch(()=>{});
 
-  // ── Historical candles ──────────────────────────────────
+  // ── Historical candles — duplicate check ────────────────
   console.log(`[${id}] Loading history...`);
   const history = await fetchForexHistory(tdSymbol, 200);
-  if (history.length > 0) {
-    for (const c of history) await saveCandle(id, c);
-    console.log(`[${id}] Written ${history.length} candles`);
+
+  // Firebase এ already কতটুকু আছে check করো
+  const lastSaved = await loadLastCandle(id);
+  const lastSavedTime = lastSaved?.time || 0;
+
+  // শুধু নতুন candles লেখো
+  const newCandles = history.filter(c => c.time > lastSavedTime);
+  if (newCandles.length > 0) {
+    for (const c of newCandles) await saveCandle(id, c);
+    console.log(`[${id}] Written ${newCandles.length} new candles (skipped ${history.length - newCandles.length} existing)`);
+  } else {
+    console.log(`[${id}] No new candles to write, Firebase up to date`);
   }
 
-  const lastClose = history.length > 0 ? history[history.length-1].close : 1.0;
+  const lastClose = history.length > 0 ? history[history.length-1].close : (lastSaved?.close || 1.0);
   _forexPrices[id] = lastClose;
 
   // ── Admin control listener ──────────────────────────────
@@ -504,4 +513,3 @@ setInterval(() => {
     .then(() => console.log('[keepalive] ping OK'))
     .catch(e => console.warn('[keepalive] ping failed:', e.message));
 }, 8 * 60 * 1000);
- 
