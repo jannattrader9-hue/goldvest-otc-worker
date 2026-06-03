@@ -217,156 +217,213 @@ async function tickOTC(id) {
 
 // ══════════════════════════════════════════════════════════
 // FOREX ENGINE
-// Strategy: Twelve Data REST API থেকে exact OHLC নেওয়া হয়
-//   - Historical: একবার 200 candle load
-//   - Live candle: প্রতি 10s এ current minute OHLC fetch
-//   - Closed candle: মিনিট শেষে automatically আসে (outputsize=2 তে)
-//   - কোনো self-build নেই — সব Twelve Data থেকে
+//
+// Architecture:
+//   WebSocket → real-time price tick (zero delay)
+//   Price tick → current minute candle build (OHLC)
+//   মিনিট শেষে → REST API থেকে confirmed OHLC save
+//   Admin control → live candle close price manipulate
 // ══════════════════════════════════════════════════════════
 
-const _forexCandleTimers = {};
+const _forexCandleTimers = {}; // per-symbol interval IDs
 
 async function initForex(id) {
   if (_activeMarkets.has(id)) return;
   const tdSymbol = FOREX_SYMBOL_MAP[id];
-  if (!tdSymbol) { console.warn(`[${id}] No TD symbol mapping`); return; }
+  if (!tdSymbol) { console.warn(`[${id}] No TD symbol`); return; }
 
   if (!isForexOpen()) {
     set(ref(db, `otc_status/${id}`), { enabled:false, reason:'market_closed' }).catch(()=>{});
-    console.log(`[${id}] Forex market closed`);
+    console.log(`[${id}] Market closed`);
     return;
   }
-
   set(ref(db, `otc_status/${id}`), { enabled:true }).catch(()=>{});
 
-  // Historical candles load করো
-  console.log(`[${id}] Loading Forex history...`);
+  // ── Historical candles ──────────────────────────────────
+  console.log(`[${id}] Loading history...`);
   const history = await fetchForexHistory(tdSymbol, 200);
   if (history.length > 0) {
     for (const c of history) await saveCandle(id, c);
-    console.log(`[${id}] Written ${history.length} historical candles`);
+    console.log(`[${id}] Written ${history.length} candles`);
   }
 
-  const lastClose = history.length > 0 ? history[history.length-1].close : 0;
+  const lastClose = history.length > 0 ? history[history.length-1].close : 1.0;
   _forexPrices[id] = lastClose;
 
-  // Admin control listener
+  // ── Admin control listener ──────────────────────────────
   _controls[id] = { mode:'auto', nextDirection:'auto' };
   onValue(ref(db, `otc_controls/${id}`), snap => {
     if (snap.exists()) _controls[id] = { ..._controls[id], ...snap.val() };
   });
 
+  // ── State ───────────────────────────────────────────────
+  const nowSec    = Math.floor(Date.now() / 1000);
+  const bucketSec = Math.floor(nowSec / 60) * 60;
   _states[id] = {
     type:          'forex',
     tdSymbol,
     price:         lastClose,
+    // Current minute live candle
+    liveOpen:      lastClose,
+    liveHigh:      lastClose,
+    liveLow:       lastClose,
+    liveClose:     lastClose,
+    liveBucket:    bucketSec,   // current minute start (UTC seconds)
     lastSavedTime: history.length > 0 ? history[history.length-1].time : 0,
   };
 
   _activeMarkets.add(id);
   console.log(`[${id}] Forex started @ ${lastClose}`);
 
-  // প্রতি 10s এ Twelve Data থেকে latest OHLC fetch করো
-  _forexCandleTimers[id] = setInterval(() => {
-    _fetchForexLatest(id, tdSymbol);
-  }, 10_000);
+  // ── WebSocket: real-time price ticks ───────────────────
+  _startForexWS(id, tdSymbol);
 
-  // সাথে সাথে একবার fetch করো
-  _fetchForexLatest(id, tdSymbol);
+  // ── প্রতি মিনিটে confirmed closed candle fetch ─────────
+  // মিনিটের boundary তে align করো + 5s extra (API delay)
+  const msToNextMin = (60 - (Date.now()/1000 % 60)) * 1000;
+  setTimeout(() => {
+    _saveClosedCandle(id, tdSymbol);
+    _forexCandleTimers[id] = setInterval(() => {
+      _saveClosedCandle(id, tdSymbol);
+    }, 60_000);
+  }, msToNextMin + 5000);
 }
 
-async function _fetchForexLatest(id, tdSymbol) {
+// ── WebSocket: real-time tick → live candle build ────────
+function _startForexWS(id, tdSymbol) {
+  let WS;
+  try { WS = require('ws'); } catch {
+    console.warn(`[${id}] ws not found, using polling fallback`);
+    _startForexPollFallback(id, tdSymbol);
+    return;
+  }
+
+  const ws = new WS(`wss://ws.twelvedata.com/v1/quotes/price?apikey=${TD_API_KEY}`);
+
+  ws.on('open', () => {
+    ws.send(JSON.stringify({ action:'subscribe', params:{ symbols: tdSymbol } }));
+    console.log(`[${id}] WS connected`);
+  });
+
+  ws.on('message', raw => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg.event === 'heartbeat' || msg.event === 'subscribe-status') return;
+      if (!msg.price || isNaN(parseFloat(msg.price))) return;
+      _onForexTick(id, parseFloat(msg.price));
+    } catch (_) {}
+  });
+
+  ws.on('close', () => {
+    console.warn(`[${id}] WS closed, reconnect 3s`);
+    delete _forexWS[id];
+    if (_activeMarkets.has(id)) {
+      setTimeout(() => _startForexWS(id, tdSymbol), 3000);
+    }
+  });
+
+  ws.on('error', e => console.error(`[${id}] WS error:`, e.message));
+  _forexWS[id] = ws;
+}
+
+// ── Fallback: REST polling প্রতি 5s (WebSocket না থাকলে) ──
+function _startForexPollFallback(id, tdSymbol) {
+  const intv = setInterval(async () => {
+    if (!_activeMarkets.has(id)) { clearInterval(intv); return; }
+    try {
+      const r = await fetch(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(tdSymbol)}&apikey=${TD_API_KEY}`);
+      const d = await r.json();
+      if (d.price) _onForexTick(id, parseFloat(d.price));
+    } catch (_) {}
+  }, 5000);
+  _forexCandleTimers[id + '_poll'] = intv;
+}
+
+// ── Price tick handler: live candle update ───────────────
+function _onForexTick(id, price) {
+  const state = _states[id];
+  if (!state) return;
+
+  const nowSec    = Math.floor(Date.now() / 1000);
+  const bucketSec = Math.floor(nowSec / 60) * 60;
+
+  // Admin control: price modify করো
+  const ctrl = _controls[id] || {};
+  let finalPrice = price;
+
+  if (ctrl.mode === 'manual') {
+    const dir = ctrl.nextDirection;
+    const v   = price * 0.00005;
+    if (dir === 'up')        finalPrice = price + v * (0.3 + Math.random()*0.4);
+    else if (dir === 'down') finalPrice = price - v * (0.3 + Math.random()*0.4);
+  }
+  // trade-based এ async handle হয় আলাদাভাবে
+
+  _forexPrices[id] = finalPrice;
+  state.price = finalPrice;
+
+  // নতুন মিনিট শুরু হয়েছে?
+  if (bucketSec !== state.liveBucket) {
+    // পুরনো live candle শেষ — পরিষ্কার করো
+    state.liveBucket = bucketSec;
+    state.liveOpen   = finalPrice;
+    state.liveHigh   = finalPrice;
+    state.liveLow    = finalPrice;
+    state.liveClose  = finalPrice;
+  } else {
+    // Same minute — update করো
+    if (finalPrice > state.liveHigh) state.liveHigh = finalPrice;
+    if (finalPrice < state.liveLow)  state.liveLow  = finalPrice;
+    state.liveClose = finalPrice;
+  }
+
+  // Firebase এ live candle লেখো
+  saveLiveCandle(id, {
+    time:       state.liveBucket,
+    open:       state.liveOpen,
+    high:       state.liveHigh,
+    low:        state.liveLow,
+    close:      state.liveClose,
+    nextCandle: (state.liveBucket + 60) * 1000,
+  });
+}
+
+// ── প্রতি মিনিটে closed candle REST থেকে নাও ────────────
+async function _saveClosedCandle(id, tdSymbol) {
   const state = _states[id];
   if (!state || state.type !== 'forex') return;
   if (!isForexOpen()) return;
 
   try {
-    // outputsize=2: index 0 = current forming candle, index 1 = just closed candle
     const url = `https://api.twelvedata.com/time_series`
       + `?symbol=${encodeURIComponent(tdSymbol)}`
-      + `&interval=1min`
-      + `&outputsize=2`
-      + `&timezone=UTC`
+      + `&interval=1min&outputsize=2&timezone=UTC`
       + `&apikey=${TD_API_KEY}`;
 
     const res  = await fetch(url);
     const data = await res.json();
+    if (data.status === 'error' || !Array.isArray(data.values) || data.values.length < 2) return;
 
-    if (data.status === 'error' || !Array.isArray(data.values) || data.values.length === 0) return;
-
-    const _parseCandle = (v) => {
-      const [d, t] = v.datetime.split(' ');
-      return {
-        time:  Math.floor(new Date(d + 'T' + t + 'Z').getTime() / 1000),
-        open:  parseFloat(v.open),
-        high:  parseFloat(v.high),
-        low:   parseFloat(v.low),
-        close: parseFloat(v.close),
-      };
+    // index 1 = just closed candle
+    const v = data.values[1];
+    const [d, t] = v.datetime.split(' ');
+    const candle = {
+      time:  Math.floor(new Date(d+'T'+t+'Z').getTime() / 1000),
+      open:  parseFloat(v.open),
+      high:  parseFloat(v.high),
+      low:   parseFloat(v.low),
+      close: parseFloat(v.close),
     };
 
-    // index 0 = current minute (forming) → live candle
-    const current = _parseCandle(data.values[0]);
+    if (candle.time <= state.lastSavedTime) return;
+    state.lastSavedTime = candle.time;
 
-    // Admin control apply করো live candle এ
-    const ctrl = _controls[id] || {};
-    let liveClose = current.close;
-
-    if (ctrl.mode === 'manual') {
-      const dir = ctrl.nextDirection;
-      const v   = current.close * 0.00008;
-      if (dir === 'up')        liveClose = current.close + v * (0.5 + Math.random()*0.5);
-      else if (dir === 'down') liveClose = current.close - v * (0.5 + Math.random()*0.5);
-    } else if (ctrl.mode === 'trade-based') {
-      try {
-        const statsSnap = await get(ref(db, `otc_trade_stats/${id}`));
-        const stats = statsSnap.exists() ? statsSnap.val() : {};
-        const upAmt  = parseFloat(stats.upAmount)  || 0;
-        const downAmt= parseFloat(stats.downAmount)|| 0;
-        const v = current.close * 0.00008;
-        if (upAmt > downAmt * 1.2)   liveClose = current.close - v*(0.5+Math.random()*0.5);
-        else if (downAmt > upAmt*1.2) liveClose = current.close + v*(0.5+Math.random()*0.5);
-      } catch(_) {}
-    }
-
-    const liveCandle = {
-      time:       current.time,
-      open:       current.open,
-      high:       Math.max(current.high, liveClose),
-      low:        Math.min(current.low,  liveClose),
-      close:      liveClose,
-      nextCandle: (current.time + 60) * 1000,
-    };
-
-    _forexPrices[id] = liveClose;
-    state.price = liveClose;
-
-    // Firebase এ live candle লেখো
-    saveLiveCandle(id, liveCandle);
-
-    // index 1 = just closed candle → save করো যদি নতুন হয়
-    if (data.values.length >= 2) {
-      const closed = _parseCandle(data.values[1]);
-      if (closed.time > state.lastSavedTime) {
-        state.lastSavedTime = closed.time;
-
-        // Admin control: manual/trade-based এ closed candle manipulate করো
-        let savedCandle = { ...closed };
-        if (ctrl.mode === 'manual' || ctrl.mode === 'trade-based') {
-          // Live candle এর close দিয়ে closed candle adjust করো
-          savedCandle.close = liveClose;
-          if (liveClose > savedCandle.high) savedCandle.high = liveClose;
-          if (liveClose < savedCandle.low)  savedCandle.low  = liveClose;
-        }
-
-        await saveCandle(id, savedCandle);
-        set(ref(db, `otc_candles/${id}/live`), null).catch(()=>{});
-        console.log(`[${id}] candle saved: close=${savedCandle.close.toFixed(5)}`);
-      }
-    }
+    await saveCandle(id, candle);
+    set(ref(db, `otc_candles/${id}/live`), null).catch(()=>{});
+    console.log(`[${id}] closed candle: ${candle.close.toFixed(5)} @ ${new Date(candle.time*1000).toISOString()}`);
 
   } catch (e) {
-    console.warn(`[${id}] fetch error:`, e.message);
+    console.warn(`[${id}] closed candle error:`, e.message);
   }
 }
 
@@ -447,3 +504,4 @@ setInterval(() => {
     .then(() => console.log('[keepalive] ping OK'))
     .catch(e => console.warn('[keepalive] ping failed:', e.message));
 }, 8 * 60 * 1000);
+ 
