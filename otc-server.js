@@ -180,17 +180,10 @@ function _startSharedTdWS() {
 
   _tdWS.on('open', () => {
     _tdReady = true;
-    // Active Forex pair গুলো subscribe করো
-    const symbols = [..._activeMarkets]
-      .filter(id => _states[id]?.type === 'forex' && TD_MAP[id])
-      .map(id => TD_MAP[id]);
-
-    if (symbols.length > 0) {
-      _tdWS.send(JSON.stringify({ action:'subscribe', params:{ symbols: symbols.join(',') } }));
-      console.log(`[TD-WS] Connected & subscribed: ${symbols.join(', ')}`);
-    } else {
-      console.log('[TD-WS] Connected (no active forex pairs yet)');
-    }
+    // সব TD_MAP pair subscribe করো — active হোক বা না হোক
+    const allSymbols = Object.values(TD_MAP).join(',');
+    _tdWS.send(JSON.stringify({ action:'subscribe', params:{ symbols: allSymbols } }));
+    console.log(`[TD-WS] Connected & subscribed: ${allSymbols}`);
   });
 
   _tdWS.on('message', raw => {
@@ -277,11 +270,12 @@ async function initForex(id) {
   _activeMarkets.add(id);
   console.log(`[${id}] Forex started @ ${lastClose}`);
 
-  // Shared WS শুরু করো / নতুন symbol subscribe করো
-  if (_tdReady && _tdWS) {
+  // WS open থাকলে সাথে সাথে subscribe, না হলে start করো
+  if (_tdWS && _tdWS.readyState === 1 && _tdReady) {
     _tdWS.send(JSON.stringify({ action:'subscribe', params:{ symbols: TD_MAP[id] } }));
     console.log(`[${id}] Subscribed to TD-WS`);
   } else {
+    // WS start করো — open হলে সব active forex pair subscribe হবে
     _startSharedTdWS();
   }
 }
