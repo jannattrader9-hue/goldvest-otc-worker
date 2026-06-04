@@ -1,4 +1,4 @@
- // ============================================================
+// ============================================================
 // otc-server.js — OTC + Forex Candle Generator Server
 // Render.com এ 24/7 চলবে।
 //
@@ -332,109 +332,139 @@ async function initForex(id) {
   _activeMarkets.add(id);
   console.log(`[${id}] Forex started @ ${lastClose}`);
 
-  // ── WebSocket: price শুধু cache করো, Firebase write না ──
+  // ── Shared WebSocket এ subscribe করো ───────────────────
   if (isFinnhub) {
-    _startFinnhubWS(id, fhSymbol);
+    _ensureFhWS(); // shared Finnhub WS — একটাই connection
   } else {
-    _startForexWS(id, tdSymbol);
+    _ensureTdWS(); // shared TD WS — একটাই connection
+    // নতুন pair টা subscribe করো যদি WS already open থাকে
+    if (_tdWS && _tdReady && tdSymbol) {
+      _tdWS.send(JSON.stringify({ action:'subscribe', params:{ symbols: tdSymbol } }));
+    }
   }
 }
 
-function _startForexWS(id, tdSymbol) {
+// ══════════════════════════════════════════════════════════
+// SHARED WebSocket CONNECTIONS
+// একটাই TD connection + একটাই Finnhub connection
+// সব pair একই connection এ subscribe করা হয়
+// ══════════════════════════════════════════════════════════
+
+let _tdWS       = null; // shared Twelve Data WS
+let _fhWS       = null; // shared Finnhub WS
+let _tdReady    = false;
+let _fhReady    = false;
+
+// Twelve Data shared WS শুরু করো
+function _ensureTdWS() {
+  if (_tdWS && (_tdWS.readyState === 0 || _tdWS.readyState === 1)) return;
+
   let WS;
-  try { WS = require('ws'); } catch {
-    console.warn(`[${id}] ws not found, polling fallback`);
-    _startForexPollFallback(id, tdSymbol);
-    return;
-  }
+  try { WS = require('ws'); } catch { return; }
 
-  const ws = new WS(`wss://ws.twelvedata.com/v1/quotes/price?apikey=${TD_API_KEY}`);
+  _tdWS   = new WS(`wss://ws.twelvedata.com/v1/quotes/price?apikey=${TD_API_KEY}`);
+  _tdReady = false;
 
-  ws.on('open', () => {
-    ws.send(JSON.stringify({ action:'subscribe', params:{ symbols: tdSymbol } }));
-    console.log(`[${id}] WS connected`);
+  _tdWS.on('open', () => {
+    _tdReady = true;
+    console.log('[TD-WS] Connected');
+    // Active Forex pair সব subscribe করো
+    const tdPairs = [..._activeMarkets]
+      .filter(id => FOREX_SYMBOL_MAP[id])
+      .map(id => FOREX_SYMBOL_MAP[id]);
+    if (tdPairs.length > 0) {
+      _tdWS.send(JSON.stringify({ action:'subscribe', params:{ symbols: tdPairs.join(',') } }));
+      console.log('[TD-WS] Subscribed:', tdPairs.join(', '));
+    }
   });
 
-  ws.on('message', raw => {
+  _tdWS.on('message', raw => {
     try {
       const msg = JSON.parse(raw.toString());
       if (msg.event === 'heartbeat' || msg.event === 'subscribe-status') return;
       if (!msg.price || isNaN(parseFloat(msg.price))) return;
-      // শুধু cache করো — Firebase write করো না
-      _forexPrices[id] = parseFloat(msg.price);
+      // symbol → id map
+      const id = Object.keys(FOREX_SYMBOL_MAP).find(k => FOREX_SYMBOL_MAP[k] === msg.symbol);
+      if (id && _activeMarkets.has(id)) _forexPrices[id] = parseFloat(msg.price);
     } catch (_) {}
   });
 
-  ws.on('close', () => {
-    console.warn(`[${id}] WS closed, reconnect 3s`);
-    delete _forexWS[id];
-    if (_activeMarkets.has(id)) setTimeout(() => _startForexWS(id, tdSymbol), 3000);
+  _tdWS.on('close', () => {
+    _tdReady = false;
+    console.warn('[TD-WS] Closed, reconnect 5s');
+    setTimeout(_ensureTdWS, 5000);
   });
 
-  ws.on('error', e => console.error(`[${id}] WS error:`, e.message));
-  _forexWS[id] = ws;
+  _tdWS.on('error', e => console.error('[TD-WS] Error:', e.message));
 }
 
-// ── Finnhub WebSocket ────────────────────────────────────
-function _startFinnhubWS(id, fhSymbol) {
+// Finnhub shared WS শুরু করো
+function _ensureFhWS() {
+  if (_fhWS && (_fhWS.readyState === 0 || _fhWS.readyState === 1)) return;
+
   let WS;
-  try { WS = require('ws'); } catch {
-    _startFinnhubPollFallback(id, fhSymbol);
-    return;
-  }
+  try { WS = require('ws'); } catch { return; }
 
-  const ws = new WS(`wss://ws.finnhub.io?token=${FINNHUB_API_KEY}`);
+  _fhWS   = new WS(`wss://ws.finnhub.io?token=${FINNHUB_API_KEY}`);
+  _fhReady = false;
 
-  ws.on('open', () => {
-    ws.send(JSON.stringify({ type:'subscribe', symbol: fhSymbol }));
-    console.log(`[${id}] Finnhub WS connected: ${fhSymbol}`);
+  _fhWS.on('open', () => {
+    _fhReady = true;
+    console.log('[FH-WS] Connected');
+    // Active Finnhub pair সব subscribe করো
+    [..._activeMarkets]
+      .filter(id => FINNHUB_SYMBOL_MAP[id])
+      .forEach(id => {
+        _fhWS.send(JSON.stringify({ type:'subscribe', symbol: FINNHUB_SYMBOL_MAP[id] }));
+      });
+    console.log('[FH-WS] Subscribed Finnhub pairs');
   });
 
-  ws.on('message', raw => {
+  _fhWS.on('message', raw => {
     try {
       const msg = JSON.parse(raw.toString());
       if (msg.type !== 'trade' || !Array.isArray(msg.data)) return;
-      // Latest trade price নাও
-      const latest = msg.data[msg.data.length - 1];
-      if (latest?.p) _forexPrices[id] = parseFloat(latest.p);
+      msg.data.forEach(trade => {
+        // Finnhub symbol → id map
+        const id = Object.keys(FINNHUB_SYMBOL_MAP).find(k => FINNHUB_SYMBOL_MAP[k] === trade.s);
+        if (id && _activeMarkets.has(id) && trade.p) {
+          _forexPrices[id] = parseFloat(trade.p);
+        }
+      });
     } catch (_) {}
   });
 
-  ws.on('close', () => {
-    console.warn(`[${id}] Finnhub WS closed, reconnect 3s`);
-    delete _forexWS[id];
-    if (_activeMarkets.has(id)) setTimeout(() => _startFinnhubWS(id, fhSymbol), 3000);
+  _fhWS.on('close', () => {
+    _fhReady = false;
+    console.warn('[FH-WS] Closed, reconnect 5s');
+    setTimeout(_ensureFhWS, 5000);
   });
 
-  ws.on('error', e => console.error(`[${id}] Finnhub WS error:`, e.message));
-  _forexWS[id] = ws;
+  _fhWS.on('error', e => console.error('[FH-WS] Error:', e.message));
 }
 
-// Finnhub REST polling fallback
-function _startFinnhubPollFallback(id, fhSymbol) {
-  const intv = setInterval(async () => {
+// Forex polling fallback (ws package না থাকলে)
+function _startForexPollFallback(id) {
+  const isFh  = _isFinnhub(id);
+  const sym   = isFh ? _getFhSymbol(id) : _getTdSymbol(id);
+  const intv  = setInterval(async () => {
     if (!_activeMarkets.has(id)) { clearInterval(intv); return; }
     try {
-      const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(fhSymbol)}&token=${FINNHUB_API_KEY}`);
-      const d = await r.json();
-      if (d.c) _forexPrices[id] = parseFloat(d.c);
+      let price = 0;
+      if (isFh) {
+        const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(sym)}&token=${FINNHUB_API_KEY}`);
+        const d = await r.json();
+        price = parseFloat(d.c) || 0;
+      } else {
+        const r = await fetch(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(sym)}&apikey=${TD_API_KEY}`);
+        const d = await r.json();
+        price = parseFloat(d.price) || 0;
+      }
+      if (price > 0) _forexPrices[id] = price;
     } catch (_) {}
-  }, 5000);
+  }, 10_000);
 }
 
-function _startForexPollFallback(id, tdSymbol) {
-  const intv = setInterval(async () => {
-    if (!_activeMarkets.has(id)) { clearInterval(intv); return; }
-    try {
-      const r = await fetch(`https://api.twelvedata.com/price?symbol=${encodeURIComponent(tdSymbol)}&apikey=${TD_API_KEY}`);
-      const d = await r.json();
-      if (d.price) _forexPrices[id] = parseFloat(d.price);
-    } catch (_) {}
-  }, 5000);
-}
-
-// ── tickForex: OTC engine এর মতো প্রতি 500ms ────────────
-// main loop এ call হয়: setInterval(() => tick(id), 500)
 async function tickForex(id) {
   const state = _states[id];
   if (!state || state.type !== 'forex') return;
