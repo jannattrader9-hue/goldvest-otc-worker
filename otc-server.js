@@ -32,16 +32,31 @@ const app        = initializeApp(firebaseConfig);
 const db         = getDatabase(app);
 const firestore  = getFirestore(app);
 
-const TICK_MS    = 500;
-const CANDLE_MS  = 60 * 1000;
-const TD_API_KEY = '392fa09f669c4cd7843f958e0fbbca36';
+const TICK_MS         = 500;
+const CANDLE_MS       = 60 * 1000;
+const TD_API_KEY      = '392fa09f669c4cd7843f958e0fbbca36';
+const FINNHUB_API_KEY = 'd7v1ippr01qp7l70m80gd7v1ippr01qp7l70m810';
 
+// Twelve Data — ৪টা pair
 const FOREX_SYMBOL_MAP = {
-  'EURUSD': 'EUR/USD', 'GBPUSD': 'GBP/USD',
-  'EURGBP': 'EUR/GBP', 'EURJPY': 'EUR/JPY',
-  'USDJPY': 'USD/JPY', 'EURNZD': 'EUR/NZD',
-  'NZDUSD': 'NZD/USD', 'NZDJPY': 'NZD/JPY',
+  'EURUSD': 'EUR/USD',
+  'GBPUSD': 'GBP/USD',
+  'EURGBP': 'EUR/GBP',
+  'EURJPY': 'EUR/JPY',
 };
+
+// Finnhub — বাকি ৪টা pair
+const FINNHUB_SYMBOL_MAP = {
+  'USDJPY': 'OANDA:USD_JPY',
+  'EURNZD': 'OANDA:EUR_NZD',
+  'NZDUSD': 'OANDA:NZD_USD',
+  'NZDJPY': 'OANDA:NZD_JPY',
+};
+
+// Helper: কোন API use করবে
+function _isFinnhub(id) { return !!FINNHUB_SYMBOL_MAP[id]; }
+function _getTdSymbol(id) { return FOREX_SYMBOL_MAP[id] || null; }
+function _getFhSymbol(id) { return FINNHUB_SYMBOL_MAP[id] || null; }
 
 function isForexOpen() {
   const now  = new Date();
@@ -92,7 +107,6 @@ async function fetchForexHistory(tdSymbol, size = 200) {
       .slice()
       .reverse()
       .map(v => {
-        // "2026-06-04 01:57:00" → UTC timestamp
         const [datePart, timePart] = v.datetime.split(' ');
         const t = Math.floor(new Date(datePart + 'T' + timePart + 'Z').getTime() / 1000);
         return {
@@ -107,6 +121,33 @@ async function fetchForexHistory(tdSymbol, size = 200) {
 
   } catch (e) {
     console.error(`[fetchForexHistory] Exception: ${e.message}`);
+    return [];
+  }
+}
+
+// Finnhub REST থেকে historical candles নাও
+async function fetchFinnhubHistory(finnhubSymbol, size = 200) {
+  try {
+    const toTs   = Math.floor(Date.now() / 1000);
+    const fromTs = toTs - (size * 60); // size minutes ago
+    const url = `https://finnhub.io/api/v1/forex/candle?symbol=${encodeURIComponent(finnhubSymbol)}&resolution=1&from=${fromTs}&to=${toTs}&token=${FINNHUB_API_KEY}`;
+    const d   = await (await fetch(url)).json();
+
+    if (d.s === 'no_data' || !Array.isArray(d.t)) {
+      console.warn(`[fetchFinnhubHistory] No data for ${finnhubSymbol}`);
+      return [];
+    }
+
+    return d.t.map((t, i) => ({
+      time:  t,
+      open:  d.o[i],
+      high:  d.h[i],
+      low:   d.l[i],
+      close: d.c[i],
+    })).filter(c => !isNaN(c.open) && c.time > 0);
+
+  } catch (e) {
+    console.error(`[fetchFinnhubHistory] Exception: ${e.message}`);
     return [];
   }
 }
@@ -228,8 +269,13 @@ const _forexCandleTimers = {};
 
 async function initForex(id) {
   if (_activeMarkets.has(id)) return;
-  const tdSymbol = FOREX_SYMBOL_MAP[id];
-  if (!tdSymbol) { console.warn(`[${id}] No TD symbol`); return; }
+
+  // Twelve Data নাকি Finnhub?
+  const isFinnhub = _isFinnhub(id);
+  const tdSymbol  = _getTdSymbol(id);
+  const fhSymbol  = _getFhSymbol(id);
+
+  if (!tdSymbol && !fhSymbol) { console.warn(`[${id}] No symbol mapping`); return; }
 
   if (!isForexOpen()) {
     set(ref(db, `otc_status/${id}`), { enabled:false, reason:'market_closed' }).catch(()=>{});
@@ -239,8 +285,11 @@ async function initForex(id) {
   set(ref(db, `otc_status/${id}`), { enabled:true }).catch(()=>{});
 
   // ── Historical candles — duplicate check ────────────────
-  console.log(`[${id}] Loading history...`);
-  const history    = await fetchForexHistory(tdSymbol, 200);
+  console.log(`[${id}] Loading history (${isFinnhub ? 'Finnhub' : 'TwelveData'})...`);
+  const history    = isFinnhub
+    ? await fetchFinnhubHistory(fhSymbol, 200)
+    : await fetchForexHistory(tdSymbol, 200);
+
   const lastSaved  = await loadLastCandle(id);
   const lastSavedTime = lastSaved?.time || 0;
   const newCandles = history.filter(c => c.time > lastSavedTime);
@@ -284,7 +333,11 @@ async function initForex(id) {
   console.log(`[${id}] Forex started @ ${lastClose}`);
 
   // ── WebSocket: price শুধু cache করো, Firebase write না ──
-  _startForexWS(id, tdSymbol);
+  if (isFinnhub) {
+    _startFinnhubWS(id, fhSymbol);
+  } else {
+    _startForexWS(id, tdSymbol);
+  }
 }
 
 function _startForexWS(id, tdSymbol) {
@@ -320,6 +373,53 @@ function _startForexWS(id, tdSymbol) {
 
   ws.on('error', e => console.error(`[${id}] WS error:`, e.message));
   _forexWS[id] = ws;
+}
+
+// ── Finnhub WebSocket ────────────────────────────────────
+function _startFinnhubWS(id, fhSymbol) {
+  let WS;
+  try { WS = require('ws'); } catch {
+    _startFinnhubPollFallback(id, fhSymbol);
+    return;
+  }
+
+  const ws = new WS(`wss://ws.finnhub.io?token=${FINNHUB_API_KEY}`);
+
+  ws.on('open', () => {
+    ws.send(JSON.stringify({ type:'subscribe', symbol: fhSymbol }));
+    console.log(`[${id}] Finnhub WS connected: ${fhSymbol}`);
+  });
+
+  ws.on('message', raw => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg.type !== 'trade' || !Array.isArray(msg.data)) return;
+      // Latest trade price নাও
+      const latest = msg.data[msg.data.length - 1];
+      if (latest?.p) _forexPrices[id] = parseFloat(latest.p);
+    } catch (_) {}
+  });
+
+  ws.on('close', () => {
+    console.warn(`[${id}] Finnhub WS closed, reconnect 3s`);
+    delete _forexWS[id];
+    if (_activeMarkets.has(id)) setTimeout(() => _startFinnhubWS(id, fhSymbol), 3000);
+  });
+
+  ws.on('error', e => console.error(`[${id}] Finnhub WS error:`, e.message));
+  _forexWS[id] = ws;
+}
+
+// Finnhub REST polling fallback
+function _startFinnhubPollFallback(id, fhSymbol) {
+  const intv = setInterval(async () => {
+    if (!_activeMarkets.has(id)) { clearInterval(intv); return; }
+    try {
+      const r = await fetch(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(fhSymbol)}&token=${FINNHUB_API_KEY}`);
+      const d = await r.json();
+      if (d.c) _forexPrices[id] = parseFloat(d.c);
+    } catch (_) {}
+  }, 5000);
 }
 
 function _startForexPollFallback(id, tdSymbol) {
