@@ -1,4 +1,4 @@
-// ============================================================
+ // ============================================================
 // otc-server.js — OTC + Forex Candle Generator Server
 // Render.com এ 24/7 চলবে।
 //
@@ -46,11 +46,12 @@ const FOREX_SYMBOL_MAP = {
 };
 
 // Finnhub — বাকি ৪টা pair
+// Finnhub Forex format: IC MARKETS বা FXCM provider
 const FINNHUB_SYMBOL_MAP = {
-  'USDJPY': 'OANDA:USD_JPY',
-  'EURNZD': 'OANDA:EUR_NZD',
-  'NZDUSD': 'OANDA:NZD_USD',
-  'NZDJPY': 'OANDA:NZD_JPY',
+  'USDJPY': 'FXCM:USD/JPY',
+  'EURNZD': 'FXCM:EUR/NZD',
+  'NZDUSD': 'FXCM:NZD/USD',
+  'NZDJPY': 'FXCM:NZD/JPY',
 };
 
 // Helper: কোন API use করবে
@@ -129,21 +130,22 @@ async function fetchForexHistory(tdSymbol, size = 200) {
 async function fetchFinnhubHistory(finnhubSymbol, size = 200) {
   try {
     const toTs   = Math.floor(Date.now() / 1000);
-    const fromTs = toTs - (size * 60); // size minutes ago
+    const fromTs = toTs - (size * 60 * 2); // 2x buffer
+    // Finnhub forex candle endpoint
     const url = `https://finnhub.io/api/v1/forex/candle?symbol=${encodeURIComponent(finnhubSymbol)}&resolution=1&from=${fromTs}&to=${toTs}&token=${FINNHUB_API_KEY}`;
     const d   = await (await fetch(url)).json();
 
-    if (d.s === 'no_data' || !Array.isArray(d.t)) {
+    if (d.s === 'no_data' || !Array.isArray(d.t) || d.t.length === 0) {
       console.warn(`[fetchFinnhubHistory] No data for ${finnhubSymbol}`);
       return [];
     }
 
     return d.t.map((t, i) => ({
       time:  t,
-      open:  d.o[i],
-      high:  d.h[i],
-      low:   d.l[i],
-      close: d.c[i],
+      open:  parseFloat(d.o[i]),
+      high:  parseFloat(d.h[i]),
+      low:   parseFloat(d.l[i]),
+      close: parseFloat(d.c[i]),
     })).filter(c => !isNaN(c.open) && c.time > 0);
 
   } catch (e) {
@@ -389,8 +391,18 @@ function _ensureTdWS() {
     } catch (_) {}
   });
 
+  let _tdReconnectCount = 0;
   _tdWS.on('close', () => {
     _tdReady = false;
+    _tdReconnectCount++;
+    if (_tdReconnectCount > 5) {
+      // বারবার fail করলে REST polling এ fall back করো
+      console.warn('[TD-WS] Too many reconnects, switching to REST polling');
+      [..._activeMarkets]
+        .filter(id => FOREX_SYMBOL_MAP[id])
+        .forEach(id => _startForexPollFallback(id));
+      return;
+    }
     console.warn('[TD-WS] Closed, reconnect 5s');
     setTimeout(_ensureTdWS, 5000);
   });
@@ -434,8 +446,17 @@ function _ensureFhWS() {
     } catch (_) {}
   });
 
+  let _fhReconnectCount = 0;
   _fhWS.on('close', () => {
     _fhReady = false;
+    _fhReconnectCount++;
+    if (_fhReconnectCount > 5) {
+      console.warn('[FH-WS] Too many reconnects, switching to REST polling');
+      [..._activeMarkets]
+        .filter(id => FINNHUB_SYMBOL_MAP[id])
+        .forEach(id => _startForexPollFallback(id));
+      return;
+    }
     console.warn('[FH-WS] Closed, reconnect 5s');
     setTimeout(_ensureFhWS, 5000);
   });
