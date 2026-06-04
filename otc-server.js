@@ -1,4 +1,4 @@
-// ============================================================
+ // ============================================================
 // otc-server.js — OTC + Forex Candle Generator
 // OTC → Synthetic (Binance base)
 // Forex → Twelve Data WebSocket (EUR/USD, GBP/USD only)
@@ -29,7 +29,7 @@ const TD_KEY    = '392fa09f669c4cd7843f958e0fbbca36';
 // Twelve Data symbol map
 const TD_MAP = {
   'EURUSD': 'EUR/USD',
-  'EURJPY': 'EUR/JPY',
+  'GBPUSD': 'GBP/USD',
 };
 
 function isForexOpen() {
