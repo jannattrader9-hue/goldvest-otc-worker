@@ -29,7 +29,7 @@ const TD_KEY    = '392fa09f669c4cd7843f958e0fbbca36';
 // Twelve Data symbol map
 const TD_MAP = {
   'EURUSD': 'EUR/USD',
-  'GBPUSD': 'GBP/USD',
+  'EURJPY': 'EUR/JPY',
 };
 
 function isForexOpen() {
