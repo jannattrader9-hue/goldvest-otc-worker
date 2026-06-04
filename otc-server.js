@@ -1,21 +1,11 @@
- // ============================================================
-// otc-server.js — OTC + Forex Candle Generator Server
-// Render.com এ 24/7 চলবে।
-//
-// OTC markets  → Binance base price → synthetic candle
-// Forex markets → Twelve Data real price + Admin control
-//
-// Admin control (Firebase RTDB otc_controls/{symbol}):
-//   mode: 'auto' | 'manual' | 'trade-based'
-//   nextDirection: 'up' | 'down' | 'auto'
-//   forexNudge: number (-1 to +1) — auto mode এ price nudge
+// ============================================================
+// otc-server.js — OTC + Forex Candle Generator
+// OTC → Synthetic (Binance base)
+// Forex → Twelve Data WebSocket (EUR/USD, GBP/USD only)
 // ============================================================
 
 const { initializeApp }  = require('firebase/app');
-const {
-  getDatabase, ref, push, set, get, onValue,
-  query, orderByKey, limitToLast
-} = require('firebase/database');
+const { getDatabase, ref, push, set, get, onValue, query, orderByKey, limitToLast } = require('firebase/database');
 const { getFirestore, collection, onSnapshot } = require('firebase/firestore');
 
 const firebaseConfig = {
@@ -28,35 +18,25 @@ const firebaseConfig = {
   databaseURL:       "https://goldvest-cf73d-default-rtdb.firebaseio.com"
 };
 
-const app        = initializeApp(firebaseConfig);
-const db         = getDatabase(app);
-const firestore  = getFirestore(app);
+const app       = initializeApp(firebaseConfig);
+const db        = getDatabase(app);
+const firestore = getFirestore(app);
 
-const TICK_MS         = 500;
-const CANDLE_MS       = 60 * 1000;
-const TD_API_KEY      = '392fa09f669c4cd7843f958e0fbbca36';
-const FINNHUB_API_KEY = 'd7v1ippr01qp7l70m80gd7v1ippr01qp7l70m810';
+const TICK_MS   = 500;
+const CANDLE_MS = 60 * 1000;
+const TD_KEY    = '392fa09f669c4cd7843f958e0fbbca36';
 
-// সব ৮টা Forex pair
-const FOREX_PAIRS = [
-  'EURUSD','GBPUSD','EURGBP','EURJPY',
-  'USDJPY','EURNZD','NZDUSD','NZDJPY'
-];
-
-// Pair থেকে base/quote বের করো
-function _parseForexId(id) {
-  const base  = id.slice(0, 3);
-  const quote = id.slice(3, 6);
-  return { base, quote };
-}
+// Twelve Data symbol map
+const TD_MAP = {
+  'EURUSD': 'EUR/USD',
+  'GBPUSD': 'GBP/USD',
+};
 
 function isForexOpen() {
-  const now  = new Date();
-  const day  = now.getUTCDay();
-  const hour = now.getUTCHours();
+  const d = new Date(), day = d.getUTCDay(), h = d.getUTCHours();
   if (day === 6) return false;
-  if (day === 0 && hour < 21) return false;
-  if (day === 5 && hour >= 22) return false;
+  if (day === 0 && h < 21) return false;
+  if (day === 5 && h >= 22) return false;
   return true;
 }
 
@@ -64,9 +44,8 @@ const _states        = {};
 const _controls      = {};
 const _activeMarkets = new Set();
 const _forexPrices   = {};
-const _forexWS       = {};
 
-// ── Fetch helpers ─────────────────────────────────────────
+// ── Firebase helpers ──────────────────────────────────────
 async function fetchBinancePrice(symbol) {
   try {
     const r = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`);
@@ -74,72 +53,6 @@ async function fetchBinancePrice(symbol) {
   } catch { return 0; }
 }
 
-// ── Twelve Data symbol map (historical candles এর জন্য) ──
-const TD_SYMBOL_MAP = {
-  'EURUSD':'EUR/USD','GBPUSD':'GBP/USD',
-  'EURGBP':'EUR/GBP','EURJPY':'EUR/JPY',
-  'USDJPY':'USD/JPY','EURNZD':'EUR/NZD',
-  'NZDUSD':'NZD/USD','NZDJPY':'NZD/JPY',
-};
-
-// ── ExchangeRate-API: সব pair এর price একটাই call এ ────
-let _ratesCache     = {};
-let _ratesLastFetch = 0;
-
-async function _fetchAllRates() {
-  const now = Date.now();
-  if (now - _ratesLastFetch < 30_000) return; // 30s cache
-  try {
-    const r = await fetch('https://open.er-api.com/v6/latest/EUR');
-    const d = await r.json();
-    if (d.result === 'success' && d.rates) {
-      _ratesCache     = d.rates;
-      _ratesLastFetch = now;
-      console.log('[ExchangeRate] Rates updated');
-    }
-  } catch (e) { console.warn('[ExchangeRate] fetch failed:', e.message); }
-}
-
-async function getForexPairPrice(id) {
-  await _fetchAllRates();
-  if (!Object.keys(_ratesCache).length) return 0;
-  const base  = id.slice(0, 3).toUpperCase();
-  const quote = id.slice(3, 6).toUpperCase();
-  try {
-    if (base === 'EUR') return _ratesCache[quote] || 0;
-    const eurBase  = _ratesCache[base]  || 0;
-    const eurQuote = _ratesCache[quote] || 0;
-    if (!eurBase || !eurQuote) return 0;
-    return parseFloat((eurQuote / eurBase).toFixed(6));
-  } catch (_) { return 0; }
-}
-
-// প্রতি মিনিটে rates update করো
-setInterval(_fetchAllRates, 60_000);
-
-// ── Twelve Data historical candles (শুধু initial load) ──
-async function fetchForexHistory(id, size = 200) {
-  const tdSymbol = TD_SYMBOL_MAP[id];
-  if (!tdSymbol) return [];
-  try {
-    const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(tdSymbol)}&interval=1min&outputsize=${size}&timezone=UTC&apikey=${TD_API_KEY}`;
-    const d   = await (await fetch(url)).json();
-    if (d.status === 'error' || !Array.isArray(d.values) || !d.values.length) return [];
-    return d.values.slice().reverse().map(v => {
-      const [dp, tp] = v.datetime.split(' ');
-      return {
-        time:  Math.floor(new Date(dp+'T'+tp+'Z').getTime()/1000),
-        open:  parseFloat(v.open),
-        high:  parseFloat(v.high),
-        low:   parseFloat(v.low),
-        close: parseFloat(v.close),
-      };
-    }).filter(c => !isNaN(c.open) && c.time > 0);
-  } catch (e) { console.warn(`[TD History] ${id}:`, e.message); return []; }
-}
-
-
-// ── Firebase helpers ──────────────────────────────────────
 async function loadLastCandle(id) {
   try {
     const snap = await get(query(ref(db, `otc_candles/${id}/candles`), orderByKey(), limitToLast(1)));
@@ -160,7 +73,7 @@ function saveLiveCandle(id, candle) {
 }
 
 // ══════════════════════════════════════════════════════════
-// OTC ENGINE (Synthetic)
+// OTC ENGINE
 // ══════════════════════════════════════════════════════════
 function randomTrend() {
   const r = Math.random();
@@ -171,7 +84,7 @@ async function backfillOTC(id, lastTime, lastPrice) {
   const now = Math.floor(Date.now() / 1000);
   const missing = Math.min(Math.floor((Math.floor(now/60)*60 - lastTime)/60)-1, 480);
   if (missing <= 0) return lastPrice;
-  console.log(`[${id}] Backfilling ${missing} OTC candles...`);
+  console.log(`[${id}] Backfilling ${missing} candles...`);
   let price = lastPrice, trend = 0, steps = 0;
   for (let i = 0; i < missing; i++) {
     if (steps <= 0) { trend = randomTrend(); steps = 8 + Math.floor(Math.random()*12); }
@@ -201,7 +114,7 @@ async function initOTC(market) {
     if (!price || price <= 0) price = fixedStart || 1.0;
   }
 
-  _controls[id] = { mode:'auto', nextDirection:'auto', volatility:'medium', trendStrength:0.6, wickFactor:0.4, speedMultiplier:1.0 };
+  _controls[id] = { mode:'auto', nextDirection:'auto', volatility:'medium', trendStrength:0.6, speedMultiplier:1.0 };
   onValue(ref(db, `otc_controls/${id}`), snap => { if (snap.exists()) _controls[id] = { ..._controls[id], ...snap.val() }; });
 
   const now = Date.now(), start = Math.floor(now/CANDLE_MS)*CANDLE_MS;
@@ -245,29 +158,94 @@ async function tickOTC(id) {
 
 // ══════════════════════════════════════════════════════════
 // FOREX ENGINE
-//
-// Architecture (OTC engine এর মতো):
-//   WebSocket → price cache (কোনো Firebase write না)
-//   প্রতি 500ms → cached price দিয়ে candle update → Firebase
-//   মিনিট শেষে → candle save → নতুন candle শুরু
+// Twelve Data WebSocket → price cache → 500ms tick → candle
+// শুধু EUR/USD আর GBP/USD (free tier এ ২টা symbol OK)
 // ══════════════════════════════════════════════════════════
 
-const _forexCandleTimers = {};
+// Single shared WebSocket for all Forex pairs
+let _tdWS      = null;
+let _tdReady   = false;
+
+function _startSharedTdWS() {
+  if (_tdWS && (_tdWS.readyState === 0 || _tdWS.readyState === 1)) return;
+
+  let WS;
+  try { WS = require('ws'); } catch (e) {
+    console.warn('[TD-WS] ws package not found');
+    return;
+  }
+
+  _tdWS   = new WS(`wss://ws.twelvedata.com/v1/quotes/price?apikey=${TD_KEY}`);
+  _tdReady = false;
+
+  _tdWS.on('open', () => {
+    _tdReady = true;
+    // Active Forex pair গুলো subscribe করো
+    const symbols = [..._activeMarkets]
+      .filter(id => _states[id]?.type === 'forex' && TD_MAP[id])
+      .map(id => TD_MAP[id]);
+
+    if (symbols.length > 0) {
+      _tdWS.send(JSON.stringify({ action:'subscribe', params:{ symbols: symbols.join(',') } }));
+      console.log(`[TD-WS] Connected & subscribed: ${symbols.join(', ')}`);
+    } else {
+      console.log('[TD-WS] Connected (no active forex pairs yet)');
+    }
+  });
+
+  _tdWS.on('message', raw => {
+    try {
+      const msg = JSON.parse(raw.toString());
+      if (msg.event === 'heartbeat' || msg.event === 'subscribe-status') return;
+      if (!msg.price || isNaN(parseFloat(msg.price))) return;
+      // symbol → id
+      const id = Object.keys(TD_MAP).find(k => TD_MAP[k] === msg.symbol);
+      if (id) _forexPrices[id] = parseFloat(msg.price);
+    } catch (_) {}
+  });
+
+  _tdWS.on('close', () => {
+    _tdReady = false;
+    console.warn('[TD-WS] Closed, reconnect 5s');
+    _tdWS = null;
+    setTimeout(_startSharedTdWS, 5000);
+  });
+
+  _tdWS.on('error', e => console.error('[TD-WS] Error:', e.message));
+}
+
+async function fetchTdHistory(id) {
+  const sym = TD_MAP[id];
+  if (!sym) return [];
+  try {
+    const url = `https://api.twelvedata.com/time_series?symbol=${encodeURIComponent(sym)}&interval=1min&outputsize=200&timezone=UTC&apikey=${TD_KEY}`;
+    const d   = await (await fetch(url)).json();
+    if (d.status === 'error' || !Array.isArray(d.values) || !d.values.length) return [];
+    return d.values.slice().reverse().map(v => {
+      const [dp, tp] = v.datetime.split(' ');
+      return {
+        time:  Math.floor(new Date(dp+'T'+tp+'Z').getTime()/1000),
+        open:  parseFloat(v.open),  high: parseFloat(v.high),
+        low:   parseFloat(v.low),   close: parseFloat(v.close),
+      };
+    }).filter(c => !isNaN(c.open) && c.time > 0);
+  } catch (e) { console.warn(`[TD History] ${id}:`, e.message); return []; }
+}
 
 async function initForex(id) {
   if (_activeMarkets.has(id)) return;
-  if (!TD_SYMBOL_MAP[id]) { console.warn(`[${id}] No symbol mapping`); return; }
+  if (!TD_MAP[id]) { console.warn(`[${id}] Not in TD_MAP, skipping`); return; }
 
   if (!isForexOpen()) {
     set(ref(db, `otc_status/${id}`), { enabled:false, reason:'market_closed' }).catch(()=>{});
-    console.log(`[${id}] Market closed`);
+    console.log(`[${id}] Forex market closed`);
     return;
   }
   set(ref(db, `otc_status/${id}`), { enabled:true }).catch(()=>{});
 
-  // ── Historical candles (Twelve Data — একবারই) ───────────
+  // Historical candles
   console.log(`[${id}] Loading history...`);
-  const history       = await fetchForexHistory(id, 200);
+  const history       = await fetchTdHistory(id);
   const lastSaved     = await loadLastCandle(id);
   const lastSavedTime = lastSaved?.time || 0;
   const newCandles    = history.filter(c => c.time > lastSavedTime);
@@ -279,42 +257,34 @@ async function initForex(id) {
     console.log(`[${id}] Firebase up to date`);
   }
 
-  // ── Initial price (ExchangeRate) ─────────────────────────
-  let lastClose = history.length > 0
-    ? history[history.length-1].close
-    : (lastSaved?.close || 0);
-
-  if (!lastClose || lastClose <= 0) {
-    lastClose = await getForexPairPrice(id);
-  }
+  const lastClose = history.length > 0 ? history[history.length-1].close : (lastSaved?.close || 1.0);
   _forexPrices[id] = lastClose;
 
-  // ── Admin control listener ──────────────────────────────
+  // Admin control
   _controls[id] = { mode:'auto', nextDirection:'auto' };
   onValue(ref(db, `otc_controls/${id}`), snap => {
     if (snap.exists()) _controls[id] = { ..._controls[id], ...snap.val() };
   });
 
-  // ── State ───────────────────────────────────────────────
-  const now   = Date.now();
-  const start = Math.floor(now / CANDLE_MS) * CANDLE_MS;
+  // State
+  const now = Date.now(), start = Math.floor(now/CANDLE_MS)*CANDLE_MS;
   _states[id] = {
-    type:       'forex',
-    price:      lastClose,
-    candleOpen: lastClose,
-    candleHigh: lastClose,
-    candleLow:  lastClose,
-    candleTime: start / 1000,
-    nextCandle: start + CANDLE_MS,
+    type:'forex', price:lastClose,
+    candleOpen:lastClose, candleHigh:lastClose, candleLow:lastClose,
+    candleTime:start/1000, nextCandle:start+CANDLE_MS,
   };
 
   _activeMarkets.add(id);
   console.log(`[${id}] Forex started @ ${lastClose}`);
-  // ExchangeRate প্রতি মিনিটে price update করবে (setInterval উপরে আছে)
-}
 
-// ── ExchangeRate API প্রতি 30s এ cache update করে ──────
-// tickForex এ getForexPairPrice(id) call করলে latest price পাওয়া যায়
+  // Shared WS শুরু করো / নতুন symbol subscribe করো
+  if (_tdReady && _tdWS) {
+    _tdWS.send(JSON.stringify({ action:'subscribe', params:{ symbols: TD_MAP[id] } }));
+    console.log(`[${id}] Subscribed to TD-WS`);
+  } else {
+    _startSharedTdWS();
+  }
+}
 
 async function tickForex(id) {
   const state = _states[id];
@@ -326,79 +296,43 @@ async function tickForex(id) {
     return;
   }
 
-  const now      = Date.now();
-  const ctrl     = _controls[id] || {};
-
-  // ── Latest real price (ExchangeRate cache থেকে) ──────────
-  const erPrice   = await getForexPairPrice(id);
-  const realPrice = (erPrice > 0) ? erPrice : (_forexPrices[id] || state.price);
+  const now       = Date.now();
+  const ctrl      = _controls[id] || {};
+  const realPrice = _forexPrices[id] || state.price;
   if (!realPrice || realPrice <= 0) return;
-  _forexPrices[id] = realPrice;
 
-  // ── Admin control apply ───────────────────────────────
+  // Admin control
   let price = realPrice;
-
   if (ctrl.mode === 'manual') {
     const dir = ctrl.nextDirection;
-    const v   = realPrice * 0.000025; // Forex এ খুব tiny movement
-    if (dir === 'up')        price = realPrice + v * (0.5 + Math.random() * 0.5);
-    else if (dir === 'down') price = realPrice - v * (0.5 + Math.random() * 0.5);
-    // 'auto' direction → real price
-
+    const v   = realPrice * 0.000025;
+    if (dir === 'up')        price = realPrice + v*(0.5+Math.random()*0.5);
+    else if (dir === 'down') price = realPrice - v*(0.5+Math.random()*0.5);
   } else if (ctrl.mode === 'trade-based') {
     try {
-      const statsSnap = await get(ref(db, `otc_trade_stats/${id}`));
-      const stats  = statsSnap.exists() ? statsSnap.val() : {};
-      const upAmt  = parseFloat(stats.upAmount)  || 0;
-      const downAmt= parseFloat(stats.downAmount)|| 0;
-      const v = realPrice * 0.000025;
-      if (upAmt > downAmt * 1.2)    price = realPrice - v * (0.5 + Math.random() * 0.5);
-      else if (downAmt > upAmt*1.2) price = realPrice + v * (0.5 + Math.random() * 0.5);
-      // কাছাকাছি → real price
+      const snap  = await get(ref(db, `otc_trade_stats/${id}`));
+      const stats = snap.exists() ? snap.val() : {};
+      const up    = parseFloat(stats.upAmount)   || 0;
+      const down  = parseFloat(stats.downAmount) || 0;
+      const v     = realPrice * 0.000025;
+      if (up > down*1.2)   price = realPrice - v*(0.5+Math.random()*0.5);
+      else if (down>up*1.2) price = realPrice + v*(0.5+Math.random()*0.5);
     } catch(_) {}
-
-  } else {
-    // Auto mode → real price exactly
-    price = realPrice;
   }
 
   state.price = price;
-
-  // ── Candle update (OTC engine এর মতো) ─────────────────
   if (price > state.candleHigh) state.candleHigh = price;
   if (price < state.candleLow)  state.candleLow  = price;
 
   if (now >= state.nextCandle) {
-    // মিনিট শেষ — candle save করো
-    await saveCandle(id, {
-      time:  state.candleTime,
-      open:  state.candleOpen,
-      high:  state.candleHigh,
-      low:   state.candleLow,
-      close: price,
-    });
+    await saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price });
     set(ref(db, `otc_candles/${id}/live`), null).catch(()=>{});
-
-    // নতুন candle শুরু
-    state.candleTime  = state.nextCandle / 1000;
-    state.candleOpen  = price;
-    state.candleHigh  = price;
-    state.candleLow   = price;
+    state.candleTime = state.nextCandle/1000; state.candleOpen = price;
+    state.candleHigh = price; state.candleLow = price;
     state.nextCandle += CANDLE_MS;
-    while (state.nextCandle <= now) {
-      state.candleTime  = state.nextCandle / 1000;
-      state.nextCandle += CANDLE_MS;
-    }
+    while (state.nextCandle <= now) { state.candleTime = state.nextCandle/1000; state.nextCandle += CANDLE_MS; }
   } else {
-    // Live candle update — Firebase এ লেখো
-    saveLiveCandle(id, {
-      time:       state.candleTime,
-      open:       state.candleOpen,
-      high:       state.candleHigh,
-      low:        state.candleLow,
-      close:      price,
-      nextCandle: state.nextCandle,
-    });
+    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle });
   }
 }
 
@@ -409,8 +343,6 @@ function stopSymbol(id) {
   if (!_activeMarkets.has(id)) return;
   _activeMarkets.delete(id);
   delete _states[id]; delete _controls[id]; delete _forexPrices[id];
-  if (_forexCandleTimers[id]) { clearInterval(_forexCandleTimers[id]); delete _forexCandleTimers[id]; }
-  if (_forexWS[id]) { try { _forexWS[id].terminate(); } catch(_){} delete _forexWS[id]; }
   set(ref(db, `otc_candles/${id}/live`), null).catch(()=>{});
   console.log(`[${id}] stopped`);
 }
@@ -421,9 +353,9 @@ function watchFirestoreMarkets() {
       const data = change.doc.data(), id = change.doc.id;
       if (change.type === 'added' || change.type === 'modified') {
         if (data.visible === false) { stopSymbol(id); return; }
-        if (data.feed === 'twelvedata')       await initForex(id);
+        if (data.feed === 'twelvedata') await initForex(id);
         else if (data.otc || data.feed === 'otc-engine' || data.feed === 'usdtbdt-engine')
-          await initOTC({ id, baseSymbol: data.baseSymbol||null, startPrice: data.startPrice||1.0 });
+          await initOTC({ id, baseSymbol:data.baseSymbol||null, startPrice:data.startPrice||1.0 });
       }
       if (change.type === 'removed') stopSymbol(id);
     });
@@ -431,7 +363,6 @@ function watchFirestoreMarkets() {
   console.log('[Firestore] Watching markets...');
 }
 
-// Market hours auto check
 setInterval(() => {
   if (!isForexOpen()) {
     [..._activeMarkets].forEach(id => {
@@ -444,7 +375,7 @@ setInterval(() => {
 }, 60_000);
 
 async function main() {
-  console.log('GoldVest OTC+Forex Server starting...');
+  console.log('GoldVest Server starting...');
   watchFirestoreMarkets();
   setInterval(() => {
     _activeMarkets.forEach(id => {
@@ -461,12 +392,11 @@ http.createServer((req, res) => {
   const otc   = [..._activeMarkets].filter(id => _states[id]?.type === 'otc');
   const forex = [..._activeMarkets].filter(id => _states[id]?.type === 'forex');
   res.writeHead(200);
-  res.end(`GoldVest Server\nOTC: ${otc.join(', ')||'none'}\nForex: ${forex.join(', ')||'none'}`);
+  res.end(`GoldVest ✅\nOTC: ${otc.join(',')||'none'}\nForex: ${forex.join(',')||'none'}`);
 }).listen(process.env.PORT||3000, () => console.log('HTTP alive'));
 
-// Self-ping প্রতি 8 মিনিট — Render free tier spin down এড়াতে
 setInterval(() => {
   fetch('https://goldvest-otc-worker.onrender.com/')
-    .then(() => console.log('[keepalive] ping OK'))
-    .catch(e => console.warn('[keepalive] ping failed:', e.message));
-}, 8 * 60 * 1000);
+    .then(() => console.log('[ping] OK'))
+    .catch(() => {});
+}, 8*60*1000);
