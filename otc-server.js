@@ -52,6 +52,7 @@ const _states        = {};
 const _controls      = {};
 const _activeMarkets = new Set();
 const _forexPrices   = {};
+const _tradeStats    = {}; // trade-based mode এর জন্য cached stats
 
 // ── Firebase helpers ──────────────────────────────────────
 async function fetchBinancePrice(symbol) {
@@ -317,6 +318,10 @@ async function initForex(id) {
   onValue(ref(db, `otc_controls/${id}`), snap => {
     if (snap.exists()) _controls[id] = { ..._controls[id], ...snap.val() };
   });
+  // Trade stats cache — background realtime update
+  onValue(ref(db, `otc_trade_stats/${id}`), snap => {
+    _tradeStats[id] = snap.exists() ? snap.val() : {};
+  });
 
   // State
   const now = Date.now(), start = Math.floor(now/CANDLE_MS)*CANDLE_MS;
@@ -376,15 +381,13 @@ function tickForex(id) {
     if (dir === 'up')        price = realPrice + v*(0.5+Math.random()*0.5);
     else if (dir === 'down') price = realPrice - v*(0.5+Math.random()*0.5);
   } else if (ctrl.mode === 'trade-based') {
-    try {
-      const snap  = await get(ref(db, `otc_trade_stats/${id}`));
-      const stats = snap.exists() ? snap.val() : {};
-      const up    = parseFloat(stats.upAmount)   || 0;
-      const down  = parseFloat(stats.downAmount) || 0;
-      const v     = realPrice * 0.000025;
-      if (up > down*1.2)   price = realPrice - v*(0.5+Math.random()*0.5);
-      else if (down>up*1.2) price = realPrice + v*(0.5+Math.random()*0.5);
-    } catch(_) {}
+    // Cached stats use করো (background এ refresh হয়)
+    const stats = _tradeStats[id] || {};
+    const up    = parseFloat(stats.upAmount)   || 0;
+    const down  = parseFloat(stats.downAmount) || 0;
+    const v     = realPrice * 0.000025;
+    if (up > down*1.2)   price = realPrice - v*(0.5+Math.random()*0.5);
+    else if (down>up*1.2) price = realPrice + v*(0.5+Math.random()*0.5);
   }
 
   state.price = price;
@@ -432,7 +435,7 @@ function tickForex(id) {
 function stopSymbol(id) {
   if (!_activeMarkets.has(id)) return;
   _activeMarkets.delete(id);
-  delete _states[id]; delete _controls[id]; delete _forexPrices[id];
+  delete _states[id]; delete _controls[id]; delete _forexPrices[id]; delete _tradeStats[id];
   set(ref(db, `otc_candles/${id}/live`), null).catch(()=>{});
   // Sub-minute live candles ও clear করো
   for (const { label } of SUB_INTERVALS) {
