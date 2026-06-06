@@ -32,6 +32,14 @@ const TD_MAP = {
   'GBPUSD': 'GBP/USD',
 };
 
+// ─── Sub-minute timeframes server থেকে generate হবে ────────
+// Firebase path: subcandles_{interval}/{symbol}/candles  → closed
+//                subcandles_{interval}/{symbol}/live     → running
+const SUB_INTERVALS = [
+  { label: '15s', ms: 15 * 1000 },
+  { label: '30s', ms: 30 * 1000 },
+];
+
 function isForexOpen() {
   const d = new Date(), day = d.getUTCDay(), h = d.getUTCHours();
   if (day === 6) return false;
@@ -61,15 +69,24 @@ async function loadLastCandle(id) {
   return null;
 }
 
-async function saveCandle(id, candle) {
-  try {
-    await push(ref(db, `otc_candles/${id}/candles`), candle);
-    console.log(`[${id}] candle close=${candle.close.toFixed(5)}`);
-  } catch (e) { console.error(`[${id}] save failed:`, e.message); }
+function saveCandle(id, candle) {
+  push(ref(db, `otc_candles/${id}/candles`), candle)
+    .then(() => console.log(`[${id}] candle close=${candle.close.toFixed(5)}`))
+    .catch(e => console.error(`[${id}] save failed:`, e.message));
 }
 
 function saveLiveCandle(id, candle) {
   set(ref(db, `otc_candles/${id}/live`), candle).catch(() => {});
+}
+
+// ─── Sub-minute candle save helpers ──────────────────────
+function saveSubCandle(id, label, candle) {
+  push(ref(db, `subcandles_${label}/${id}/candles`), candle)
+    .catch(e => console.error(`[${id}][${label}] sub save failed:`, e.message));
+}
+
+function saveLiveSubCandle(id, label, candle) {
+  set(ref(db, `subcandles_${label}/${id}/live`), candle).catch(() => {});
 }
 
 // ══════════════════════════════════════════════════════════
@@ -118,12 +135,30 @@ async function initOTC(market) {
   onValue(ref(db, `otc_controls/${id}`), snap => { if (snap.exists()) _controls[id] = { ..._controls[id], ...snap.val() }; });
 
   const now = Date.now(), start = Math.floor(now/CANDLE_MS)*CANDLE_MS;
-  _states[id] = { type:'otc', price, candleOpen:price, candleHigh:price, candleLow:price, candleTime:start/1000, nextCandle:start+CANDLE_MS, trend:0, trendSteps:0 };
+
+  // ── Sub-minute state init ─────────────────────────────
+  const subStates = {};
+  for (const { label, ms } of SUB_INTERVALS) {
+    const subStart = Math.floor(now / ms) * ms;
+    subStates[label] = {
+      candleOpen: price, candleHigh: price, candleLow: price,
+      candleTime: subStart / 1000,
+      nextCandle: subStart + ms,
+      ms,
+    };
+  }
+
+  _states[id] = {
+    type:'otc', price, candleOpen:price, candleHigh:price, candleLow:price,
+    candleTime:start/1000, nextCandle:start+CANDLE_MS,
+    trend:0, trendSteps:0,
+    subStates, // sub-minute state এখানে
+  };
   _activeMarkets.add(id);
   console.log(`[${id}] OTC started @ ${price.toFixed(4)}`);
 }
 
-async function tickOTC(id) {
+function tickOTC(id) {
   const state = _states[id];
   if (!state || state.type !== 'otc') return;
   const ctrl = _controls[id] || {};
@@ -131,6 +166,7 @@ async function tickOTC(id) {
   const speed = ctrl.speedMultiplier || 1.0;
   const now = Date.now();
 
+  // ── Price generation — হুবহু আগের মতো ──────────────
   if (!ctrl.mode || ctrl.mode === 'auto') {
     if (state.trendSteps <= 0) { state.trend = randomTrend(); state.trendSteps = Math.round((8+Math.floor(Math.random()*12))/speed); }
     state.trendSteps--;
@@ -144,8 +180,9 @@ async function tickOTC(id) {
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
 
+  // ── 1m candle logic — হুবহু আগের মতো ───────────────
   if (now >= state.nextCandle) {
-    await saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price });
+    saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price });
     set(ref(db, `otc_candles/${id}/live`), null).catch(()=>{});
     state.candleTime = state.nextCandle/1000; state.candleOpen = state.price;
     state.candleHigh = state.price; state.candleLow = state.price;
@@ -153,6 +190,28 @@ async function tickOTC(id) {
     while (state.nextCandle <= now) { state.candleTime = state.nextCandle/1000; state.nextCandle += CANDLE_MS; }
   } else {
     saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle });
+  }
+
+  // ── Sub-minute candle logic (15s, 30s) ───────────────
+  for (const { label } of SUB_INTERVALS) {
+    const ss = state.subStates[label];
+    if (!ss) continue;
+
+    if (state.price > ss.candleHigh) ss.candleHigh = state.price;
+    if (state.price < ss.candleLow)  ss.candleLow  = state.price;
+
+    if (now >= ss.nextCandle) {
+      saveSubCandle(id, label, { time:ss.candleTime, open:ss.candleOpen, high:ss.candleHigh, low:ss.candleLow, close:state.price });
+      set(ref(db, `subcandles_${label}/${id}/live`), null).catch(() => {});
+      ss.candleTime = ss.nextCandle / 1000;
+      ss.candleOpen = state.price;
+      ss.candleHigh = state.price;
+      ss.candleLow  = state.price;
+      ss.nextCandle += ss.ms;
+      while (ss.nextCandle <= now) { ss.candleTime = ss.nextCandle / 1000; ss.nextCandle += ss.ms; }
+    } else {
+      saveLiveSubCandle(id, label, { time:ss.candleTime, open:ss.candleOpen, high:ss.candleHigh, low:ss.candleLow, close:state.price, nextCandle:ss.nextCandle });
+    }
   }
 }
 
@@ -261,10 +320,24 @@ async function initForex(id) {
 
   // State
   const now = Date.now(), start = Math.floor(now/CANDLE_MS)*CANDLE_MS;
+
+  // ── Sub-minute state init for Forex ──────────────────
+  const subStates = {};
+  for (const { label, ms } of SUB_INTERVALS) {
+    const subStart = Math.floor(now / ms) * ms;
+    subStates[label] = {
+      candleOpen: lastClose, candleHigh: lastClose, candleLow: lastClose,
+      candleTime: subStart / 1000,
+      nextCandle: subStart + ms,
+      ms,
+    };
+  }
+
   _states[id] = {
     type:'forex', price:lastClose,
     candleOpen:lastClose, candleHigh:lastClose, candleLow:lastClose,
     candleTime:start/1000, nextCandle:start+CANDLE_MS,
+    subStates,
   };
 
   _activeMarkets.add(id);
@@ -280,7 +353,7 @@ async function initForex(id) {
   }
 }
 
-async function tickForex(id) {
+function tickForex(id) {
   const state = _states[id];
   if (!state || state.type !== 'forex') return;
 
@@ -295,7 +368,7 @@ async function tickForex(id) {
   const realPrice = _forexPrices[id] || state.price;
   if (!realPrice || realPrice <= 0) return;
 
-  // Admin control
+  // Admin control — হুবহু আগের মতো
   let price = realPrice;
   if (ctrl.mode === 'manual') {
     const dir = ctrl.nextDirection;
@@ -318,8 +391,9 @@ async function tickForex(id) {
   if (price > state.candleHigh) state.candleHigh = price;
   if (price < state.candleLow)  state.candleLow  = price;
 
+  // ── 1m candle logic — হুবহু আগের মতো ───────────────
   if (now >= state.nextCandle) {
-    await saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price });
+    saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price });
     set(ref(db, `otc_candles/${id}/live`), null).catch(()=>{});
     state.candleTime = state.nextCandle/1000; state.candleOpen = price;
     state.candleHigh = price; state.candleLow = price;
@@ -327,6 +401,28 @@ async function tickForex(id) {
     while (state.nextCandle <= now) { state.candleTime = state.nextCandle/1000; state.nextCandle += CANDLE_MS; }
   } else {
     saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle });
+  }
+
+  // ── Sub-minute candle logic (15s, 30s) ───────────────
+  for (const { label } of SUB_INTERVALS) {
+    const ss = state.subStates[label];
+    if (!ss) continue;
+
+    if (price > ss.candleHigh) ss.candleHigh = price;
+    if (price < ss.candleLow)  ss.candleLow  = price;
+
+    if (now >= ss.nextCandle) {
+      saveSubCandle(id, label, { time:ss.candleTime, open:ss.candleOpen, high:ss.candleHigh, low:ss.candleLow, close:price });
+      set(ref(db, `subcandles_${label}/${id}/live`), null).catch(() => {});
+      ss.candleTime = ss.nextCandle / 1000;
+      ss.candleOpen = price;
+      ss.candleHigh = price;
+      ss.candleLow  = price;
+      ss.nextCandle += ss.ms;
+      while (ss.nextCandle <= now) { ss.candleTime = ss.nextCandle / 1000; ss.nextCandle += ss.ms; }
+    } else {
+      saveLiveSubCandle(id, label, { time:ss.candleTime, open:ss.candleOpen, high:ss.candleHigh, low:ss.candleLow, close:price, nextCandle:ss.nextCandle });
+    }
   }
 }
 
@@ -338,6 +434,10 @@ function stopSymbol(id) {
   _activeMarkets.delete(id);
   delete _states[id]; delete _controls[id]; delete _forexPrices[id];
   set(ref(db, `otc_candles/${id}/live`), null).catch(()=>{});
+  // Sub-minute live candles ও clear করো
+  for (const { label } of SUB_INTERVALS) {
+    set(ref(db, `subcandles_${label}/${id}/live`), null).catch(() => {});
+  }
   console.log(`[${id}] stopped`);
 }
 
