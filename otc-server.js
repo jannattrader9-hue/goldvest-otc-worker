@@ -493,7 +493,7 @@ http.createServer((req, res) => {
 }).listen(process.env.PORT||3000, () => console.log('HTTP alive'));
 
 setInterval(() => {
-  fetch('https://goldvest-otc-worker.onrender.com/')
+  fetch('https://goldvest-otc-worker-production.up.railway.app/')
     .then(() => console.log('[ping] OK'))
     .catch(() => {});
 }, 8*60*1000);
