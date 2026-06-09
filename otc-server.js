@@ -6,7 +6,6 @@
 
 const admin = require('firebase-admin');
 
-// Railway environment variable থেকে service account load
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
 admin.initializeApp({
@@ -14,15 +13,8 @@ admin.initializeApp({
     databaseURL: "https://goldvest-cf73d-default-rtdb.firebaseio.com"
 });
 
-const db       = admin.database();
+const db        = admin.database();
 const firestore = admin.firestore();
-
-// ── Database helpers (Admin SDK syntax) ──────────────────
-const ref        = (path) => db.ref(path);
-const push       = (r, val) => r.push(val);
-const set        = (r, val) => r.set(val);
-const get        = (r) => r.once('value');
-const onValue    = (r, cb) => r.on('value', cb);
 
 const TICK_MS   = 500;
 const CANDLE_MS = 60 * 1000;
@@ -52,6 +44,48 @@ const _activeMarkets = new Set();
 const _forexPrices   = {};
 const _tradeStats    = {};
 
+// ── 24h change tracking ───────────────────────────────────
+// প্রতি symbol এর জন্য 24h আগের open price cache করো
+const _openPrice24h  = {}; // { BTCOTC: { price, time } }
+
+// 24h change calculate + RTDB save
+function _save24hChange(id, currentClose) {
+  try {
+    const ref24 = _openPrice24h[id];
+    if (!ref24 || !ref24.price) return;
+
+    const change = ((currentClose - ref24.price) / ref24.price) * 100;
+    db.ref(`otc_change/${id}`).set({
+      change:    Number(change.toFixed(3)),
+      updatedAt: Date.now(),
+    }).catch(() => {});
+  } catch (e) {}
+}
+
+// 24h আগের candle load করো — init এর সময় একবার
+async function _load24hOpenPrice(id) {
+  try {
+    const now24hAgo = Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000);
+    const snap = await db.ref(`otc_candles/${id}/candles`)
+      .orderByChild('time')
+      .startAt(now24hAgo)
+      .limitToFirst(1)
+      .once('value');
+
+    if (snap.exists()) {
+      const candle = Object.values(snap.val())[0];
+      _openPrice24h[id] = { price: candle.open || candle.close, time: candle.time };
+    }
+  } catch (e) {}
+}
+
+// প্রতি ঘণ্টায় 24h reference update করো
+setInterval(() => {
+  _activeMarkets.forEach(id => {
+    _load24hOpenPrice(id);
+  });
+}, 60 * 60 * 1000);
+
 // ── Firebase helpers ──────────────────────────────────────
 async function fetchBinancePrice(symbol) {
   try {
@@ -70,7 +104,11 @@ async function loadLastCandle(id) {
 
 function saveCandle(id, candle) {
   db.ref(`otc_candles/${id}/candles`).push(candle)
-    .then(() => console.log(`[${id}] candle close=${candle.close.toFixed(5)}`))
+    .then(() => {
+      console.log(`[${id}] candle close=${candle.close.toFixed(5)}`);
+      // Candle close হলে 24h change update করো
+      _save24hChange(id, candle.close);
+    })
     .catch(e => console.error(`[${id}] save failed:`, e.message));
 }
 
@@ -154,6 +192,10 @@ async function initOTC(market) {
     subStates,
   };
   _activeMarkets.add(id);
+
+  // 24h open price load করো
+  await _load24hOpenPrice(id);
+
   console.log(`[${id}] OTC started @ ${price.toFixed(4)}`);
 }
 
@@ -313,6 +355,10 @@ async function initForex(id) {
     subStates,
   };
   _activeMarkets.add(id);
+
+  // 24h open price load করো
+  await _load24hOpenPrice(id);
+
   console.log(`[${id}] Forex started @ ${lastClose}`);
   if (_tdWS && _tdWS.readyState === 1 && _tdReady) {
     _tdWS.send(JSON.stringify({ action:'subscribe', params:{ symbols: TD_MAP[id] } }));
@@ -387,6 +433,7 @@ function stopSymbol(id) {
   if (!_activeMarkets.has(id)) return;
   _activeMarkets.delete(id);
   delete _states[id]; delete _controls[id]; delete _forexPrices[id]; delete _tradeStats[id];
+  delete _openPrice24h[id];
   db.ref(`otc_candles/${id}/live`).set(null).catch(()=>{});
   for (const { label } of SUB_INTERVALS) {
     db.ref(`subcandles_${label}/${id}/live`).set(null).catch(() => {});
