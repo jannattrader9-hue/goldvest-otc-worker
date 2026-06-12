@@ -86,6 +86,81 @@ const _activeMarkets = new Set();
 const _forexPrices   = {};
 const _tradeStats    = {};
 
+// ── [SHADOW TRACKING - ধাপ ১] In-memory active trades map ──
+// এটি শুধুমাত্র observation/verification এর জন্য — settlement logic এখনও বদলায়নি।
+// Key: `${userId}/${tradeId}`, Value: { userId, tradeId, symbol, expiryTimestamp, status }
+const _activeTradesMemory = new Map();
+
+function _startActiveTradesShadowListener() {
+  firestore.collectionGroup('trades')
+    .where('status', '==', 'live')
+    .onSnapshot(snap => {
+      snap.docChanges().forEach(change => {
+        const data   = change.doc.data();
+        const userId = change.doc.ref.parent.parent.id;
+        const key     = `${userId}/${change.doc.id}`;
+        if (change.type === 'removed' || data.status !== 'live') {
+          _activeTradesMemory.delete(key);
+        } else {
+          _activeTradesMemory.set(key, {
+            userId, tradeId: change.doc.id,
+            symbol: data.symbol, expiryTimestamp: data.expiryTimestamp,
+            accountType: data.accountType, status: data.status
+          });
+        }
+      });
+    }, err => console.error('[shadow-tracking] listener error:', err.message));
+}
+
+// প্রতি tick এ shadow map থেকে কতগুলো trade "due" (expiryTimestamp <= now) তা log করো — observational only
+function _logShadowDueTrades() {
+  const nowSec = Math.floor(Date.now() / 1000);
+  let due = 0;
+  for (const t of _activeTradesMemory.values()) {
+    if (t.expiryTimestamp <= nowSec) due++;
+  }
+  if (due > 0) {
+    console.log(`[shadow-tracking] active=${_activeTradesMemory.size} due=${due}`);
+  }
+}
+
+// ── [ধাপ ২] In-memory map থেকে tick-based settlement ──────
+// প্রতি tick এ — যেসব live trade এর expiryTimestamp <= now, তাদের সেই
+// symbol এর current state.price দিয়ে সাথে সাথে settle করো (candle-close
+// trigger এর পাশাপাশি/parallel — duplicate-safe, কারণ _doSettle এ
+// status !== 'live' guard আছে)
+async function _settleDueTradesFromMemory() {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const due = [];
+  for (const [key, t] of _activeTradesMemory.entries()) {
+    if (t.expiryTimestamp <= nowSec && t.accountType === 'live') {
+      due.push([key, t]);
+    }
+  }
+  if (due.length === 0) return;
+
+  await Promise.allSettled(due.map(async ([key, t]) => {
+    const state = _states[t.symbol];
+    if (!state || typeof state.price !== 'number') return;
+    const closePrice = state.price;
+    try {
+      const res = await fetch(SETTLE_FUNCTION_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type':   'application/json',
+          'X-Settle-Token': SETTLE_TOKEN,
+        },
+        body: JSON.stringify({ userId: t.userId, tradeId: t.tradeId, closePrice }),
+      });
+      console.log(`[tick-settle] ${t.symbol} tradeId=${t.tradeId} closePrice=${closePrice.toFixed(5)} → ${await res.text()}`);
+    } catch (e) {
+      console.error(`[tick-settle] ${t.symbol} tradeId=${t.tradeId} failed:`, e.message);
+    }
+    // duplicate attempt এড়াতে এখনই memory থেকে remove করো — listener নিজেও পরে remove করবে
+    _activeTradesMemory.delete(key);
+  }));
+}
+
 // ── 24h change tracking ───────────────────────────────────
 // প্রতি symbol এর জন্য 24h আগের open price cache করো
 const _openPrice24h  = {}; // { BTCOTC: { price, time } }
@@ -529,11 +604,13 @@ setInterval(() => {
 async function main() {
   console.log('GoldVest Server starting (Admin SDK)...');
   watchFirestoreMarkets();
+  _startActiveTradesShadowListener();
   setInterval(() => {
     _activeMarkets.forEach(id => {
       if (_states[id]?.type === 'otc')   tickOTC(id);
       if (_states[id]?.type === 'forex') tickForex(id);
     });
+    _settleDueTradesFromMemory().catch(e => console.error('[tick-settle] error:', e.message));
   }, TICK_MS);
   console.log('Server running ✅');
 }
