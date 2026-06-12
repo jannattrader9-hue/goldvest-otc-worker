@@ -51,7 +51,7 @@ function _queueSettlementBroadcast(userId, tradeId, settleResult) {
   });
 
   if (_userSettleTimers.has(userId)) clearTimeout(_userSettleTimers.get(userId));
-  _userSettleTimers.set(userId, setTimeout(() => _flushUserSettleBatch(userId), 50));
+  _userSettleTimers.set(userId, setTimeout(() => _flushUserSettleBatch(userId), 300));
 }
 
 function _flushUserSettleBatch(userId) {
