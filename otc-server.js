@@ -61,6 +61,7 @@ function _flushUserSettleBatch(userId) {
   if (!items || items.length === 0) return;
 
   const batchId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  console.log(`[batch-broadcast] userId=${userId} batchId=${batchId} items=${items.length}`);
   db.ref(`user_settlement_batches/${userId}/${batchId}`).set({
     items,
     timestamp: Date.now(),
