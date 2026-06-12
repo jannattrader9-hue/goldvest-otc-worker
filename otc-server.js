@@ -139,6 +139,10 @@ async function _settleDueTradesFromMemory() {
   }
   if (due.length === 0) return;
 
+  // duplicate attempt এড়াতে — fetch শুরু করার আগেই memory থেকে remove করো
+  // (পরের tick এই trade আর "due" list এ আসবে না; listener নিজেও পরে confirm করে remove করবে)
+  for (const [key] of due) _activeTradesMemory.delete(key);
+
   await Promise.allSettled(due.map(async ([key, t]) => {
     const state = _states[t.symbol];
     if (!state || typeof state.price !== 'number') return;
@@ -156,8 +160,6 @@ async function _settleDueTradesFromMemory() {
     } catch (e) {
       console.error(`[tick-settle] ${t.symbol} tradeId=${t.tradeId} failed:`, e.message);
     }
-    // duplicate attempt এড়াতে এখনই memory থেকে remove করো — listener নিজেও পরে remove করবে
-    _activeTradesMemory.delete(key);
   }));
 }
 
