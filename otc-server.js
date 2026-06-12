@@ -267,7 +267,8 @@ function tickOTC(id) {
     const closedCandleTime  = state.nextCandle / 1000;
     const closedCandleClose = state.price;
     saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price });
-    db.ref(`otc_candles/${id}/live`).set(null).catch(()=>{});
+    // /live কে সাথে সাথে closed candle-এর final value দিয়ে আপডেট করো (null না) — client তাৎক্ষণিকভাবে সঠিক close পাবে
+    db.ref(`otc_candles/${id}/live`).set({ time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle }).catch(()=>{});
 
     // ── candle just closed — এই মুহূর্তের close price দিয়ে matching live trades settle করো ──
     settleTradesForCandle(id, closedCandleTime, closedCandleClose).catch(() => {});
@@ -450,7 +451,8 @@ function tickForex(id) {
     const closedCandleTime  = state.nextCandle / 1000;
     const closedCandleClose = price;
     saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price });
-    db.ref(`otc_candles/${id}/live`).set(null).catch(()=>{});
+    // /live কে সাথে সাথে closed candle-এর final value দিয়ে আপডেট করো (null না) — client তাৎক্ষণিকভাবে সঠিক close পাবে
+    db.ref(`otc_candles/${id}/live`).set({ time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle }).catch(()=>{});
 
     // ── candle just closed — এই মুহূর্তের close price দিয়ে matching live trades settle করো ──
     settleTradesForCandle(id, closedCandleTime, closedCandleClose).catch(() => {});
