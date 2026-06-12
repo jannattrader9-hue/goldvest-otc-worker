@@ -30,6 +30,48 @@ const SUB_INTERVALS = [
   { label: '30s', ms: 30 * 1000 },
 ];
 
+// ── Settlement (candle-close triggered, delay-free) ───────
+const SETTLE_FUNCTION_URL = 'https://us-central1-goldvest-cf73d.cloudfunctions.net/settleTrade';
+const SETTLE_TOKEN        = process.env.SETTLE_TOKEN || 'gv_settle_secret_2024';
+
+// candle close হওয়ার মুহূর্তে — সেই symbol+candleTime এ expire হওয়া সব live trades
+// খুঁজে exact close price দিয়ে settle করো (একই tick, delay-free)
+async function settleTradesForCandle(symbol, candleTime, closePrice) {
+  try {
+    const snap = await firestore.collectionGroup('trades')
+      .where('symbol', '==', symbol)
+      .where('status', '==', 'live')
+      .where('accountType', '==', 'live')
+      .where('expiryTimestamp', '==', candleTime)
+      .get();
+
+    if (snap.empty) return;
+
+    await Promise.allSettled(snap.docs.map(async (doc) => {
+      const trade  = doc.data();
+      const userId = trade.userId || doc.ref.parent.parent?.id;
+      const tradeId = doc.id;
+      if (!userId) return;
+
+      try {
+        const res = await fetch(SETTLE_FUNCTION_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type':   'application/json',
+            'X-Settle-Token': SETTLE_TOKEN,
+          },
+          body: JSON.stringify({ userId, tradeId, closePrice }),
+        });
+        console.log(`[settle] ${symbol} tradeId=${tradeId} closePrice=${closePrice.toFixed(5)} → ${await res.text()}`);
+      } catch (e) {
+        console.error(`[settle] ${symbol} tradeId=${tradeId} failed:`, e.message);
+      }
+    }));
+  } catch (e) {
+    console.error(`[settle] ${symbol} query failed:`, e.message);
+  }
+}
+
 function isForexOpen() {
   const d = new Date(), day = d.getUTCDay(), h = d.getUTCHours();
   if (day === 6) return false;
@@ -221,8 +263,14 @@ function tickOTC(id) {
   if (state.price < state.candleLow)  state.candleLow  = state.price;
 
   if (now >= state.nextCandle) {
+    const closedCandleTime  = state.candleTime;
+    const closedCandleClose = state.price;
     saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price });
     db.ref(`otc_candles/${id}/live`).set(null).catch(()=>{});
+
+    // ── candle just closed — এই মুহূর্তের close price দিয়ে matching live trades settle করো ──
+    settleTradesForCandle(id, closedCandleTime, closedCandleClose).catch(() => {});
+
     state.candleTime = state.nextCandle/1000; state.candleOpen = state.price;
     state.candleHigh = state.price; state.candleLow = state.price;
     state.nextCandle += CANDLE_MS;
@@ -397,8 +445,14 @@ function tickForex(id) {
   if (price > state.candleHigh) state.candleHigh = price;
   if (price < state.candleLow)  state.candleLow  = price;
   if (now >= state.nextCandle) {
+    const closedCandleTime  = state.candleTime;
+    const closedCandleClose = price;
     saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price });
     db.ref(`otc_candles/${id}/live`).set(null).catch(()=>{});
+
+    // ── candle just closed — এই মুহূর্তের close price দিয়ে matching live trades settle করো ──
+    settleTradesForCandle(id, closedCandleTime, closedCandleClose).catch(() => {});
+
     state.candleTime = state.nextCandle/1000; state.candleOpen = price;
     state.candleHigh = price; state.candleLow = price;
     state.nextCandle += CANDLE_MS;
