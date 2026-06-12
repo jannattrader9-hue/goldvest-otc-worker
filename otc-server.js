@@ -263,7 +263,8 @@ function tickOTC(id) {
   if (state.price < state.candleLow)  state.candleLow  = state.price;
 
   if (now >= state.nextCandle) {
-    const closedCandleTime  = state.candleTime;
+    // trade.expiryTimestamp = candle close time (= next candle's open time), candleTime এ candle open time থাকে
+    const closedCandleTime  = state.nextCandle / 1000;
     const closedCandleClose = state.price;
     saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price });
     db.ref(`otc_candles/${id}/live`).set(null).catch(()=>{});
@@ -445,7 +446,8 @@ function tickForex(id) {
   if (price > state.candleHigh) state.candleHigh = price;
   if (price < state.candleLow)  state.candleLow  = price;
   if (now >= state.nextCandle) {
-    const closedCandleTime  = state.candleTime;
+    // trade.expiryTimestamp = candle close time (= next candle's open time), candleTime এ candle open time থাকে
+    const closedCandleTime  = state.nextCandle / 1000;
     const closedCandleClose = price;
     saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price });
     db.ref(`otc_candles/${id}/live`).set(null).catch(()=>{});
