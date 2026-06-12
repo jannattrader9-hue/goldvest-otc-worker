@@ -34,6 +34,39 @@ const SUB_INTERVALS = [
 const SETTLE_FUNCTION_URL = 'https://us-central1-goldvest-cf73d.cloudfunctions.net/settleTrade';
 const SETTLE_TOKEN        = process.env.SETTLE_TOKEN || 'gv_settle_secret_2024';
 
+// ── Batch broadcast — settled trades কে per-user group করে RTDB তে
+// একসাথে push করো, যাতে client একটাই event এ সব trades একসাথে process করে
+// (Quotex-pattern: single event → instant bulk UI update)
+const _userSettleQueue = new Map(); // userId -> [{tradeId, status, closePrice, profit}, ...]
+const _userSettleTimers = new Map(); // userId -> timeout handle
+
+function _queueSettlementBroadcast(userId, tradeId, settleResult) {
+  if (!userId || !settleResult || settleResult.result !== 'ok') return;
+  if (!_userSettleQueue.has(userId)) _userSettleQueue.set(userId, []);
+  _userSettleQueue.get(userId).push({
+    tradeId,
+    status:     settleResult.status,
+    closePrice: settleResult.closePrice,
+    profit:     settleResult.profit,
+  });
+
+  if (_userSettleTimers.has(userId)) clearTimeout(_userSettleTimers.get(userId));
+  _userSettleTimers.set(userId, setTimeout(() => _flushUserSettleBatch(userId), 50));
+}
+
+function _flushUserSettleBatch(userId) {
+  _userSettleTimers.delete(userId);
+  const items = _userSettleQueue.get(userId);
+  _userSettleQueue.delete(userId);
+  if (!items || items.length === 0) return;
+
+  const batchId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  db.ref(`user_settlement_batches/${userId}/${batchId}`).set({
+    items,
+    timestamp: Date.now(),
+  }).catch(e => console.error(`[batch-broadcast] ${userId} failed:`, e.message));
+}
+
 // candle close হওয়ার মুহূর্তে — সেই symbol+candleTime এ expire হওয়া সব live trades
 // খুঁজে exact close price দিয়ে settle করো (একই tick, delay-free)
 async function settleTradesForCandle(symbol, candleTime, closePrice) {
@@ -62,7 +95,9 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
           },
           body: JSON.stringify({ userId, tradeId, closePrice }),
         });
-        console.log(`[settle] ${symbol} tradeId=${tradeId} closePrice=${closePrice.toFixed(5)} → ${await res.text()}`);
+        const data = await res.json().catch(() => ({}));
+        console.log(`[settle] ${symbol} tradeId=${tradeId} closePrice=${closePrice.toFixed(5)} → ${data.result || 'unknown'}`);
+        _queueSettlementBroadcast(userId, tradeId, data);
       } catch (e) {
         console.error(`[settle] ${symbol} tradeId=${tradeId} failed:`, e.message);
       }
@@ -156,7 +191,9 @@ async function _settleDueTradesFromMemory() {
         },
         body: JSON.stringify({ userId: t.userId, tradeId: t.tradeId, closePrice }),
       });
-      console.log(`[tick-settle] ${t.symbol} tradeId=${t.tradeId} closePrice=${closePrice.toFixed(5)} → ${await res.text()}`);
+      const data = await res.json().catch(() => ({}));
+      console.log(`[tick-settle] ${t.symbol} tradeId=${t.tradeId} closePrice=${closePrice.toFixed(5)} → ${data.result || 'unknown'}`);
+      _queueSettlementBroadcast(t.userId, t.tradeId, data);
     } catch (e) {
       console.error(`[tick-settle] ${t.symbol} tradeId=${t.tradeId} failed:`, e.message);
     }
