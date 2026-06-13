@@ -97,6 +97,7 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
       if (!userId) return;
 
       try {
+        const _t0 = Date.now();
         const res = await fetch(SETTLE_FUNCTION_URL, {
           method: 'POST',
           headers: {
@@ -106,7 +107,8 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
           body: JSON.stringify({ userId, tradeId, closePrice }),
         });
         const data = await res.json().catch(() => ({}));
-        console.log(`[settle] ${symbol} tradeId=${tradeId} closePrice=${closePrice.toFixed(5)} → ${data.result || 'unknown'}`);
+        const _ms = Date.now() - _t0;
+        console.log(`[settle] ${symbol} tradeId=${tradeId} closePrice=${closePrice.toFixed(5)} → ${data.result || 'unknown'} (${_ms}ms)`);
         _queueSettlementBroadcast(userId, tradeId, data);
       } catch (e) {
         console.error(`[settle] ${symbol} tradeId=${tradeId} failed:`, e.message);
@@ -196,6 +198,7 @@ async function _settleDueTradesFromMemory() {
     if (!state || typeof state.price !== 'number') return;
     const closePrice = state.price;
     try {
+      const _t0 = Date.now();
       const res = await fetch(SETTLE_FUNCTION_URL, {
         method: 'POST',
         headers: {
@@ -205,7 +208,8 @@ async function _settleDueTradesFromMemory() {
         body: JSON.stringify({ userId: t.userId, tradeId: t.tradeId, closePrice }),
       });
       const data = await res.json().catch(() => ({}));
-      console.log(`[tick-settle] ${t.symbol} tradeId=${t.tradeId} closePrice=${closePrice.toFixed(5)} → ${data.result || 'unknown'}`);
+      const _ms = Date.now() - _t0;
+      console.log(`[tick-settle] ${t.symbol} tradeId=${t.tradeId} closePrice=${closePrice.toFixed(5)} → ${data.result || 'unknown'} (${_ms}ms)`);
       _queueSettlementBroadcast(t.userId, t.tradeId, data);
     } catch (e) {
       console.error(`[tick-settle] ${t.symbol} tradeId=${t.tradeId} failed:`, e.message);
