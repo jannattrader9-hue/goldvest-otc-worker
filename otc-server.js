@@ -5,6 +5,7 @@
 // ============================================================
 
 const admin = require('firebase-admin');
+const pLimit = require('p-limit');
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
@@ -19,6 +20,12 @@ const firestore = admin.firestore();
 const TICK_MS   = 500;
 const CANDLE_MS = 60 * 1000;
 const TD_KEY    = '392fa09f669c4cd7843f958e0fbbca36';
+
+// Settlement burst protection — একই candle close এ অনেক trade একসাথে due
+// হলেও, সবগুলো এক মুহূর্তে fetch() না করে এই সংখ্যক concurrent request এ
+// limit করো (Cloud Function concurrency / Firestore transaction storm এড়াতে)
+const SETTLE_CONCURRENCY = 50;
+const settleLimit = pLimit(SETTLE_CONCURRENCY);
 
 const TD_MAP = {
   'EURUSD': 'EUR/USD',
@@ -81,7 +88,9 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
 
     if (snap.empty) return;
 
-    await Promise.allSettled(snap.docs.map(async (doc) => {
+    // Concurrency-capped — একই candle close এ হাজার হাজার trade due হলেও
+    // একসাথে সর্বোচ্চ SETTLE_CONCURRENCY টা fetch() in-flight থাকবে।
+    await Promise.allSettled(snap.docs.map(doc => settleLimit(async () => {
       const trade  = doc.data();
       const userId = trade.userId || doc.ref.parent.parent?.id;
       const tradeId = doc.id;
@@ -102,7 +111,7 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
       } catch (e) {
         console.error(`[settle] ${symbol} tradeId=${tradeId} failed:`, e.message);
       }
-    }));
+    })));
   } catch (e) {
     console.error(`[settle] ${symbol} query failed:`, e.message);
   }
@@ -179,7 +188,10 @@ async function _settleDueTradesFromMemory() {
   // (পরের tick এই trade আর "due" list এ আসবে না; listener নিজেও পরে confirm করে remove করবে)
   for (const [key] of due) _activeTradesMemory.delete(key);
 
-  await Promise.allSettled(due.map(async ([key, t]) => {
+  // Concurrency-capped — একই tick এ হাজার হাজার trade due হলেও একসাথে
+  // সর্বোচ্চ SETTLE_CONCURRENCY টা fetch() in-flight থাকবে (settleTradesForCandle
+  // এর limiter এর সাথে shared, যাতে দুটো path মিলে total concurrency বাউন্ডেড থাকে)
+  await Promise.allSettled(due.map(([key, t]) => settleLimit(async () => {
     const state = _states[t.symbol];
     if (!state || typeof state.price !== 'number') return;
     const closePrice = state.price;
@@ -198,7 +210,7 @@ async function _settleDueTradesFromMemory() {
     } catch (e) {
       console.error(`[tick-settle] ${t.symbol} tradeId=${t.tradeId} failed:`, e.message);
     }
-  }));
+  })));
 }
 
 // ── 24h change tracking ───────────────────────────────────
@@ -669,3 +681,11 @@ setInterval(() => {
     .then(() => console.log('[ping] OK'))
     .catch(() => {});
 }, 8*60*1000);
+
+
+
+
+
+
+
+
