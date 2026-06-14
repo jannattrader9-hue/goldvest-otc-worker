@@ -263,6 +263,44 @@ const _pendingSettle = new Set();
 // tick-settle এই symbol-এর trades skip করবে যতক্ষণ candle batch শেষ না হয়।
 const _candleSettlingSymbols = new Set();
 
+// ── Restart recovery — RTDB settlement_queue থেকে live trades reload ──
+// OTC server restart হলে _activeTradesMemory খালি হয়ে যায়।
+// এই function টা start এ একবার RTDB থেকে pending trades load করে
+// যাতে tick-settle instant কাজ করতে পারে।
+async function _recoverLiveTradesFromRTDB() {
+  try {
+    const snap = await db.ref('settlement_queue').once('value');
+    if (!snap.exists()) {
+      console.log('[recovery] No pending trades in settlement_queue');
+      return;
+    }
+    let count = 0;
+    snap.forEach(timeNode => {
+      const expiryTimestamp = parseInt(timeNode.key);
+      timeNode.forEach(userNode => {
+        const userId = userNode.key;
+        userNode.forEach(tradeNode => {
+          const t = tradeNode.val();
+          if (t.accountType !== 'live') return;
+          const key = `${userId}/${tradeNode.key}`;
+          _activeTradesMemory.set(key, {
+            userId,
+            tradeId: tradeNode.key,
+            symbol: t.symbol,
+            expiryTimestamp,
+            accountType: 'live',
+            status: 'live',
+          });
+          count++;
+        });
+      });
+    });
+    console.log(`[recovery] Loaded ${count} pending trades into memory ✅`);
+  } catch (e) {
+    console.error('[recovery] Failed:', e.message);
+  }
+}
+
 function _startActiveTradesShadowListener() {
   firestore.collectionGroup('trades')
     .where('status', '==', 'live')
@@ -795,6 +833,7 @@ setInterval(() => {
 async function main() {
   console.log('GoldVest Server starting (Admin SDK)...');
   watchFirestoreMarkets();
+  await _recoverLiveTradesFromRTDB();
   _startActiveTradesShadowListener();
   setInterval(() => {
     _activeMarkets.forEach(id => {
