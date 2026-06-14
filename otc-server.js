@@ -6,6 +6,7 @@
 
 const admin = require('firebase-admin');
 const pLimit = require('p-limit');
+const Redis  = require('ioredis');
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
@@ -16,6 +17,26 @@ admin.initializeApp({
 
 const db        = admin.database();
 const firestore = admin.firestore();
+
+// ── Redis client — settler service-এ trade jobs push করে ──
+const REDIS_URL = process.env.REDIS_URL;
+let   redisPub  = null;
+
+if (REDIS_URL) {
+    redisPub = new Redis(REDIS_URL, {
+        lazyConnect:          true,
+        maxRetriesPerRequest: null,
+        enableOfflineQueue:   true,
+    });
+    redisPub.connect().then(() => {
+        console.log('[Redis] connected ✅');
+    }).catch(e => {
+        console.error('[Redis] connect failed:', e.message);
+        redisPub = null;
+    });
+} else {
+    console.warn('[Redis] REDIS_URL not set — falling back to batchSettle HTTP');
+}
 
 const TICK_MS   = 500;
 const CANDLE_MS = 60 * 1000;
@@ -76,10 +97,31 @@ function _flushUserSettleBatch(userId) {
   }).catch(e => console.error(`[batch-broadcast] ${userId} failed:`, e.message));
 }
 
-// ── Batch settle helper — trades কে ৫০০-এ chunk করে batchSettle endpoint-এ পাঠায়।
-// batchSettle per-user sequential করে তাই Firestore write contention নেই।
-// Results RTDB batch broadcast queue-এ যায়।
+// ── Batch settle — Redis queue-এ push করো (settler service process করবে)
+// Redis না থাকলে পুরনো batchSettle HTTP endpoint-এ fallback করো
 async function _batchSettleAndBroadcast(symbol, trades, closePrice) {
+  if (!trades || trades.length === 0) return;
+
+  // ── Redis path (fast, <1ms per trade) ──────────────────
+  if (redisPub && redisPub.status === 'ready') {
+    try {
+      const jobs = trades.map(t => JSON.stringify({
+        userId:     t.userId,
+        tradeId:    t.tradeId,
+        closePrice: t.closePrice || closePrice,
+        symbol,
+        settledBy:  'redis-settler',
+      }));
+      // LPUSH — settler blpop করে instantly process করবে
+      await redisPub.lpush('gv:settle_queue', ...jobs);
+      console.log(`[redis-push] ${symbol} pushed=${trades.length} closePrice=${closePrice.toFixed(5)}`);
+      return;
+    } catch (e) {
+      console.error(`[redis-push] ${symbol} failed, falling back to HTTP:`, e.message);
+    }
+  }
+
+  // ── HTTP fallback (যদি Redis না থাকে) ──────────────────
   const CHUNK = 500;
   for (let i = 0; i < trades.length; i += CHUNK) {
     const chunk = trades.slice(i, i + CHUNK);
