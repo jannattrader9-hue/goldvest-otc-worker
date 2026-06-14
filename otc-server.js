@@ -129,6 +129,12 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
         tradeId: doc.id,
         closePrice,
       })).filter(t => t.userId);
+      // tick-settle duplicate এড়াতে pending mark করো
+      trades.forEach(t => {
+        const key = `${t.userId}/${t.tradeId}`;
+        _activeTradesMemory.delete(key);
+        _pendingSettle.add(key);
+      });
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
       return;
     }
@@ -142,12 +148,21 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
         // symbol filter — একই candleTime-এ অনেক symbol-এর trades থাকতে পারে
         if (t.symbol === symbol && t.accountType === 'live') {
           trades.push({ userId, tradeId: tradeNode.key, closePrice });
+          // tick-settle duplicate এড়াতে pending mark করো
+          const key = `${userId}/${tradeNode.key}`;
+          _activeTradesMemory.delete(key);
+          _pendingSettle.add(key);
         }
       });
     });
 
     if (trades.length === 0) return;
     console.log(`[settle] ${symbol} candleTime=${candleTime} found ${trades.length} trades in queue`);
+
+    // 30s safety — Firestore confirm না এলেও pending guard clear করো
+    const pendingKeys = trades.map(t => `${t.userId}/${t.tradeId}`);
+    setTimeout(() => pendingKeys.forEach(k => _pendingSettle.delete(k)), 30000);
+
     await _batchSettleAndBroadcast(symbol, trades, closePrice);
 
     // settle হয়ে গেলে queue entry গুলো cleanup — এই symbol-এর trades remove
