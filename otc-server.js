@@ -109,6 +109,11 @@ async function _batchSettleAndBroadcast(symbol, trades, closePrice) {
 // candle close হওয়ার মুহূর্তে — সেই symbol+candleTime এ expire হওয়া সব live trades
 // খুঁজে exact close price দিয়ে settle করো (একই tick, delay-free)
 async function settleTradesForCandle(symbol, candleTime, closePrice) {
+  // Synchronously mark — tick-settle এই symbol skip করবে এখন থেকে
+  _candleSettlingSymbols.add(symbol);
+  // 35s safety cleanup — যেকোনো কারণে clear না হলে
+  setTimeout(() => _candleSettlingSymbols.delete(symbol), 35000);
+
   try {
     // settlement_queue RTDB থেকে এই candleTime-এ due trades পড়ো —
     // collectionGroup Firestore query-এর চেয়ে অনেক lighter (indexed by expiry)
@@ -136,6 +141,7 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
         _pendingSettle.add(key);
       });
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
+      _candleSettlingSymbols.delete(symbol);
       return;
     }
 
@@ -164,6 +170,9 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
     setTimeout(() => pendingKeys.forEach(k => _pendingSettle.delete(k)), 30000);
 
     await _batchSettleAndBroadcast(symbol, trades, closePrice);
+
+    // Candle settle শেষ — tick-settle আবার চলতে পারবে
+    _candleSettlingSymbols.delete(symbol);
 
     // settle হয়ে গেলে queue entry গুলো cleanup — এই symbol-এর trades remove
     // (অন্য symbol-এর trades একই candleTime-এ থাকতে পারে, তাই selective delete)
@@ -199,6 +208,9 @@ const _activeTradesMemory = new Map();
 // Settlement শুরু হয়েছে কিন্তু Firestore onSnapshot এখনো confirm করেনি —
 // এই set-এ থাকা trades পরের tick-এ duplicate settle attempt করবে না।
 const _pendingSettle = new Set();
+// Candle close হলে এই symbol-কে synchronously mark করা হয় —
+// tick-settle এই symbol-এর trades skip করবে যতক্ষণ candle batch শেষ না হয়।
+const _candleSettlingSymbols = new Set();
 
 function _startActiveTradesShadowListener() {
   firestore.collectionGroup('trades')
@@ -245,6 +257,7 @@ async function _settleDueTradesFromMemory() {
   for (const [key, t] of _activeTradesMemory.entries()) {
     if (t.expiryTimestamp <= nowSec && t.accountType === 'live') {
       if (_pendingSettle.has(key)) continue; // Firestore confirm আসেনি — skip
+      if (_candleSettlingSymbols.has(t.symbol)) continue; // candle path চলছে — skip
       due.push([key, t]);
     }
   }
