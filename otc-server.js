@@ -110,9 +110,9 @@ async function _batchSettleAndBroadcast(symbol, trades, closePrice) {
 // খুঁজে exact close price দিয়ে settle করো (একই tick, delay-free)
 async function settleTradesForCandle(symbol, candleTime, closePrice) {
   // Synchronously mark — tick-settle এই symbol skip করবে এখন থেকে
+  // tickOTC/tickForex ইতিমধ্যে synchronously mark করেছে — এটা safety fallback
+  // (direct call হলে যেমন Firestore fallback path এ)
   _candleSettlingSymbols.add(symbol);
-  // 35s safety cleanup — যেকোনো কারণে clear না হলে
-  setTimeout(() => _candleSettlingSymbols.delete(symbol), 35000);
 
   try {
     // settlement_queue RTDB থেকে এই candleTime-এ due trades পড়ো —
@@ -478,7 +478,11 @@ function tickOTC(id) {
     db.ref(`otc_candles/${id}/live`).set({ time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle }).catch(()=>{});
 
     // ── candle just closed — এই মুহূর্তের close price দিয়ে matching live trades settle করো ──
-    settleTradesForCandle(id, closedCandleTime, closedCandleClose).catch(() => {});
+    // Synchronously mark — একই tick-এ _settleDueTradesFromMemory এই symbol skip করবে
+    _candleSettlingSymbols.add(id);
+    settleTradesForCandle(id, closedCandleTime, closedCandleClose).catch(() => {
+      _candleSettlingSymbols.delete(id);
+    });
 
     state.candleTime = state.nextCandle/1000; state.candleOpen = state.price;
     state.candleHigh = state.price; state.candleLow = state.price;
@@ -662,7 +666,11 @@ function tickForex(id) {
     db.ref(`otc_candles/${id}/live`).set({ time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle }).catch(()=>{});
 
     // ── candle just closed — এই মুহূর্তের close price দিয়ে matching live trades settle করো ──
-    settleTradesForCandle(id, closedCandleTime, closedCandleClose).catch(() => {});
+    // Synchronously mark — একই tick-এ _settleDueTradesFromMemory এই symbol skip করবে
+    _candleSettlingSymbols.add(id);
+    settleTradesForCandle(id, closedCandleTime, closedCandleClose).catch(() => {
+      _candleSettlingSymbols.delete(id);
+    });
 
     state.candleTime = state.nextCandle/1000; state.candleOpen = price;
     state.candleHigh = price; state.candleLow = price;
