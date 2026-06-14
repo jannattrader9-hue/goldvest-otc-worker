@@ -181,6 +181,9 @@ const _tradeStats    = {};
 // এটি শুধুমাত্র observation/verification এর জন্য — settlement logic এখনও বদলায়নি।
 // Key: `${userId}/${tradeId}`, Value: { userId, tradeId, symbol, expiryTimestamp, status }
 const _activeTradesMemory = new Map();
+// Settlement শুরু হয়েছে কিন্তু Firestore onSnapshot এখনো confirm করেনি —
+// এই set-এ থাকা trades পরের tick-এ duplicate settle attempt করবে না।
+const _pendingSettle = new Set();
 
 function _startActiveTradesShadowListener() {
   firestore.collectionGroup('trades')
@@ -192,6 +195,7 @@ function _startActiveTradesShadowListener() {
         const key     = `${userId}/${change.doc.id}`;
         if (change.type === 'removed' || data.status !== 'live') {
           _activeTradesMemory.delete(key);
+          _pendingSettle.delete(key); // confirmed — pending guard clear করো
         } else {
           _activeTradesMemory.set(key, {
             userId, tradeId: change.doc.id,
@@ -225,13 +229,18 @@ async function _settleDueTradesFromMemory() {
   const due = [];
   for (const [key, t] of _activeTradesMemory.entries()) {
     if (t.expiryTimestamp <= nowSec && t.accountType === 'live') {
+      if (_pendingSettle.has(key)) continue; // Firestore confirm আসেনি — skip
       due.push([key, t]);
     }
   }
   if (due.length === 0) return;
 
-  // duplicate attempt এড়াতে — fetch শুরু করার আগেই memory থেকে remove করো
-  for (const [key] of due) _activeTradesMemory.delete(key);
+  // duplicate attempt এড়াতে — settlement শুরুর আগেই pending mark করো
+  // Firestore onSnapshot status change confirm করলে _pendingSettle থেকে সরাবে
+  for (const [key] of due) {
+    _activeTradesMemory.delete(key);
+    _pendingSettle.add(key);
+  }
 
   // symbol দিয়ে group করো — প্রতিটা symbol-এর জন্য আলাদা close price
   const bySymbol = new Map();
@@ -247,6 +256,13 @@ async function _settleDueTradesFromMemory() {
     console.log(`[tick-settle] ${symbol} due=${trades.length} closePrice=${closePrice.toFixed(5)}`);
     await _batchSettleAndBroadcast(symbol, trades, closePrice);
   }));
+
+  // Safety cleanup — 30s পরে Firestore confirm না এলেও pending guard clear করো
+  // (যাতে কোনো trade চিরতরে আটকে না যায়)
+  const keys = due.map(([key]) => key);
+  setTimeout(() => {
+    keys.forEach(k => _pendingSettle.delete(k));
+  }, 30000);
 }
 
 // ── 24h change tracking ───────────────────────────────────
