@@ -21,6 +21,7 @@ const firestore = admin.firestore();
 // ── Redis client — settler service-এ trade jobs push করে ──
 const REDIS_URL = process.env.REDIS_URL;
 let   redisPub  = null;
+let   redisReady = false;
 
 if (REDIS_URL) {
     redisPub = new Redis(REDIS_URL, {
@@ -28,11 +29,19 @@ if (REDIS_URL) {
         maxRetriesPerRequest: null,
         enableOfflineQueue:   true,
     });
-    redisPub.connect().then(() => {
+    redisPub.on('ready', () => {
+        redisReady = true;
         console.log('[Redis] connected ✅');
-    }).catch(e => {
+    });
+    redisPub.on('error', (e) => {
+        redisReady = false;
+        console.error('[Redis] error:', e.message);
+    });
+    redisPub.on('close', () => {
+        redisReady = false;
+    });
+    redisPub.connect().catch(e => {
         console.error('[Redis] connect failed:', e.message);
-        redisPub = null;
     });
 } else {
     console.warn('[Redis] REDIS_URL not set — falling back to batchSettle HTTP');
@@ -103,7 +112,7 @@ async function _batchSettleAndBroadcast(symbol, trades, closePrice) {
   if (!trades || trades.length === 0) return;
 
   // ── Redis path (fast, <1ms per trade) ──────────────────
-  if (redisPub && redisPub.status === 'ready') {
+  if (redisPub && redisReady) {
     try {
       const jobs = trades.map(t => JSON.stringify({
         userId:     t.userId,
