@@ -38,7 +38,8 @@ const SUB_INTERVALS = [
 ];
 
 // ── Settlement (candle-close triggered, delay-free) ───────
-const SETTLE_FUNCTION_URL = 'https://us-central1-goldvest-cf73d.cloudfunctions.net/settleTrade';
+const SETTLE_FUNCTION_URL       = 'https://us-central1-goldvest-cf73d.cloudfunctions.net/settleTrade';
+const BATCH_SETTLE_FUNCTION_URL = 'https://us-central1-goldvest-cf73d.cloudfunctions.net/batchSettle';
 const SETTLE_TOKEN        = process.env.SETTLE_TOKEN || 'gv_settle_secret_2024';
 
 // ── Batch broadcast — settled trades কে per-user group করে RTDB তে
@@ -75,45 +76,88 @@ function _flushUserSettleBatch(userId) {
   }).catch(e => console.error(`[batch-broadcast] ${userId} failed:`, e.message));
 }
 
+// ── Batch settle helper — trades কে ৫০০-এ chunk করে batchSettle endpoint-এ পাঠায়।
+// batchSettle per-user sequential করে তাই Firestore write contention নেই।
+// Results RTDB batch broadcast queue-এ যায়।
+async function _batchSettleAndBroadcast(symbol, trades, closePrice) {
+  const CHUNK = 500;
+  for (let i = 0; i < trades.length; i += CHUNK) {
+    const chunk = trades.slice(i, i + CHUNK);
+    const _t0 = Date.now();
+    try {
+      const res = await fetch(BATCH_SETTLE_FUNCTION_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type':   'application/json',
+          'X-Settle-Token': SETTLE_TOKEN,
+        },
+        body: JSON.stringify({ trades: chunk, settledBy: 'otc-server' }),
+      });
+      const data = await res.json().catch(() => ({}));
+      const _ms = Date.now() - _t0;
+      const results = data.results || [];
+      console.log(`[batch-settle] ${symbol} chunk=${i/CHUNK+1} trades=${chunk.length} took=${_ms}ms ok=${results.filter(r=>r.result==='ok').length}`);
+      results.forEach(r => {
+        _queueSettlementBroadcast(r.userId, r.tradeId, r);
+      });
+    } catch (e) {
+      console.error(`[batch-settle] ${symbol} chunk=${i/CHUNK+1} failed:`, e.message);
+    }
+  }
+}
+
 // candle close হওয়ার মুহূর্তে — সেই symbol+candleTime এ expire হওয়া সব live trades
 // খুঁজে exact close price দিয়ে settle করো (একই tick, delay-free)
 async function settleTradesForCandle(symbol, candleTime, closePrice) {
   try {
-    const snap = await firestore.collectionGroup('trades')
-      .where('symbol', '==', symbol)
-      .where('status', '==', 'live')
-      .where('accountType', '==', 'live')
-      .where('expiryTimestamp', '==', candleTime)
-      .get();
+    // settlement_queue RTDB থেকে এই candleTime-এ due trades পড়ো —
+    // collectionGroup Firestore query-এর চেয়ে অনেক lighter (indexed by expiry)
+    const queueSnap = await db.ref(`settlement_queue/${candleTime}`).once('value');
 
-    if (snap.empty) return;
+    if (!queueSnap.exists()) {
+      // Fallback: RTDB queue-এ না থাকলে Firestore collectionGroup query
+      // (পুরনো trades যেগুলো queue-এ লেখা হয়নি, বা Cloud Function miss করেছে)
+      const fsSnap = await firestore.collectionGroup('trades')
+        .where('symbol', '==', symbol)
+        .where('status', '==', 'live')
+        .where('accountType', '==', 'live')
+        .where('expiryTimestamp', '==', candleTime)
+        .get();
+      if (fsSnap.empty) return;
+      const trades = fsSnap.docs.map(doc => ({
+        userId: doc.data().userId || doc.ref.parent.parent?.id,
+        tradeId: doc.id,
+        closePrice,
+      })).filter(t => t.userId);
+      await _batchSettleAndBroadcast(symbol, trades, closePrice);
+      return;
+    }
 
-    // Concurrency-capped — একই candle close এ হাজার হাজার trade due হলেও
-    // একসাথে সর্বোচ্চ SETTLE_CONCURRENCY টা fetch() in-flight থাকবে।
-    await Promise.allSettled(snap.docs.map(doc => settleLimit(async () => {
-      const trade  = doc.data();
-      const userId = trade.userId || doc.ref.parent.parent?.id;
-      const tradeId = doc.id;
-      if (!userId) return;
+    // settlement_queue-এ এই symbol-এর trades বের করো
+    const trades = [];
+    queueSnap.forEach(userNode => {
+      const userId = userNode.key;
+      userNode.forEach(tradeNode => {
+        const t = tradeNode.val();
+        // symbol filter — একই candleTime-এ অনেক symbol-এর trades থাকতে পারে
+        if (t.symbol === symbol && t.accountType === 'live') {
+          trades.push({ userId, tradeId: tradeNode.key, closePrice });
+        }
+      });
+    });
 
-      try {
-        const _t0 = Date.now();
-        const res = await fetch(SETTLE_FUNCTION_URL, {
-          method: 'POST',
-          headers: {
-            'Content-Type':   'application/json',
-            'X-Settle-Token': SETTLE_TOKEN,
-          },
-          body: JSON.stringify({ userId, tradeId, closePrice }),
-        });
-        const data = await res.json().catch(() => ({}));
-        const _ms = Date.now() - _t0;
-        console.log(`[settle] ${symbol} tradeId=${tradeId} closePrice=${closePrice.toFixed(5)} → ${data.result || 'unknown'} (${_ms}ms)`);
-        _queueSettlementBroadcast(userId, tradeId, data);
-      } catch (e) {
-        console.error(`[settle] ${symbol} tradeId=${tradeId} failed:`, e.message);
-      }
-    })));
+    if (trades.length === 0) return;
+    console.log(`[settle] ${symbol} candleTime=${candleTime} found ${trades.length} trades in queue`);
+    await _batchSettleAndBroadcast(symbol, trades, closePrice);
+
+    // settle হয়ে গেলে queue entry গুলো cleanup — এই symbol-এর trades remove
+    // (অন্য symbol-এর trades একই candleTime-এ থাকতে পারে, তাই selective delete)
+    const cleanups = [];
+    trades.forEach(t => {
+      cleanups.push(db.ref(`settlement_queue/${candleTime}/${t.userId}/${t.tradeId}`).remove());
+    });
+    await Promise.allSettled(cleanups);
+
   } catch (e) {
     console.error(`[settle] ${symbol} query failed:`, e.message);
   }
@@ -187,34 +231,22 @@ async function _settleDueTradesFromMemory() {
   if (due.length === 0) return;
 
   // duplicate attempt এড়াতে — fetch শুরু করার আগেই memory থেকে remove করো
-  // (পরের tick এই trade আর "due" list এ আসবে না; listener নিজেও পরে confirm করে remove করবে)
   for (const [key] of due) _activeTradesMemory.delete(key);
 
-  // Concurrency-capped — একই tick এ হাজার হাজার trade due হলেও একসাথে
-  // সর্বোচ্চ SETTLE_CONCURRENCY টা fetch() in-flight থাকবে (settleTradesForCandle
-  // এর limiter এর সাথে shared, যাতে দুটো path মিলে total concurrency বাউন্ডেড থাকে)
-  await Promise.allSettled(due.map(([key, t]) => settleLimit(async () => {
+  // symbol দিয়ে group করো — প্রতিটা symbol-এর জন্য আলাদা close price
+  const bySymbol = new Map();
+  for (const [key, t] of due) {
     const state = _states[t.symbol];
-    if (!state || typeof state.price !== 'number') return;
-    const closePrice = state.price;
-    try {
-      const _t0 = Date.now();
-      const res = await fetch(SETTLE_FUNCTION_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type':   'application/json',
-          'X-Settle-Token': SETTLE_TOKEN,
-        },
-        body: JSON.stringify({ userId: t.userId, tradeId: t.tradeId, closePrice }),
-      });
-      const data = await res.json().catch(() => ({}));
-      const _ms = Date.now() - _t0;
-      console.log(`[tick-settle] ${t.symbol} tradeId=${t.tradeId} closePrice=${closePrice.toFixed(5)} → ${data.result || 'unknown'} (${_ms}ms)`);
-      _queueSettlementBroadcast(t.userId, t.tradeId, data);
-    } catch (e) {
-      console.error(`[tick-settle] ${t.symbol} tradeId=${t.tradeId} failed:`, e.message);
-    }
-  })));
+    if (!state || typeof state.price !== 'number') continue;
+    if (!bySymbol.has(t.symbol)) bySymbol.set(t.symbol, { closePrice: state.price, trades: [] });
+    bySymbol.get(t.symbol).trades.push({ userId: t.userId, tradeId: t.tradeId, closePrice: state.price });
+  }
+
+  // প্রতি symbol-এর trades batchSettle-এ পাঠাও
+  await Promise.allSettled([...bySymbol.entries()].map(async ([symbol, { closePrice, trades }]) => {
+    console.log(`[tick-settle] ${symbol} due=${trades.length} closePrice=${closePrice.toFixed(5)}`);
+    await _batchSettleAndBroadcast(symbol, trades, closePrice);
+  }));
 }
 
 // ── 24h change tracking ───────────────────────────────────
