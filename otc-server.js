@@ -111,21 +111,32 @@ function _flushUserSettleBatch(userId) {
 async function _batchSettleAndBroadcast(symbol, trades, closePrice) {
   if (!trades || trades.length === 0) return;
 
-  // ── live_market_stats decrement (fire-and-forget) ──
+  // ── live_market_stats: settled trades remove করো ──
+  // transaction এর বদলে increment/decrement — পুরো node delete না করে
+  // নতুন trades এ type/amount আছে, তাই সঠিক decrement হবে
   try {
     let upDec = 0, downDec = 0, upAmt = 0, downAmt = 0;
+    let hasTypeInfo = false;
     trades.forEach(t => {
+      if (t.type) { hasTypeInfo = true; }
       if (t.type === 'up')   { upDec++;   upAmt   += t.amount || 0; }
-      else                   { downDec++; downAmt += t.amount || 0; }
+      else if (t.type === 'down') { downDec++; downAmt += t.amount || 0; }
     });
-    db.ref('live_market_stats/' + symbol).transaction(curr => {
-      if (!curr) return curr;
-      curr.up       = Math.max(0, (curr.up       || 0) - upDec);
-      curr.down     = Math.max(0, (curr.down     || 0) - downDec);
-      curr.upAmount = Math.max(0, (curr.upAmount || 0) - upAmt);
-      curr.downAmount = Math.max(0, (curr.downAmount || 0) - downAmt);
-      return curr;
-    }).catch(() => {});
+    if (hasTypeInfo) {
+      db.ref('live_market_stats/' + symbol).transaction(curr => {
+        if (!curr) return curr;
+        curr.up         = Math.max(0, (curr.up         || 0) - upDec);
+        curr.down       = Math.max(0, (curr.down       || 0) - downDec);
+        curr.upAmount   = Math.max(0, (curr.upAmount   || 0) - upAmt);
+        curr.downAmount = Math.max(0, (curr.downAmount || 0) - downAmt);
+        // সব 0 হলে node delete করো
+        if ((curr.up || 0) <= 0 && (curr.down || 0) <= 0) return null;
+        return curr;
+      }).catch(() => {});
+    } else {
+      // পুরানো trades (type নেই) — node clear করো
+      db.ref('live_market_stats/' + symbol).remove().catch(() => {});
+    }
   } catch (e) {}
 
   // ── Redis path (fast, <1ms per trade) ──────────────────
