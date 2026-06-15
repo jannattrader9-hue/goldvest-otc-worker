@@ -389,15 +389,13 @@ const _rtdbSettledKeys = new Set(); // duplicate guard
 async function _settleDueTradesFromRTDB() {
   try {
     const nowSec = Math.floor(Date.now() / 1000);
-    const snap = await db.ref('settlement_queue')
-      .orderByKey()
-      .endAt(String(nowSec))
-      .once('value');
+    const snap = await db.ref('settlement_queue').once('value');
     if (!snap.exists()) return;
 
     const bySymbol = new Map();
     snap.forEach(timeNode => {
       const expiryTimestamp = parseInt(timeNode.key);
+      if (expiryTimestamp > nowSec) return; // এখনো due হয়নি
       timeNode.forEach(userNode => {
         const userId = userNode.key;
         userNode.forEach(tradeNode => {
