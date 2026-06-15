@@ -179,7 +179,7 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
         .where('accountType', '==', 'live')
         .where('expiryTimestamp', '==', candleTime)
         .get();
-      if (fsSnap.empty) return;
+      if (fsSnap.empty) { _candleSettlingSymbols.delete(symbol); return; }
       const trades = fsSnap.docs.map(doc => ({
         userId: doc.data().userId || doc.ref.parent.parent?.id,
         tradeId: doc.id,
