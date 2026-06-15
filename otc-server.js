@@ -402,7 +402,6 @@ async function _settleDueTradesFromRTDB() {
           const t = tradeNode.val();
           if (t.accountType !== 'live') return;
           const key = `${userId}/${tradeNode.key}`;
-          if (_pendingSettle.has(key)) return;
           if (_rtdbSettledKeys.has(key)) return;
           if (_candleSettlingSymbols.has(t.symbol)) return;
           const state = _states[t.symbol];
