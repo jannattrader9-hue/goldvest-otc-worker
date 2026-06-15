@@ -406,7 +406,7 @@ async function _settleDueTradesFromRTDB() {
           if (_rtdbSettledKeys.has(key)) return;
           if (_candleSettlingSymbols.has(t.symbol)) return;
           const state = _states[t.symbol];
-          if (!state || typeof state.price !== 'number') return;
+          if (!state || typeof state.price !== 'number') { console.log(`[rtdb-debug] SKIP symbol=${t.symbol} state=${state?JSON.stringify({type:state.type,price:state.price,pt:typeof state.price}):"NULL"}`); return; }
           if (!bySymbol.has(t.symbol)) bySymbol.set(t.symbol, { closePrice: state.price, trades: [] });
           bySymbol.get(t.symbol).trades.push({ userId, tradeId: tradeNode.key, closePrice: state.price });
           _rtdbSettledKeys.add(key);
@@ -916,6 +916,7 @@ setInterval(() => {
     .then(() => console.log('[ping] OK'))
     .catch(() => {});
 }, 8*60*1000);
+
 
 
 
