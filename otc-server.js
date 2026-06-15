@@ -221,7 +221,7 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
         const t = tradeNode.val();
         // symbol filter — একই candleTime-এ অনেক symbol-এর trades থাকতে পারে
         if (t.symbol === symbol && t.accountType === 'live') {
-          trades.push({ userId, tradeId: tradeNode.key, closePrice });
+          trades.push({ userId, tradeId: tradeNode.key, closePrice, type: t.type || '', amount: t.amount || 0 });
           // tick-settle duplicate এড়াতে pending mark করো
           const key = `${userId}/${tradeNode.key}`;
           _activeTradesMemory.delete(key);
@@ -382,7 +382,7 @@ async function _settleDueTradesFromMemory() {
     const state = _states[t.symbol];
     if (!state || typeof state.price !== 'number') continue;
     if (!bySymbol.has(t.symbol)) bySymbol.set(t.symbol, { closePrice: state.price, trades: [] });
-    bySymbol.get(t.symbol).trades.push({ userId: t.userId, tradeId: t.tradeId, closePrice: state.price });
+    bySymbol.get(t.symbol).trades.push({ userId: t.userId, tradeId: t.tradeId, closePrice: state.price, type: t.type || '', amount: t.amount || 0 });
   }
 
   // প্রতি symbol-এর trades batchSettle-এ পাঠাও
