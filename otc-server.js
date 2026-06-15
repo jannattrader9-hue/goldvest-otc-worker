@@ -213,7 +213,7 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
       });
     });
 
-    if (trades.length === 0) return;
+    if (trades.length === 0) { _candleSettlingSymbols.delete(symbol); return; }
     console.log(`[settle] ${symbol} candleTime=${candleTime} found ${trades.length} trades in queue`);
 
     // 30s safety — Firestore confirm না এলেও pending guard clear করো
