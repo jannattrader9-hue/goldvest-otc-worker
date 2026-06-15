@@ -405,9 +405,9 @@ async function _settleDueTradesFromRTDB() {
           if (_rtdbSettledKeys.has(key)) return;
           if (_candleSettlingSymbols.has(t.symbol)) return;
           const state = _states[t.symbol];
-          if (!state || typeof state.price !== 'number') { console.log(`[rtdb-debug] SKIP symbol=${t.symbol} state=${state?JSON.stringify({type:state.type,price:state.price,pt:typeof state.price}):"NULL"}`); return; }
+          if (!state || typeof state.price !== 'number') return;
           if (!bySymbol.has(t.symbol)) bySymbol.set(t.symbol, { closePrice: state.price, trades: [] });
-          bySymbol.get(t.symbol).trades.push({ userId, tradeId: tradeNode.key, closePrice: state.price });
+          bySymbol.get(t.symbol).trades.push({ userId, tradeId: tradeNode.key, closePrice: state.price, expiryTimestamp });
           _rtdbSettledKeys.add(key);
           _pendingSettle.add(key);
           _activeTradesMemory.delete(key);
@@ -420,6 +420,10 @@ async function _settleDueTradesFromRTDB() {
     await Promise.allSettled([...bySymbol.entries()].map(async ([symbol, { closePrice, trades }]) => {
       console.log(`[rtdb-tick-settle] ${symbol} due=${trades.length} closePrice=${closePrice.toFixed(5)}`);
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
+      // settle হয়ে গেলে RTDB queue থেকে delete করো
+      await Promise.allSettled(trades.map(t =>
+        db.ref(`settlement_queue/${t.expiryTimestamp}/${t.userId}/${t.tradeId}`).remove()
+      ));
     }));
 
     // 60s পরে guard clear করো
