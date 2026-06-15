@@ -111,6 +111,23 @@ function _flushUserSettleBatch(userId) {
 async function _batchSettleAndBroadcast(symbol, trades, closePrice) {
   if (!trades || trades.length === 0) return;
 
+  // ── live_market_stats decrement (fire-and-forget) ──
+  try {
+    let upDec = 0, downDec = 0, upAmt = 0, downAmt = 0;
+    trades.forEach(t => {
+      if (t.type === 'up')   { upDec++;   upAmt   += t.amount || 0; }
+      else                   { downDec++; downAmt += t.amount || 0; }
+    });
+    db.ref('live_market_stats/' + symbol).transaction(curr => {
+      if (!curr) return curr;
+      curr.up       = Math.max(0, (curr.up       || 0) - upDec);
+      curr.down     = Math.max(0, (curr.down     || 0) - downDec);
+      curr.upAmount = Math.max(0, (curr.upAmount || 0) - upAmt);
+      curr.downAmount = Math.max(0, (curr.downAmount || 0) - downAmt);
+      return curr;
+    }).catch(() => {});
+  } catch (e) {}
+
   // ── Redis path (fast, <1ms per trade) ──────────────────
   if (redisPub && redisReady) {
     try {
@@ -407,7 +424,7 @@ async function _settleDueTradesFromRTDB() {
           const state = _states[t.symbol];
           if (!state || typeof state.price !== 'number') return;
           if (!bySymbol.has(t.symbol)) bySymbol.set(t.symbol, { closePrice: state.price, trades: [] });
-          bySymbol.get(t.symbol).trades.push({ userId, tradeId: tradeNode.key, closePrice: state.price, expiryTimestamp });
+          bySymbol.get(t.symbol).trades.push({ userId, tradeId: tradeNode.key, closePrice: state.price, expiryTimestamp, type: t.type || '', amount: t.amount || 0 });
           _rtdbSettledKeys.add(key);
           _pendingSettle.add(key);
           _activeTradesMemory.delete(key);
