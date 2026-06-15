@@ -382,6 +382,64 @@ async function _settleDueTradesFromMemory() {
   }, 30000);
 }
 
+// ── RTDB settlement_queue থেকে directly due trades settle ──
+// Firestore shadow listener slow হলেও এই path কাজ করে।
+// প্রতি tick এ RTDB queue চেক করে — expiryTimestamp <= now হলে settle করো।
+const _rtdbSettledKeys = new Set(); // duplicate guard
+async function _settleDueTradesFromRTDB() {
+  try {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const snap = await db.ref('settlement_queue')
+      .orderByKey()
+      .endAt(String(nowSec))
+      .once('value');
+    if (!snap.exists()) return;
+
+    const bySymbol = new Map();
+    snap.forEach(timeNode => {
+      const expiryTimestamp = parseInt(timeNode.key);
+      timeNode.forEach(userNode => {
+        const userId = userNode.key;
+        userNode.forEach(tradeNode => {
+          const t = tradeNode.val();
+          if (t.accountType !== 'live') return;
+          const key = `${userId}/${tradeNode.key}`;
+          if (_pendingSettle.has(key)) return;
+          if (_rtdbSettledKeys.has(key)) return;
+          if (_candleSettlingSymbols.has(t.symbol)) return;
+          const state = _states[t.symbol];
+          if (!state || typeof state.price !== 'number') return;
+          if (!bySymbol.has(t.symbol)) bySymbol.set(t.symbol, { closePrice: state.price, trades: [] });
+          bySymbol.get(t.symbol).trades.push({ userId, tradeId: tradeNode.key, closePrice: state.price });
+          _rtdbSettledKeys.add(key);
+          _pendingSettle.add(key);
+          _activeTradesMemory.delete(key);
+        });
+      });
+    });
+
+    if (bySymbol.size === 0) return;
+
+    await Promise.allSettled([...bySymbol.entries()].map(async ([symbol, { closePrice, trades }]) => {
+      console.log(`[rtdb-tick-settle] ${symbol} due=${trades.length} closePrice=${closePrice.toFixed(5)}`);
+      await _batchSettleAndBroadcast(symbol, trades, closePrice);
+    }));
+
+    // 60s পরে guard clear করো
+    setTimeout(() => {
+      [...bySymbol.values()].forEach(({ trades }) => {
+        trades.forEach(t => {
+          const key = `${t.userId}/${t.tradeId}`;
+          _rtdbSettledKeys.delete(key);
+          _pendingSettle.delete(key);
+        });
+      });
+    }, 60000);
+  } catch (e) {
+    console.error('[rtdb-tick-settle] error:', e.message);
+  }
+}
+
 // ── 24h change tracking ───────────────────────────────────
 // প্রতি symbol এর জন্য 24h আগের open price cache করো
 const _openPrice24h  = {}; // { BTCOTC: { price, time } }
@@ -841,6 +899,7 @@ async function main() {
       if (_states[id]?.type === 'forex') tickForex(id);
     });
     _settleDueTradesFromMemory().catch(e => console.error('[tick-settle] error:', e.message));
+    _settleDueTradesFromRTDB().catch(e => console.error('[rtdb-tick-settle] error:', e.message));
   }, TICK_MS);
   console.log('Server running ✅');
 }
