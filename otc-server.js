@@ -1059,6 +1059,58 @@ http.createServer(async (req, res) => {
     return;
   }
 
+  // ── POST /admin-deduct ────────────────────────────────────
+  if (req.method === 'POST' && req.url === '/admin-deduct') {
+    try {
+      let body;
+      try { body = await _readBody(req); }
+      catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid body' })); return; }
+
+      const { uid, amount, adminSecret } = body;
+
+      // Admin secret check
+      if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) {
+        res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
+      }
+
+      if (!uid || !amount || parseFloat(amount) <= 0) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid uid or amount' })); return;
+      }
+
+      const deductAmt = parseFloat(amount);
+      const balKey = BAL_KEY_OTC(uid);
+
+      // Redis miss হলে Firestore থেকে load
+      let currentBal = await redisPub.get(balKey);
+      if (currentBal === null) {
+        const snap = await firestore.collection('users').doc(uid).get();
+        const bal  = snap.exists ? (snap.data().liveBalance || 0) : 0;
+        await redisPub.set(balKey, bal.toString(), 'EX', 3600);
+        currentBal = bal.toString();
+      }
+
+      const balFloat = parseFloat(currentBal);
+      if (balFloat < deductAmt) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Insufficient balance', balance: balFloat })); return;
+      }
+
+      // Atomic deduct
+      const newBal = await redisPub.incrbyfloat(balKey, -deductAmt);
+      await redisPub.expire(balKey, 3600);
+      await redisPub.set(`gv:bal:dirty:${uid}`, '1', 'EX', 3600);
+
+      console.log(`[admin-deduct] uid=${uid} amount=${deductAmt} newBal=${newBal}`);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, newBalance: parseFloat(newBal) }));
+
+    } catch(e) {
+      console.error('[admin-deduct] error:', e.message);
+      res.writeHead(500); res.end(JSON.stringify({ error: 'Internal error' }));
+    }
+    return;
+  }
+
   res.writeHead(404); res.end('Not found');
 
 }).listen(process.env.PORT||3000, () => console.log('HTTP alive'));
