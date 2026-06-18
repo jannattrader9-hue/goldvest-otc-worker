@@ -935,11 +935,132 @@ async function main() {
 main().catch(console.error);
 
 const http = require('http');
-http.createServer((req, res) => {
-  const otc   = [..._activeMarkets].filter(id => _states[id]?.type === 'otc');
-  const forex = [..._activeMarkets].filter(id => _states[id]?.type === 'forex');
-  res.writeHead(200);
-  res.end(`GoldVest ✅\nOTC: ${otc.join(',')||'none'}\nForex: ${forex.join(',')||'none'}`);
+
+// ── /place-trade helper — body parse ──────────────────────
+function _readBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk; if (body.length > 10000) reject(new Error('Body too large')); });
+    req.on('end', () => { try { resolve(JSON.parse(body)); } catch(e) { reject(e); } });
+    req.on('error', reject);
+  });
+}
+
+const BAL_KEY_OTC   = (uid) => `gv:bal:${uid}`;
+const TRADE_KEY_OTC = (tid) => `gv:trade:${tid}`;
+
+http.createServer(async (req, res) => {
+  // CORS — client fetch করতে পারবে
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  // ── GET / — health check ──────────────────────────────
+  if (req.method === 'GET') {
+    const otc   = [..._activeMarkets].filter(id => _states[id]?.type === 'otc');
+    const forex = [..._activeMarkets].filter(id => _states[id]?.type === 'forex');
+    res.writeHead(200);
+    res.end(`GoldVest ✅\nOTC: ${otc.join(',')||'none'}\nForex: ${forex.join(',')||'none'}`);
+    return;
+  }
+
+  // ── POST /place-trade ─────────────────────────────────
+  if (req.method === 'POST' && req.url === '/place-trade') {
+    try {
+      // 1. Body parse
+      let body;
+      try { body = await _readBody(req); }
+      catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid body' })); return; }
+
+      const { idToken, trade } = body;
+      if (!idToken || !trade) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Missing idToken or trade' })); return;
+      }
+
+      // 2. Firebase Auth token verify — server side security
+      let decoded;
+      try { decoded = await admin.auth().verifyIdToken(idToken); }
+      catch(e) {
+        res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
+      }
+
+      const userId  = decoded.uid;
+      const amount  = parseFloat(trade.amount);
+      const tradeId = trade.firestoreId;
+
+      if (!tradeId || !amount || amount <= 0) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid trade data' })); return;
+      }
+
+      // 3. Redis balance check + atomic deduct
+      const balKey = BAL_KEY_OTC(userId);
+      let currentBal = await redisPub.get(balKey);
+
+      if (currentBal === null) {
+        // Redis miss — Firestore থেকে load করে cache করো
+        const snap = await firestore.collection('users').doc(userId).get();
+        const bal  = snap.exists ? (snap.data().liveBalance || 0) : 0;
+        await redisPub.set(balKey, bal.toString(), 'EX', 3600);
+        currentBal = bal.toString();
+      }
+
+      const balFloat = parseFloat(currentBal);
+      if (balFloat < amount) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Insufficient balance', balance: balFloat })); return;
+      }
+
+      // Atomic deduct — race condition safe
+      const newBal = await redisPub.incrbyfloat(balKey, -amount);
+      await redisPub.expire(balKey, 3600);
+      await redisPub.set(`gv:bal:dirty:${userId}`, '1', 'EX', 3600);
+
+      console.log(`[place-trade] userId=${userId} tradeId=${tradeId} amount=${amount} newBal=${newBal}`);
+
+      // 4. Redis Hash এ trade data save — settler <1ms এ পাবে
+      await redisPub.hset(TRADE_KEY_OTC(tradeId),
+        'userId',          userId,
+        'symbol',          trade.symbol || '',
+        'entryPrice',      String(trade.entryPrice || 0),
+        'amount',          String(amount),
+        'type',            trade.type || '',
+        'payoutPercent',   String(trade.payoutPercent || 92),
+        'status',          'live',
+        'accountType',     'live',
+        'expiryTimestamp', String(trade.expiryTimestamp || 0),
+        'currency',        trade.currency || 'USD',
+      );
+      await redisPub.expire(TRADE_KEY_OTC(tradeId), 7200); // 2h TTL
+
+      // 5. RTDB settlement_queue write — otc-server candle close এ এখান থেকে পাবে
+      db.ref(`settlement_queue/${trade.expiryTimestamp}/${userId}/${tradeId}`).set({
+        userId, tradeId,
+        symbol:      trade.symbol || '',
+        accountType: 'live',
+        type:        trade.type || '',
+        amount:      amount,
+      }).catch(e => console.error('[place-trade] RTDB queue failed:', e.message));
+
+      // 6. Firestore trade save — background, non-blocking
+      firestore.collection('users').doc(userId).collection('trades').doc(tradeId).set({
+        ...trade,
+        userId,
+        tradeLine:  null,
+        createdAt:  admin.firestore.FieldValue.serverTimestamp(),
+      }).catch(e => console.error('[place-trade] Firestore save failed:', e.message));
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, newBalance: parseFloat(newBal) }));
+
+    } catch(e) {
+      console.error('[place-trade] error:', e.message);
+      res.writeHead(500); res.end(JSON.stringify({ error: 'Internal error' }));
+    }
+    return;
+  }
+
+  res.writeHead(404); res.end('Not found');
+
 }).listen(process.env.PORT||3000, () => console.log('HTTP alive'));
 
 setInterval(() => {
