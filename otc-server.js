@@ -1157,6 +1157,71 @@ http.createServer(async (req, res) => {
     return;
   }
 
+  // ── POST /sell-trade ─────────────────────────────────────
+  if (req.method === 'POST' && req.url === '/sell-trade') {
+    try {
+      let body;
+      try { body = await _readBody(req); }
+      catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid body' })); return; }
+
+      const { idToken, tradeId, userId } = body;
+
+      if (!idToken || !tradeId || !userId) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Missing fields' })); return;
+      }
+
+      // idToken verify — user authenticate
+      let decoded;
+      try { decoded = await admin.auth().verifyIdToken(idToken); }
+      catch(e) {
+        res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
+      }
+
+      if (decoded.uid !== userId) {
+        res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
+      }
+
+      // Firestore থেকে trade data নাও — sellPrice validate করো
+      const tradeSnap = await firestore.collection('users').doc(userId).collection('trades').doc(tradeId).get();
+      if (!tradeSnap.exists) {
+        res.writeHead(404); res.end(JSON.stringify({ error: 'Trade not found' })); return;
+      }
+
+      const trade = tradeSnap.data();
+      if (trade.status !== 'sold') {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Trade not sold' })); return;
+      }
+
+      const sellPrice = parseFloat(trade.sellPrice || 0);
+      if (!sellPrice || sellPrice <= 0) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid sell price' })); return;
+      }
+
+      // Redis এ atomic credit
+      const balKey = BAL_KEY_OTC(userId);
+      let currentBal = await redisPub.get(balKey);
+      if (currentBal === null) {
+        const snap = await firestore.collection('users').doc(userId).get();
+        const bal = snap.exists ? (snap.data().liveBalance || 0) : 0;
+        await redisPub.set(balKey, bal.toString(), 'EX', 3600);
+      }
+
+      const newBal = await redisPub.incrbyfloat(balKey, sellPrice);
+      await redisPub.expire(balKey, 3600);
+      await redisPub.set(`gv:bal:dirty:${userId}`, '1', 'EX', 3600);
+
+      console.log(`[sell-trade] userId=${userId} tradeId=${tradeId} sellPrice=${sellPrice} newBal=${newBal}`);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, newBalance: parseFloat(newBal) }));
+
+    } catch(e) {
+      console.error('[sell-trade] error:', e.message);
+      res.writeHead(500); res.end(JSON.stringify({ error: 'Internal error' }));
+    }
+    return;
+  }
+
   res.writeHead(404); res.end('Not found');
 
 }).listen(process.env.PORT||3000, () => console.log('HTTP alive'));
