@@ -1209,6 +1209,8 @@ http.createServer(async (req, res) => {
       const newBal = await redisPub.incrbyfloat(balKey, sellPrice);
       await redisPub.expire(balKey, 3600);
       await redisPub.set(`gv:bal:dirty:${userId}`, '1', 'EX', 3600);
+      // Redis Hash এ status 'sold' set করো — settler আর credit করবে না
+      await redisPub.hset(`gv:trade:${tradeId}`, 'status', 'sold');
 
       console.log(`[sell-trade] userId=${userId} tradeId=${tradeId} sellPrice=${sellPrice} newBal=${newBal}`);
 
