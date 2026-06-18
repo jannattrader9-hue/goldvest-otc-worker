@@ -1164,9 +1164,9 @@ http.createServer(async (req, res) => {
       try { body = await _readBody(req); }
       catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid body' })); return; }
 
-      const { idToken, tradeId, userId } = body;
+      const { idToken, tradeId, userId, sellPrice: claimedSellPrice } = body;
 
-      if (!idToken || !tradeId || !userId) {
+      if (!idToken || !tradeId || !userId || !claimedSellPrice) {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Missing fields' })); return;
       }
 
@@ -1181,19 +1181,28 @@ http.createServer(async (req, res) => {
         res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
       }
 
-      // Firestore থেকে trade data নাও — sellPrice validate করো
-      const tradeSnap = await firestore.collection('users').doc(userId).collection('trades').doc(tradeId).get();
-      if (!tradeSnap.exists) {
+      // Redis Hash থেকে trade data নাও — দ্রুত validate (Firestore এর বদলে)
+      const TRADE_KEY = `gv:trade:${tradeId}`;
+      const hash = await redisPub.hgetall(TRADE_KEY);
+      if (!hash || !hash.userId) {
         res.writeHead(404); res.end(JSON.stringify({ error: 'Trade not found' })); return;
       }
 
-      const trade = tradeSnap.data();
-      if (trade.status !== 'sold') {
-        res.writeHead(400); res.end(JSON.stringify({ error: 'Trade not sold' })); return;
+      if (hash.userId !== userId) {
+        res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
       }
 
-      const sellPrice = parseFloat(trade.sellPrice || 0);
-      if (!sellPrice || sellPrice <= 0) {
+      if (hash.status === 'sold' || hash.status === 'won' || hash.status === 'lost' || hash.status === 'refunded') {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Trade already settled' })); return;
+      }
+
+      // sellPrice sanity check — max payout এর বেশি হতে পারবে না
+      const tradeAmount = parseFloat(hash.amount || 0);
+      const payoutPercent = parseFloat(hash.payoutPercent || 92);
+      const maxPossible = tradeAmount + (tradeAmount * payoutPercent / 100);
+      const sellPrice = parseFloat(claimedSellPrice);
+
+      if (!sellPrice || sellPrice <= 0 || sellPrice > maxPossible) {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid sell price' })); return;
       }
 
