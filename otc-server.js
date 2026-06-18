@@ -1111,6 +1111,52 @@ http.createServer(async (req, res) => {
     return;
   }
 
+  // ── POST /admin-credit ───────────────────────────────────
+  if (req.method === 'POST' && req.url === '/admin-credit') {
+    try {
+      let body;
+      try { body = await _readBody(req); }
+      catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid body' })); return; }
+
+      const { uid, amount, adminSecret } = body;
+
+      // Admin secret check
+      if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) {
+        res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
+      }
+
+      if (!uid || !amount || parseFloat(amount) <= 0) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid uid or amount' })); return;
+      }
+
+      const creditAmt = parseFloat(amount);
+      const balKey = BAL_KEY_OTC(uid);
+
+      // Redis miss হলে Firestore থেকে load
+      let currentBal = await redisPub.get(balKey);
+      if (currentBal === null) {
+        const snap = await firestore.collection('users').doc(uid).get();
+        const bal  = snap.exists ? (snap.data().liveBalance || 0) : 0;
+        await redisPub.set(balKey, bal.toString(), 'EX', 3600);
+      }
+
+      // Atomic credit
+      const newBal = await redisPub.incrbyfloat(balKey, creditAmt);
+      await redisPub.expire(balKey, 3600);
+      await redisPub.set(`gv:bal:dirty:${uid}`, '1', 'EX', 3600);
+
+      console.log(`[admin-credit] uid=${uid} amount=${creditAmt} newBal=${newBal}`);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, newBalance: parseFloat(newBal) }));
+
+    } catch(e) {
+      console.error('[admin-credit] error:', e.message);
+      res.writeHead(500); res.end(JSON.stringify({ error: 'Internal error' }));
+    }
+    return;
+  }
+
   res.writeHead(404); res.end('Not found');
 
 }).listen(process.env.PORT||3000, () => console.log('HTTP alive'));
