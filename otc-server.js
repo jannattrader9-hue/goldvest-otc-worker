@@ -18,6 +18,10 @@ admin.initializeApp({
 const db        = admin.database();
 const firestore = admin.firestore();
 
+// ── NOWPayments crypto currencies cache ──
+let _cryptoCurrenciesCache = null;
+let _cryptoCurrenciesCacheTime = 0;
+
 // ── Redis client — settler service-এ trade jobs push করে ──
 const REDIS_URL = process.env.REDIS_URL;
 let   redisPub  = null;
@@ -1228,6 +1232,44 @@ http.createServer(async (req, res) => {
 
     } catch(e) {
       console.error('[sell-trade] error:', e.message);
+      res.writeHead(500); res.end(JSON.stringify({ error: 'Internal error' }));
+    }
+    return;
+  }
+
+  // ── GET /crypto-currencies ───────────────────────────────
+  // NOWPayments থেকে available crypto currencies list — 1 ঘণ্টা cache করা হয়
+  if (req.method === 'GET' && req.url === '/crypto-currencies') {
+    try {
+      const now = Date.now();
+      if (_cryptoCurrenciesCache && (now - _cryptoCurrenciesCacheTime) < 3600000) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, currencies: _cryptoCurrenciesCache, cached: true }));
+        return;
+      }
+
+      const npRes = await fetch('https://api.nowpayments.io/v1/full-currencies', {
+        headers: { 'x-api-key': process.env.NOWPAYMENTS_API_KEY }
+      });
+      const npData = await npRes.json();
+
+      if (!npData.currencies) {
+        res.writeHead(502); res.end(JSON.stringify({ error: 'NOWPayments currencies fetch failed' })); return;
+      }
+
+      // শুধু enabled currency গুলো রাখো, frontend এর জন্য simplify করো
+      const list = npData.currencies
+        .filter(c => c.enable)
+        .map(c => ({ code: c.code, name: c.name, logo: c.logo_url || null, network: c.network }));
+
+      _cryptoCurrenciesCache = list;
+      _cryptoCurrenciesCacheTime = now;
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, currencies: list, cached: false }));
+
+    } catch(e) {
+      console.error('[crypto-currencies] error:', e.message);
       res.writeHead(500); res.end(JSON.stringify({ error: 'Internal error' }));
     }
     return;
