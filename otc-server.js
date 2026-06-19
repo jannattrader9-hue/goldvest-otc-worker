@@ -962,7 +962,7 @@ http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
   // ── GET / — health check ──────────────────────────────
-  if (req.method === 'GET') {
+  if (req.method === 'GET' && req.url === '/') {
     const otc   = [..._activeMarkets].filter(id => _states[id]?.type === 'otc');
     const forex = [..._activeMarkets].filter(id => _states[id]?.type === 'forex');
     res.writeHead(200);
