@@ -7,6 +7,7 @@
 const admin = require('firebase-admin');
 const pLimit = require('p-limit');
 const Redis  = require('ioredis');
+const crypto = require('crypto');
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
@@ -1350,6 +1351,115 @@ http.createServer(async (req, res) => {
     } catch(e) {
       console.error('[create-crypto-payment] error:', e.message);
       res.writeHead(500); res.end(JSON.stringify({ error: 'Internal error' }));
+    }
+    return;
+  }
+
+  // ── POST /nowpayments-webhook ────────────────────────────
+  // NOWPayments IPN callback — payment status update পাঠায়
+  if (req.method === 'POST' && req.url === '/nowpayments-webhook') {
+    try {
+      let body;
+      try { body = await _readBody(req); }
+      catch(e) { res.writeHead(400); res.end('Invalid body'); return; }
+
+      // ── Signature verify — HMAC-SHA512, sorted keys ──
+      const receivedSig = req.headers['x-nowpayments-sig'];
+      if (!receivedSig) {
+        console.warn('[nowpayments-webhook] missing signature header');
+        res.writeHead(401); res.end('Missing signature'); return;
+      }
+
+      function _sortObject(obj) {
+        return Object.keys(obj).sort().reduce((result, key) => {
+          result[key] = (obj[key] && typeof obj[key] === 'object') ? _sortObject(obj[key]) : obj[key];
+          return result;
+        }, {});
+      }
+
+      const sortedBody = _sortObject(body);
+      const hmac = crypto.createHmac('sha512', process.env.NOWPAYMENTS_IPN_SECRET);
+      hmac.update(JSON.stringify(sortedBody));
+      const expectedSig = hmac.digest('hex');
+
+      if (expectedSig !== receivedSig) {
+        console.warn('[nowpayments-webhook] signature mismatch — possible forged request');
+        res.writeHead(401); res.end('Invalid signature'); return;
+      }
+
+      // ── Signature OK — payment process করো ──
+      const { payment_id, payment_status, price_amount } = body;
+
+      if (!payment_id) {
+        res.writeHead(400); res.end('Missing payment_id'); return;
+      }
+
+      console.log(`[nowpayments-webhook] paymentId=${payment_id} status=${payment_status}`);
+
+      // শুধু 'finished' status এ balance credit করো
+      if (payment_status === 'finished') {
+        const payDocRef = firestore.collection('cryptoPayments').doc(String(payment_id));
+
+        // Transaction দিয়ে atomic check-and-mark — duplicate webhook race condition প্রতিরোধ করে
+        let shouldCredit = false;
+        let uid = null;
+        let creditAmt = 0;
+
+        await firestore.runTransaction(async (tx) => {
+          const payDoc = await tx.get(payDocRef);
+
+          if (!payDoc.exists) {
+            console.warn(`[nowpayments-webhook] paymentId=${payment_id} — no matching record found`);
+            return;
+          }
+
+          const payData = payDoc.data();
+
+          if (payData.status === 'finished') {
+            console.log(`[nowpayments-webhook] paymentId=${payment_id} already processed — skip`);
+            return;
+          }
+
+          uid = payData.uid;
+          creditAmt = parseFloat(price_amount) || payData.amountUSD;
+          shouldCredit = true;
+
+          // এখনই status 'finished' মার্ক করো — পরবর্তী duplicate webhook এই check এ আটকে যাবে
+          tx.update(payDocRef, {
+            status:         'finished',
+            creditedAmount: creditAmt,
+            finishedAt:     admin.firestore.FieldValue.serverTimestamp(),
+          });
+        });
+
+        if (shouldCredit && uid) {
+          // Redis এ USD credit (transaction এর বাইরে — Redis Firestore transaction এ অংশ নেয় না)
+          const balKey = BAL_KEY_OTC(uid);
+          let currentBal = await redisPub.get(balKey);
+          if (currentBal === null) {
+            const userSnap = await firestore.collection('users').doc(uid).get();
+            const bal = userSnap.exists ? (userSnap.data().liveBalance || 0) : 0;
+            await redisPub.set(balKey, bal.toString(), 'EX', 3600);
+          }
+
+          const newBal = await redisPub.incrbyfloat(balKey, creditAmt);
+          await redisPub.expire(balKey, 3600);
+          await redisPub.set(`gv:bal:dirty:${uid}`, '1', 'EX', 3600);
+
+          console.log(`[nowpayments-webhook] uid=${uid} paymentId=${payment_id} credited=${creditAmt} newBal=${newBal}`);
+        }
+
+      } else {
+        // অন্য status (waiting, confirming, partially_paid, failed, expired) — শুধু log/track করো
+        const payDocRef = firestore.collection('cryptoPayments').doc(String(payment_id));
+        await payDocRef.update({ status: payment_status || 'unknown' }).catch(() => {});
+      }
+
+      res.writeHead(200); res.end('OK');
+
+    } catch(e) {
+      console.error('[nowpayments-webhook] error:', e.message);
+      res.writeHead(500); res.end('Internal error');
     }
     return;
   }
