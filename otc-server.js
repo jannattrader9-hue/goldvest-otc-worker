@@ -1464,6 +1464,32 @@ http.createServer(async (req, res) => {
     return;
   }
 
+  // ── TEMP DEBUG: GET /debug-min-amounts — সব curated coin এর minimum amount দেখায়, পরে delete করা হবে ──
+  if (req.method === 'GET' && req.url === '/debug-min-amounts') {
+    try {
+      const coins = ['usdttrc20','usdterc20','usdtbsc','btc','eth','ltc','bch','trx','usdc','dash','matic','dai','shib','doge','xrp','ton'];
+      const results = {};
+
+      for (const coin of coins) {
+        try {
+          const npRes = await fetch(`https://api.nowpayments.io/v1/min-amount?currency_from=${coin}&currency_to=usd&fiat_equivalent=usd`, {
+            headers: { 'x-api-key': process.env.NOWPAYMENTS_API_KEY }
+          });
+          const npData = await npRes.json();
+          results[coin] = npData.fiat_equivalent || npData.min_amount || npData;
+        } catch(e) {
+          results[coin] = 'error: ' + e.message;
+        }
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(results, null, 2));
+    } catch(e) {
+      res.writeHead(500); res.end(JSON.stringify({ error: e.message }));
+    }
+    return;
+  }
+
   res.writeHead(404); res.end('Not found');
 
 }).listen(process.env.PORT||3000, () => console.log('HTTP alive'));
