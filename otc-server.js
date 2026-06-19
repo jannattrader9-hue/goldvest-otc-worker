@@ -1275,6 +1275,85 @@ http.createServer(async (req, res) => {
     return;
   }
 
+  // ── POST /create-crypto-payment ──────────────────────────
+  if (req.method === 'POST' && req.url === '/create-crypto-payment') {
+    try {
+      let body;
+      try { body = await _readBody(req); }
+      catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid body' })); return; }
+
+      const { idToken, amountUSD, payCurrency } = body;
+
+      if (!idToken || !amountUSD || !payCurrency) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Missing fields' })); return;
+      }
+
+      const amt = parseFloat(amountUSD);
+      if (!amt || amt <= 0) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid amount' })); return;
+      }
+
+      // idToken verify — user authenticate
+      let decoded;
+      try { decoded = await admin.auth().verifyIdToken(idToken); }
+      catch(e) {
+        res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
+      }
+      const userId = decoded.uid;
+
+      // NOWPayments — Create Payment
+      const npRes = await fetch('https://api.nowpayments.io/v1/payment', {
+        method: 'POST',
+        headers: {
+          'x-api-key':    process.env.NOWPAYMENTS_API_KEY,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          price_amount:      amt,
+          price_currency:    'usd',
+          pay_currency:      payCurrency,
+          order_id:          `gv_${userId}_${Date.now()}`,
+          order_description: 'GoldVest Deposit',
+          ipn_callback_url:  'https://goldvest-otc-worker-production.up.railway.app/nowpayments-webhook'
+        })
+      });
+      const npData = await npRes.json();
+
+      if (!npData.payment_id || !npData.pay_address) {
+        console.error('[create-crypto-payment] NOWPayments error:', JSON.stringify(npData));
+        res.writeHead(502); res.end(JSON.stringify({ error: 'Payment creation failed', detail: npData.message || npData })); return;
+      }
+
+      // Firestore এ track করার জন্য record রাখো
+      await firestore.collection('cryptoPayments').doc(String(npData.payment_id)).set({
+        uid:           userId,
+        amountUSD:     amt,
+        payCurrency:   payCurrency,
+        payAddress:    npData.pay_address,
+        payAmount:     npData.pay_amount,
+        status:        'waiting',
+        createdAt:     admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      console.log(`[create-crypto-payment] uid=${userId} paymentId=${npData.payment_id} amountUSD=${amt} currency=${payCurrency}`);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        success:     true,
+        paymentId:   npData.payment_id,
+        payAddress:  npData.pay_address,
+        payAmount:   npData.pay_amount,
+        payCurrency: npData.pay_currency,
+        extraId:     npData.payin_extra_id || null
+      }));
+
+    } catch(e) {
+      console.error('[create-crypto-payment] error:', e.message);
+      res.writeHead(500); res.end(JSON.stringify({ error: 'Internal error' }));
+    }
+    return;
+  }
+
   res.writeHead(404); res.end('Not found');
 
 }).listen(process.env.PORT||3000, () => console.log('HTTP alive'));
