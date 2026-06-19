@@ -1340,12 +1340,13 @@ http.createServer(async (req, res) => {
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
-        success:     true,
-        paymentId:   npData.payment_id,
-        payAddress:  npData.pay_address,
-        payAmount:   npData.pay_amount,
-        payCurrency: npData.pay_currency,
-        extraId:     npData.payin_extra_id || null
+        success:        true,
+        paymentId:      npData.payment_id,
+        payAddress:     npData.pay_address,
+        payAmount:      npData.pay_amount,
+        payCurrency:    npData.pay_currency,
+        extraId:        npData.payin_extra_id || null,
+        expirationDate: npData.expiration_estimate_date || null
       }));
 
     } catch(e) {
