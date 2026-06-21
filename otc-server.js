@@ -601,6 +601,10 @@ async function initOTC(market) {
   db.ref(`otc_controls/${id}`).on('value', snap => {
     if (snap.exists()) _controls[id] = { ..._controls[id], ...snap.val() };
   });
+  // trade-based mode এর জন্য — Forex engine এ যেভাবে আছে, OTC তেও same pattern
+  db.ref(`otc_trade_stats/${id}`).on('value', snap => {
+    _tradeStats[id] = snap.exists() ? snap.val() : {};
+  });
 
   const now = Date.now(), start = Math.floor(now/CANDLE_MS)*CANDLE_MS;
 
@@ -642,6 +646,15 @@ function tickOTC(id) {
     state.trendSteps--;
   } else if (ctrl.mode === 'manual') {
     state.trend = ctrl.nextDirection === 'up' ? 1 : ctrl.nextDirection === 'down' ? -1 : 0;
+    state.trendSteps = 99;
+  } else if (ctrl.mode === 'trade-based') {
+    // Forex engine এর same pattern — majority pool এর দিকে subtle nudge (guaranteed outcome না)
+    const stats = _tradeStats[id] || {};
+    const up    = parseFloat(stats.upAmount)   || 0;
+    const down  = parseFloat(stats.downAmount) || 0;
+    if (up > down * 1.2)        state.trend = -1;
+    else if (down > up * 1.2)   state.trend = 1;
+    else                        state.trend = 0;
     state.trendSteps = 99;
   }
 
