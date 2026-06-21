@@ -646,7 +646,9 @@ function tickOTC(id) {
   }
 
   const v = state.price * 0.0008 * volMul;
-  state.price = Math.max(state.price + (state.trend*v*(ctrl.trendStrength||0.6) + (Math.random()-0.5)*v*2)*speed, 0.0001);
+  const trendComponent  = state.trend * v * (ctrl.trendStrength || 0.6) * 0.35;
+  const randomComponent = (Math.random() - 0.5) * v * 3.2;
+  state.price = Math.max(state.price + (trendComponent + randomComponent) * speed, 0.0001);
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
 
