@@ -851,7 +851,6 @@ function tickForex(id) {
     else if (down>up*1.2) price = realPrice + v*(0.5+Math.random()*0.5);
   }
   state.price = price;
-  db.ref(`live_prices/${id}`).set(price).catch(() => {}); // real-server settlement এর জন্য
   if (price > state.candleHigh) state.candleHigh = price;
   if (price < state.candleLow)  state.candleLow  = price;
   if (now >= state.nextCandle) {
@@ -1060,6 +1059,8 @@ http.createServer(async (req, res) => {
         accountType: 'live',
         type:        trade.type || '',
         amount:      amount,
+        feedType:    trade.feedType || '',
+        entryPrice:  trade.entryPrice || 0,
       }).catch(e => console.error('[place-trade] RTDB queue failed:', e.message));
 
       // 6. Firestore trade save — background, non-blocking
