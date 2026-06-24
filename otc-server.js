@@ -851,6 +851,7 @@ function tickForex(id) {
     else if (down>up*1.2) price = realPrice + v*(0.5+Math.random()*0.5);
   }
   state.price = price;
+  db.ref(`live_prices/${id}`).set(price).catch(() => {}); // real-server settlement এর জন্য
   if (price > state.candleHigh) state.candleHigh = price;
   if (price < state.candleLow)  state.candleLow  = price;
   if (now >= state.nextCandle) {
