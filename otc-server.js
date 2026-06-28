@@ -1192,17 +1192,29 @@ http.createServer(async (req, res) => {
   }
 
   // ── POST /admin-credit ───────────────────────────────────
+  // Admin panel থেকে deposit approve বা withdrawal reject করলে call হয়।
+  // adminSecret নেই — Firebase idToken + admin custom claim verify করা হয়।
   if (req.method === 'POST' && req.url === '/admin-credit') {
     try {
       let body;
       try { body = await _readBody(req); }
       catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid body' })); return; }
 
-      const { uid, amount, adminSecret } = body;
+      const { idToken, uid, amount } = body;
 
-      // Admin secret check
-      if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) {
+      // idToken verify — caller কে authenticate করো
+      if (!idToken) {
         res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
+      }
+      let decoded;
+      try { decoded = await admin.auth().verifyIdToken(idToken); }
+      catch(e) {
+        res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
+      }
+
+      // Admin custom claim check — token.admin === true হলেই allow
+      if (!decoded.admin) {
+        res.writeHead(403); res.end(JSON.stringify({ error: 'Forbidden — admin only' })); return;
       }
 
       if (!uid || !amount || parseFloat(amount) <= 0) {
