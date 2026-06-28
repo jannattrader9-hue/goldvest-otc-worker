@@ -1053,14 +1053,7 @@ http.createServer(async (req, res) => {
         console.warn('[place-trade] market payout fetch failed, using fallback:', e.message);
       }
 
-      // 4b. expiryTimestamp validate — min 5s, max 24h from now
-      const now = Math.floor(Date.now() / 1000);
-      const expiry = parseInt(trade.expiryTimestamp || 0);
-      if (expiry < now + 5 || expiry > now + 86400) {
-        res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid expiry time' })); return;
-      }
-
-      // 4c. Redis Hash এ trade data save — settler <1ms এ পাবে
+      // 4. Redis Hash এ trade data save — settler <1ms এ পাবে
       await redisPub.hset(TRADE_KEY_OTC(tradeId),
         'userId',          userId,
         'symbol',          trade.symbol || '',
@@ -1070,13 +1063,13 @@ http.createServer(async (req, res) => {
         'payoutPercent',   String(verifiedPayout), // Firestore verified — client value ignore
         'status',          'live',
         'accountType',     'live',
-        'expiryTimestamp', String(expiry),
+        'expiryTimestamp', String(trade.expiryTimestamp || 0),
         'currency',        trade.currency || 'USD',
       );
       await redisPub.expire(TRADE_KEY_OTC(tradeId), 7200); // 2h TTL
 
       // 5. RTDB settlement_queue write — otc-server candle close এ এখান থেকে পাবে
-      db.ref(`settlement_queue/${expiry}/${userId}/${tradeId}`).set({
+      db.ref(`settlement_queue/${trade.expiryTimestamp}/${userId}/${tradeId}`).set({
         userId, tradeId,
         symbol:      trade.symbol || '',
         accountType: 'live',
