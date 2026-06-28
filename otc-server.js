@@ -1081,6 +1081,64 @@ http.createServer(async (req, res) => {
     return;
   }
 
+  // ── POST /withdraw-deduct ─────────────────────────────────
+  // User নিজের withdraw request submit করলে এই endpoint call হয়।
+  // adminSecret নেই — Firebase idToken দিয়ে user authenticate করা হয়।
+  // uid client থেকে আসে না — token থেকে নেওয়া হয় (tamper-proof)।
+  if (req.method === 'POST' && req.url === '/withdraw-deduct') {
+    try {
+      let body;
+      try { body = await _readBody(req); }
+      catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid body' })); return; }
+
+      const { idToken, amount } = body;
+
+      if (!idToken || !amount || parseFloat(amount) <= 0) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Missing fields' })); return;
+      }
+
+      // idToken verify — uid token থেকে নেওয়া হচ্ছে, client-এর uid বিশ্বাস করা হচ্ছে না
+      let decoded;
+      try { decoded = await admin.auth().verifyIdToken(idToken); }
+      catch(e) {
+        res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
+      }
+      const uid = decoded.uid;
+
+      const deductAmt = parseFloat(amount);
+      const balKey = BAL_KEY_OTC(uid);
+
+      // Redis miss হলে Firestore থেকে load
+      let currentBal = await redisPub.get(balKey);
+      if (currentBal === null) {
+        const snap = await firestore.collection('users').doc(uid).get();
+        const bal  = snap.exists ? (snap.data().liveBalance || 0) : 0;
+        await redisPub.set(balKey, bal.toString(), 'EX', 3600);
+        currentBal = bal.toString();
+      }
+
+      const balFloat = parseFloat(currentBal);
+      if (balFloat < deductAmt) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Insufficient balance', balance: balFloat })); return;
+      }
+
+      // Atomic deduct
+      const newBal = await redisPub.incrbyfloat(balKey, -deductAmt);
+      await redisPub.expire(balKey, 3600);
+      await redisPub.set(`gv:bal:dirty:${uid}`, '1', 'EX', 3600);
+
+      console.log(`[withdraw-deduct] uid=${uid} amount=${deductAmt} newBal=${newBal}`);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, newBalance: parseFloat(newBal) }));
+
+    } catch(e) {
+      console.error('[withdraw-deduct] error:', e.message);
+      res.writeHead(500); res.end(JSON.stringify({ error: 'Internal error' }));
+    }
+    return;
+  }
+
   // ── POST /admin-deduct ────────────────────────────────────
   if (req.method === 'POST' && req.url === '/admin-deduct') {
     try {
