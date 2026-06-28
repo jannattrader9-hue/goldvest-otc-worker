@@ -1037,23 +1037,46 @@ http.createServer(async (req, res) => {
 
       console.log(`[place-trade] userId=${userId} tradeId=${tradeId} amount=${amount} newBal=${newBal}`);
 
-      // 4. Redis Hash এ trade data save — settler <1ms এ পাবে
+      // 4a. Firestore থেকে market এর real payout নাও — client value বিশ্বাস করা হচ্ছে না
+      let verifiedPayout = 92; // safe fallback
+      try {
+        const mSnap = await firestore.collection('markets').doc(trade.symbol || '').get();
+        if (mSnap.exists) {
+          const mData = mSnap.data();
+          const duration = parseFloat(trade.duration || 0);
+          // 5 মিনিট (300s) বা তার বেশি হলে payout5, না হলে payout
+          verifiedPayout = (duration >= 300 && mData.payout5)
+            ? mData.payout5
+            : (mData.payout || 92);
+        }
+      } catch(e) {
+        console.warn('[place-trade] market payout fetch failed, using fallback:', e.message);
+      }
+
+      // 4b. expiryTimestamp validate — min 5s, max 24h from now
+      const now = Math.floor(Date.now() / 1000);
+      const expiry = parseInt(trade.expiryTimestamp || 0);
+      if (expiry < now + 5 || expiry > now + 86400) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid expiry time' })); return;
+      }
+
+      // 4c. Redis Hash এ trade data save — settler <1ms এ পাবে
       await redisPub.hset(TRADE_KEY_OTC(tradeId),
         'userId',          userId,
         'symbol',          trade.symbol || '',
         'entryPrice',      String(trade.entryPrice || 0),
         'amount',          String(amount),
         'type',            trade.type || '',
-        'payoutPercent',   String(trade.payoutPercent || 92),
+        'payoutPercent',   String(verifiedPayout), // Firestore verified — client value ignore
         'status',          'live',
         'accountType',     'live',
-        'expiryTimestamp', String(trade.expiryTimestamp || 0),
+        'expiryTimestamp', String(expiry),
         'currency',        trade.currency || 'USD',
       );
       await redisPub.expire(TRADE_KEY_OTC(tradeId), 7200); // 2h TTL
 
       // 5. RTDB settlement_queue write — otc-server candle close এ এখান থেকে পাবে
-      db.ref(`settlement_queue/${trade.expiryTimestamp}/${userId}/${tradeId}`).set({
+      db.ref(`settlement_queue/${expiry}/${userId}/${tradeId}`).set({
         userId, tradeId,
         symbol:      trade.symbol || '',
         accountType: 'live',
