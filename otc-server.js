@@ -737,45 +737,21 @@ function tickOTC(id) {
     momentumDecay = 0.95;
     randomScale   = 0.05;
   } else {
-    // normal — Quotex exact pattern (145 tick analysis)
-    // 58% zero, 21% pos, 21% neg | avg change 0.003 | max 0.011
-    if (!state.lastDir) state.lastDir = 0; // -1=down, 0=same, 1=up
-
+    // normal — fully random, Quotex distribution
+    // 58% zero, 21% up, 21% down — each tick independent
     const rand = Math.random();
 
-    if (state.lastDir === 0) {
-      // After SAME: 58% same, 21% up, 21% down
-      if (rand < 0.58) {
-        rawRandom = 0;
-      } else if (rand < 0.79) {
-        rawRandom = v * (0.5 + Math.random() * 1.2);
-      } else {
-        rawRandom = -v * (0.5 + Math.random() * 1.2);
-      }
-    } else if (state.lastDir > 0) {
-      // After UP: 70% same, 30% up (data confirmed)
-      if (rand < 0.70) {
-        rawRandom = 0;
-      } else {
-        rawRandom = v * (0.1 + Math.random() * 0.4);
-      }
+    if (rand < 0.58) {
+      rawRandom = 0;
+    } else if (rand < 0.79) {
+      rawRandom = v * (0.3 + Math.random() * 1.0);
+    } else if (rand < 0.97) {
+      rawRandom = -v * (0.3 + Math.random() * 1.0);
     } else {
-      // After DOWN: 62% same, 25% up, 12% down
-      if (rand < 0.62) {
-        rawRandom = 0;
-      } else if (rand < 0.87) {
-        rawRandom = v * (0.3 + Math.random() * 0.8);
-      } else {
-        rawRandom = -v * (0.3 + Math.random() * 0.6);
-      }
+      // rare spike 3%
+      rawRandom = (Math.random() < 0.5 ? 1 : -1) * v * (2.5 + Math.random() * 1.5);
     }
 
-    // rare spike 2% — max 0.011 equivalent
-    if (Math.random() < 0.02) {
-      rawRandom = (Math.random() < 0.5 ? 1 : -1) * v * 3.5;
-    }
-
-    state.lastDir = rawRandom > 0 ? 1 : rawRandom < 0 ? -1 : 0;
     momentumDecay = 0.55;
     randomScale   = 0.75;
   }
