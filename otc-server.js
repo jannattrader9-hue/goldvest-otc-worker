@@ -675,6 +675,7 @@ async function initOTC(market) {
     type:'otc', price, candleOpen:price, candleHigh:price, candleLow:price,
     candleTime:start/1000, nextCandle:start+CANDLE_MS,
     trend:0, trendSteps:0,
+    momentum: 0,
     subStates,
   };
   _activeMarkets.add(id);
@@ -711,8 +712,41 @@ function tickOTC(id) {
   }
 
   const v = state.price * 0.0008 * volMul;
-  const trendComponent  = state.trend * v * (ctrl.trendStrength || 0.6) * 0.35;
-  const randomComponent = (Math.random() - 0.5) * v * 3.2;
+  const trendComponent = state.trend * v * (ctrl.trendStrength || 0.6) * 0.35;
+
+  // ── Candle Mode — admin panel থেকে control করা যাবে ──────
+  const candleMode = ctrl.candleMode || 'normal';
+  let rawRandom, momentumDecay, randomScale;
+
+  if (candleMode === 'choppy') {
+    // দ্রুত উপরে নিচে — momentum কম, random বেশি
+    rawRandom     = (Math.random() - 0.5) * v * 5.0;
+    momentumDecay = 0.2;
+    randomScale   = 0.8;
+  } else if (candleMode === 'spike') {
+    // মাঝে মাঝে হঠাৎ বড় spike
+    const isSpiking = Math.random() < 0.08; // 8% chance প্রতি tick এ
+    rawRandom     = isSpiking
+      ? (Math.random() < 0.5 ? 1 : -1) * v * 12.0
+      : (Math.random() - 0.5) * v * 2.0;
+    momentumDecay = 0.85;
+    randomScale   = 0.15;
+  } else if (candleMode === 'slow') {
+    // ধীরে ধীরে drift — momentum বেশি, random কম
+    rawRandom     = (Math.random() - 0.5) * v * 1.2;
+    momentumDecay = 0.95;
+    randomScale   = 0.05;
+  } else {
+    // normal — smooth Quotex-style movement
+    rawRandom     = (Math.random() - 0.5) * v * 3.2;
+    momentumDecay = 0.75;
+    randomScale   = 0.25;
+  }
+
+  // Momentum — আগের tick এর movement carry করে smooth করে
+  if (!state.momentum) state.momentum = 0;
+  state.momentum = state.momentum * momentumDecay + rawRandom * randomScale;
+  const randomComponent = state.momentum;
 
   // ── Exposure bias — exposed user এর active trade দেখে subtle price nudge ──
   // async হওয়ায় _activeTradesMemory থেকে এই market এর live trades এর
