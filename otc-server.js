@@ -752,8 +752,8 @@ function tickOTC(id) {
       rawRandom = (Math.random() < 0.5 ? 1 : -1) * v * (2.5 + Math.random() * 1.5);
     }
 
-    momentumDecay = 0.55;
-    randomScale   = 0.75;
+    momentumDecay = 0.1;
+    randomScale   = 0.9;
   }
 
   // Momentum — আগের tick এর movement carry করে smooth করে
