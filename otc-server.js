@@ -737,10 +737,21 @@ function tickOTC(id) {
     momentumDecay = 0.95;
     randomScale   = 0.05;
   } else {
-    // normal — smooth Quotex-style movement
-    rawRandom     = (Math.random() - 0.5) * v * 3.2;
-    momentumDecay = 0.75;
-    randomScale   = 0.25;
+    // normal — Quotex-style smooth movement
+    // ৬০% chance price same থাকবে, ৪০% chance ছোট change
+    const rand = Math.random();
+    if (rand < 0.60) {
+      // price same — no change
+      rawRandom = 0;
+    } else if (rand < 0.95) {
+      // ছোট change — 0.001-0.003%
+      rawRandom = (Math.random() < 0.5 ? 1 : -1) * v * 0.4;
+    } else {
+      // rare spike — 0.01%
+      rawRandom = (Math.random() < 0.5 ? 1 : -1) * v * 1.5;
+    }
+    momentumDecay = 0.85;
+    randomScale   = 0.15;
   }
 
   // Momentum — আগের tick এর movement carry করে smooth করে
