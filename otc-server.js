@@ -1522,6 +1522,39 @@ http.createServer(async (req, res) => {
     return;
   }
 
+  // ── GET /min-amount ──────────────────────────────────────
+  if (req.method === 'GET' && req.url?.startsWith('/min-amount')) {
+    try {
+      const urlObj = new URL(req.url, 'http://localhost');
+      const currencyFrom = urlObj.searchParams.get('currency_from') || '';
+      const currencyTo   = urlObj.searchParams.get('currency_to')   || '';
+
+      if (!currencyTo) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'currency_to required' })); return;
+      }
+
+      const params = new URLSearchParams({ currency_to: currencyTo });
+      if (currencyFrom) params.set('currency_from', currencyFrom);
+      params.set('fiat_equivalent', 'usd');
+
+      const npRes = await fetch(`https://api.nowpayments.io/v1/min-amount?${params}`, {
+        headers: { 'x-api-key': process.env.NOWPAYMENTS_API_KEY }
+      });
+      const npData = await npRes.json();
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        minAmount:     npData.min_amount,
+        fiatEquivalent: npData.fiat_equivalent,
+        currency:      npData.currency_to
+      }));
+    } catch(e) {
+      console.error('[min-amount] error:', e.message);
+      res.writeHead(500); res.end(JSON.stringify({ error: 'Internal error' }));
+    }
+    return;
+  }
+
   // ── POST /create-crypto-payment ──────────────────────────
   if (req.method === 'POST' && req.url === '/create-crypto-payment') {
     try {
@@ -1556,12 +1589,13 @@ http.createServer(async (req, res) => {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          price_amount:      amt,
-          price_currency:    'usd',
-          pay_currency:      payCurrency,
-          order_id:          `gv_${userId}_${Date.now()}`,
-          order_description: 'GoldVest Deposit',
-          ipn_callback_url:  'https://goldvest-otc-worker-production.up.railway.app/nowpayments-webhook'
+          price_amount:        amt,
+          price_currency:      'usd',
+          pay_currency:        payCurrency,
+          order_id:            `gv_${userId}_${Date.now()}`,
+          order_description:   'GoldVest Deposit',
+          ipn_callback_url:    'https://goldvest-otc-worker-production.up.railway.app/nowpayments-webhook',
+          is_fee_paid_by_user: true
         })
       });
       const npData = await npRes.json();
