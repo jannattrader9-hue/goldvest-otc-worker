@@ -748,9 +748,9 @@ function tickOTC(id) {
       if (rand < 0.58) {
         rawRandom = 0;
       } else if (rand < 0.79) {
-        rawRandom = v * (0.2 + Math.random() * 0.5);
+        rawRandom = v * (0.5 + Math.random() * 1.2);
       } else {
-        rawRandom = -v * (0.2 + Math.random() * 0.5);
+        rawRandom = -v * (0.5 + Math.random() * 1.2);
       }
     } else if (state.lastDir > 0) {
       // After UP: 70% same, 30% up (data confirmed)
@@ -764,20 +764,20 @@ function tickOTC(id) {
       if (rand < 0.62) {
         rawRandom = 0;
       } else if (rand < 0.87) {
-        rawRandom = v * (0.1 + Math.random() * 0.4);
+        rawRandom = v * (0.3 + Math.random() * 0.8);
       } else {
-        rawRandom = -v * (0.1 + Math.random() * 0.3);
+        rawRandom = -v * (0.3 + Math.random() * 0.6);
       }
     }
 
     // rare spike 2% — max 0.011 equivalent
     if (Math.random() < 0.02) {
-      rawRandom = (Math.random() < 0.5 ? 1 : -1) * v * 1.8;
+      rawRandom = (Math.random() < 0.5 ? 1 : -1) * v * 3.5;
     }
 
     state.lastDir = rawRandom > 0 ? 1 : rawRandom < 0 ? -1 : 0;
-    momentumDecay = 0.3;
-    randomScale   = 0.7;
+    momentumDecay = 0.55;
+    randomScale   = 0.75;
   }
 
   // Momentum — আগের tick এর movement carry করে smooth করে
