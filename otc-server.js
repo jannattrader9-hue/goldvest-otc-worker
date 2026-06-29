@@ -1594,8 +1594,7 @@ http.createServer(async (req, res) => {
           pay_currency:        payCurrency,
           order_id:            `gv_${userId}_${Date.now()}`,
           order_description:   'GoldVest Deposit',
-          ipn_callback_url:    'https://goldvest-otc-worker-production.up.railway.app/nowpayments-webhook',
-          is_fee_paid_by_user: true
+          ipn_callback_url:    'https://goldvest-otc-worker-production.up.railway.app/nowpayments-webhook'
         })
       });
       const npData = await npRes.json();
