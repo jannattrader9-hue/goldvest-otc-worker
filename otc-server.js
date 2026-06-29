@@ -758,8 +758,16 @@ function tickOTC(id) {
 
   // Momentum — আগের tick এর movement carry করে smooth করে
   if (!state.momentum) state.momentum = 0;
-  state.momentum = state.momentum * momentumDecay + rawRandom * randomScale;
-  const randomComponent = state.momentum;
+
+  // candle শেষ ১৫ সেকেন্ডে momentum reset — predictable reverse এড়াতে
+  const now_ms = Date.now();
+  const timeToNextCandle = state.nextCandle ? (state.nextCandle - now_ms) : 99999;
+  if (timeToNextCandle <= 15000) {
+    state.momentum = 0; // momentum clear — এখন fully random
+  } else {
+    state.momentum = state.momentum * momentumDecay + rawRandom * randomScale;
+  }
+  const randomComponent = state.momentum !== 0 ? state.momentum : rawRandom * randomScale;
 
   // ── Exposure bias — exposed user এর active trade দেখে subtle price nudge ──
   // async হওয়ায় _activeTradesMemory থেকে এই market এর live trades এর
