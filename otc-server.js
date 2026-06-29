@@ -675,6 +675,7 @@ async function initOTC(market) {
     type:'otc', price, candleOpen:price, candleHigh:price, candleLow:price,
     candleTime:start/1000, nextCandle:start+CANDLE_MS,
     trend:0, trendSteps:0,
+    momentum: 0,
     subStates,
   };
   _activeMarkets.add(id);
@@ -711,8 +712,78 @@ function tickOTC(id) {
   }
 
   const v = state.price * 0.0008 * volMul;
-  const trendComponent  = state.trend * v * (ctrl.trendStrength || 0.6) * 0.35;
-  const randomComponent = (Math.random() - 0.5) * v * 3.2;
+  const trendComponent = state.trend * v * (ctrl.trendStrength || 0.6) * 0.35;
+
+  // ── Candle Mode — admin panel থেকে control করা যাবে ──────
+  const candleMode = ctrl.candleMode || 'normal';
+  let rawRandom, momentumDecay, randomScale;
+
+  if (candleMode === 'choppy') {
+    // দ্রুত উপরে নিচে — momentum কম, random বেশি
+    rawRandom     = (Math.random() - 0.5) * v * 5.0;
+    momentumDecay = 0.2;
+    randomScale   = 0.8;
+  } else if (candleMode === 'spike') {
+    // মাঝে মাঝে হঠাৎ বড় spike
+    const isSpiking = Math.random() < 0.08; // 8% chance প্রতি tick এ
+    rawRandom     = isSpiking
+      ? (Math.random() < 0.5 ? 1 : -1) * v * 12.0
+      : (Math.random() - 0.5) * v * 2.0;
+    momentumDecay = 0.85;
+    randomScale   = 0.15;
+  } else if (candleMode === 'slow') {
+    // ধীরে ধীরে drift — momentum বেশি, random কম
+    rawRandom     = (Math.random() - 0.5) * v * 1.2;
+    momentumDecay = 0.95;
+    randomScale   = 0.05;
+  } else {
+    // normal — Quotex exact pattern (145 tick analysis)
+    // 58% zero, 21% pos, 21% neg | avg change 0.003 | max 0.011
+    if (!state.lastDir) state.lastDir = 0; // -1=down, 0=same, 1=up
+
+    const rand = Math.random();
+
+    if (state.lastDir === 0) {
+      // After SAME: 58% same, 21% up, 21% down
+      if (rand < 0.58) {
+        rawRandom = 0;
+      } else if (rand < 0.79) {
+        rawRandom = v * (0.2 + Math.random() * 0.5);
+      } else {
+        rawRandom = -v * (0.2 + Math.random() * 0.5);
+      }
+    } else if (state.lastDir > 0) {
+      // After UP: 70% same, 30% up (data confirmed)
+      if (rand < 0.70) {
+        rawRandom = 0;
+      } else {
+        rawRandom = v * (0.1 + Math.random() * 0.4);
+      }
+    } else {
+      // After DOWN: 62% same, 25% up, 12% down
+      if (rand < 0.62) {
+        rawRandom = 0;
+      } else if (rand < 0.87) {
+        rawRandom = v * (0.1 + Math.random() * 0.4);
+      } else {
+        rawRandom = -v * (0.1 + Math.random() * 0.3);
+      }
+    }
+
+    // rare spike 2% — max 0.011 equivalent
+    if (Math.random() < 0.02) {
+      rawRandom = (Math.random() < 0.5 ? 1 : -1) * v * 1.8;
+    }
+
+    state.lastDir = rawRandom > 0 ? 1 : rawRandom < 0 ? -1 : 0;
+    momentumDecay = 0.3;
+    randomScale   = 0.7;
+  }
+
+  // Momentum — আগের tick এর movement carry করে smooth করে
+  if (!state.momentum) state.momentum = 0;
+  state.momentum = state.momentum * momentumDecay + rawRandom * randomScale;
+  const randomComponent = state.momentum;
 
   // ── Exposure bias — exposed user এর active trade দেখে subtle price nudge ──
   // async হওয়ায় _activeTradesMemory থেকে এই market এর live trades এর
