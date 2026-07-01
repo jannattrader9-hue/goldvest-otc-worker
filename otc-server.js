@@ -722,6 +722,26 @@ function tickOTC(id) {
   const v = state.price * 0.0008 * volMul;
   const trendComponent = state.trend * v * (ctrl.trendStrength || 0.6) * 0.35;
 
+  // ── Trade-based close bias — candle শেষ ১০ সেকেন্ডে majority এর বিপরীতে force ──
+  let closeBias = 0;
+  if (ctrl.mode === 'trade-based' && state.trend !== 0) {
+    const timeToClose = state.nextCandle ? (state.nextCandle - Date.now()) : 99999;
+    if (timeToClose <= 10000 && timeToClose > 0) {
+      // শেষ ১০ সেকেন্ডে strong push — entryPrice এর সাথে compare করে correct side এ নিয়ে যাও
+      const targetAbove = state.trend === 1; // trend=1 মানে candle up চাই (down majority হারাবে)
+      const currentPrice = state.price;
+      const openPrice = state.candleOpen || currentPrice;
+      const isAlreadyCorrect = targetAbove ? (currentPrice > openPrice) : (currentPrice < openPrice);
+      if (!isAlreadyCorrect) {
+        // correct side এ নেই — strong push দাও
+        closeBias = state.trend * v * 3.0;
+      } else {
+        // correct side এ আছে — maintain করো
+        closeBias = state.trend * v * 0.5;
+      }
+    }
+  }
+
   // ── Candle Mode — admin panel থেকে control করা যাবে ──────
   const candleMode = ctrl.candleMode || 'normal';
   let rawRandom, momentumDecay, randomScale;
@@ -806,7 +826,7 @@ function tickOTC(id) {
     state._pendingExposureBias = 0; // reset after use
   }
 
-  state.price = Math.max(state.price + (trendComponent + randomComponent + exposureBiasTotal) * speed, 0.0001);
+  state.price = Math.max(state.price + (trendComponent + randomComponent + exposureBiasTotal + closeBias) * speed, 0.0001);
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
 
