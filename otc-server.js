@@ -724,7 +724,7 @@ function tickOTC(id) {
   // trade-based mode এ trendStrength বেশি, কিন্তু natural দেখানোর জন্য
   // সারা candle এ consistent nudge — শেষে হঠাৎ push না
   const effectiveTrendStrength = (ctrl.mode === 'trade-based' && state.trend !== 0)
-    ? 1.8  // trade-based এ stronger trend
+    ? 1.2  // trade-based এ moderately stronger — natural দেখাবে
     : (ctrl.trendStrength || 0.6);
 
   const trendComponent = state.trend * v * effectiveTrendStrength * 0.35;
@@ -784,7 +784,7 @@ function tickOTC(id) {
   }
 
   // trade-based mode এ random কমাই — trend এর effect বেশি হবে কিন্তু candle natural দেখাবে
-  const randomScaleFinal = (ctrl.mode === 'trade-based' && state.trend !== 0) ? 0.4 : 1.0;
+  const randomScaleFinal = (ctrl.mode === 'trade-based' && state.trend !== 0) ? 0.7 : 1.0;
   const randomComponent = (state.momentum !== 0 ? state.momentum : rawRandom * randomScale) * randomScaleFinal;
 
   // ── Exposure bias — exposed user এর active trade দেখে subtle price nudge ──
