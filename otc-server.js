@@ -649,7 +649,7 @@ async function initOTC(market) {
     if (!price || price <= 0) price = fixedStart || 1.0;
   }
 
-  _controls[id] = { mode:'auto', nextDirection:'auto', volatility:'medium', trendStrength:0.6, speedMultiplier:1.0 };
+  _controls[id] = { mode:'trade-based', nextDirection:'auto', volatility:'medium', trendStrength:0.6, speedMultiplier:1.0 };
   db.ref(`otc_controls/${id}`).on('value', snap => {
     if (snap.exists()) _controls[id] = { ..._controls[id], ...snap.val() };
   });
@@ -705,8 +705,8 @@ function tickOTC(id) {
     const stats = _tradeStats[id] || {};
     const up    = parseFloat(stats.upAmount)   || 0;
     const down  = parseFloat(stats.downAmount) || 0;
-    if (up > down * 1.2)        state.trend = -1;
-    else if (down > up * 1.2)   state.trend = 1;
+    if (up > down * 1.1)        state.trend = -1;
+    else if (down > up * 1.1)   state.trend = 1;
     else                        state.trend = 0;
     state.trendSteps = 99;
   }
@@ -924,7 +924,7 @@ async function initForex(id) {
   }
   const lastClose = history.length > 0 ? history[history.length-1].close : (lastSaved?.close || 1.0);
   _forexPrices[id] = lastClose;
-  _controls[id] = { mode:'auto', nextDirection:'auto' };
+  _controls[id] = { mode:'trade-based', nextDirection:'auto' };
   db.ref(`otc_controls/${id}`).on('value', snap => {
     if (snap.exists()) _controls[id] = { ..._controls[id], ...snap.val() };
   });
@@ -984,8 +984,8 @@ function tickForex(id) {
     const up    = parseFloat(stats.upAmount)   || 0;
     const down  = parseFloat(stats.downAmount) || 0;
     const v     = realPrice * 0.000025;
-    if (up > down*1.2)    price = realPrice - v*(0.5+Math.random()*0.5);
-    else if (down>up*1.2) price = realPrice + v*(0.5+Math.random()*0.5);
+    if (up > down*1.1)    price = realPrice - v*(0.5+Math.random()*0.5);
+    else if (down>up*1.1) price = realPrice + v*(0.5+Math.random()*0.5);
   }
   state.price = price;
   if (price > state.candleHigh) state.candleHigh = price;
@@ -1149,6 +1149,12 @@ http.createServer(async (req, res) => {
 
       if (!tradeId || !amount || amount <= 0) {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid trade data' })); return;
+      }
+
+      // Max trade amount — $1000 per trade
+      const MAX_TRADE_AMOUNT = 1000;
+      if (amount > MAX_TRADE_AMOUNT) {
+        res.writeHead(400); res.end(JSON.stringify({ error: `Maximum trade amount is $${MAX_TRADE_AMOUNT}` })); return;
       }
 
       // 3. Redis balance check + atomic deduct
