@@ -1207,10 +1207,8 @@ http.createServer(async (req, res) => {
 
         if (!newPrice || newPrice <= 0) { results.push(`${id}: skip (no price)`); continue; }
 
-        // RTDB candle data clear
-        await db.ref(`otc_candles/${id}`).remove();
-
-        // State reset
+        // ⚠️ RTDB candle history DELETE করা হচ্ছে না — শুধু in-memory state reset
+        // State reset — server এর current price ঠিক করো
         state.price      = newPrice;
         state.candleOpen = newPrice;
         state.candleHigh = newPrice;
