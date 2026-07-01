@@ -751,15 +751,14 @@ function _stateDuration(s) {
 }
 
 function _stateBias(s) {
-  // direction bias: +1 up, -1 down, 0 neutral
   switch (s) {
-    case 'uptrend':       return  0.7;
-    case 'downtrend':     return -0.7;
-    case 'pullback_up':   return -0.4;
-    case 'pullback_down': return  0.4;
-    case 'breakout_up':   return  1.2;
-    case 'breakout_down': return -1.2;
-    default:              return  0.0; // ranging
+    case 'uptrend':       return  0.3;
+    case 'downtrend':     return -0.3;
+    case 'pullback_up':   return -0.15;
+    case 'pullback_down': return  0.15;
+    case 'breakout_up':   return  0.4;
+    case 'breakout_down': return -0.4;
+    default:              return  0.0;
   }
 }
 
@@ -772,7 +771,7 @@ function tickOTC(id) {
   const now     = Date.now();
 
   // ── Base volatility — price এর ০.০২% per tick ──────────────────────────
-  const v = state.price * 0.0002 * volMul;
+  const v = state.price * 0.00015 * volMul;
 
   // ── Noise counter (smooth noise seed) ───────────────────────────────────
   if (!state._noiseSeed) state._noiseSeed = Math.random() * 1000;
@@ -854,7 +853,7 @@ function tickOTC(id) {
   const targetVelocity = (directionBias * v * 0.4) + (smoothNoise * v * 0.6);
   state.acceleration   = (targetVelocity - state.velocity) * 0.22;
   state.velocity       = state.velocity * 0.78 + state.acceleration;
-  const maxV           = v * 3.0;
+  const maxV           = v * 2.0;
   state.velocity       = Math.max(-maxV, Math.min(maxV, state.velocity));
 
   // ── Final price update ────────────────────────────────────────────────────
@@ -1275,7 +1274,23 @@ http.createServer(async (req, res) => {
     return;
   }
 
-  // ── POST /place-trade ─────────────────────────────────
+  // ── GET /delete-all-candles — সব RTDB candle history delete করো ──────────
+  if (req.method === 'GET' && req.url?.startsWith('/delete-all-candles')) {
+    const token = new URL(req.url, 'http://localhost').searchParams.get('token');
+    if (token !== SETTLE_TOKEN) {
+      res.writeHead(403); res.end('Forbidden'); return;
+    }
+    try {
+      await db.ref('otc_candles').remove();
+      console.log('[delete-all-candles] All candle history deleted');
+      res.writeHead(200, { 'Content-Type': 'text/plain' });
+      res.end('All candle history deleted ✅');
+    } catch(e) {
+      res.writeHead(500);
+      res.end('Error: ' + e.message);
+    }
+    return;
+  }
   if (req.method === 'POST' && req.url === '/place-trade') {
     try {
       // 1. Body parse
