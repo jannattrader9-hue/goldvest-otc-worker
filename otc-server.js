@@ -820,20 +820,12 @@ function tickOTC(id) {
   const smoothNoise = noise1 * 0.5 + noise2 * 0.35 + noise3 * 0.15;
 
   // ── Micro pullback + breathing ────────────────────────────────────────────
-  // প্রতি tick এ move না — pause এবং micro correction থাকবে
   if (!state._microTick) state._microTick = 0;
   state._microTick++;
-
-  // Breathing pattern — 3 tick up, 1 tick micro down, 1 tick pause
-  const microPhase = state._microTick % 5;
-  let microFactor = 1.0; // normal move
-  if (microPhase === 3) {
-    // micro correction — direction এর বিপরীতে ছোট move
-    microFactor = -0.3;
-  } else if (microPhase === 4) {
-    // pause — প্রায় কোনো movement নেই
-    microFactor = 0.05;
-  }
+  const microPhase = state._microTick % 7;
+  let microFactor = 1.0;
+  if (microPhase === 5) microFactor = -0.25; // micro correction
+  if (microPhase === 6) microFactor = 0.3;   // mini pause (not full stop)
 
   // ── Dynamic Support / Resistance ─────────────────────────────────────────
   if (!state.srHigh) state.srHigh = state.price * 1.003;
@@ -849,9 +841,9 @@ function tickOTC(id) {
   const midPoint  = (state.srHigh + state.srLow) / 2;
   const rangeSize = Math.max(state.srHigh - state.srLow, v * 2);
   const deviation = (state.price - midPoint) / (rangeSize * 0.5);
-  const meanReversionForce = -deviation * v * 0.4;
+  const meanReversionForce = -deviation * v * 0.35;
 
-  // ── Trade-based mode — candle শেষ ৭s এ very subtle drift ────────────────
+  // ── Trade-based mode — candle শেষ ৭s এ subtle drift ─────────────────────
   const timeToNextCandle = state.nextCandle ? (state.nextCandle - now) : 99999;
   let closePush = 0;
   if (ctrl.mode === 'trade-based' && state.trend !== 0 && timeToNextCandle <= 7000) {
@@ -859,13 +851,13 @@ function tickOTC(id) {
   }
 
   // ── Velocity + Acceleration ───────────────────────────────────────────────
-  const targetVelocity = (directionBias * v * 0.35) + (smoothNoise * v * 0.55);
-  state.acceleration   = (targetVelocity - state.velocity) * 0.20;
-  state.velocity       = state.velocity * 0.80 + state.acceleration;
-  const maxV           = v * 2.5;
+  const targetVelocity = (directionBias * v * 0.4) + (smoothNoise * v * 0.6);
+  state.acceleration   = (targetVelocity - state.velocity) * 0.22;
+  state.velocity       = state.velocity * 0.78 + state.acceleration;
+  const maxV           = v * 3.0;
   state.velocity       = Math.max(-maxV, Math.min(maxV, state.velocity));
 
-  // ── Final price update — microFactor দিয়ে breathing apply ───────────────
+  // ── Final price update ────────────────────────────────────────────────────
   const delta = (state.velocity * microFactor + meanReversionForce + closePush) * speed;
   state.price = Math.max(state.price + delta, 0.0001);
   if (state.price > state.candleHigh) state.candleHigh = state.price;
