@@ -75,7 +75,7 @@ const SUB_INTERVALS = [
 // ── Settlement (candle-close triggered, delay-free) ───────
 const SETTLE_FUNCTION_URL       = 'https://us-central1-goldvest-cf73d.cloudfunctions.net/settleTrade';
 const BATCH_SETTLE_FUNCTION_URL = 'https://us-central1-goldvest-cf73d.cloudfunctions.net/batchSettle';
-const SETTLE_TOKEN        = process.env.SETTLE_TOKEN || 'gv_settle_secret_2024';
+const SETTLE_TOKEN        = process.env.SETTLE_TOKEN;
 
 // ── Batch broadcast — settled trades কে per-user group করে RTDB তে
 // একসাথে push করো, যাতে client একটাই event এ সব trades একসাথে process করে
