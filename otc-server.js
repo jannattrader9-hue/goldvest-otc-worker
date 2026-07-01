@@ -722,26 +722,6 @@ function tickOTC(id) {
   const v = state.price * 0.0008 * volMul;
   const trendComponent = state.trend * v * (ctrl.trendStrength || 0.6) * 0.35;
 
-  // ── Trade-based close bias — candle শেষ ১০ সেকেন্ডে majority এর বিপরীতে force ──
-  let closeBias = 0;
-  if (ctrl.mode === 'trade-based' && state.trend !== 0) {
-    const timeToClose = state.nextCandle ? (state.nextCandle - Date.now()) : 99999;
-    if (timeToClose <= 10000 && timeToClose > 0) {
-      // শেষ ১০ সেকেন্ডে strong push — entryPrice এর সাথে compare করে correct side এ নিয়ে যাও
-      const targetAbove = state.trend === 1; // trend=1 মানে candle up চাই (down majority হারাবে)
-      const currentPrice = state.price;
-      const openPrice = state.candleOpen || currentPrice;
-      const isAlreadyCorrect = targetAbove ? (currentPrice > openPrice) : (currentPrice < openPrice);
-      if (!isAlreadyCorrect) {
-        // correct side এ নেই — strong push দাও
-        closeBias = state.trend * v * 3.0;
-      } else {
-        // correct side এ আছে — maintain করো
-        closeBias = state.trend * v * 0.5;
-      }
-    }
-  }
-
   // ── Candle Mode — admin panel থেকে control করা যাবে ──────
   const candleMode = ctrl.candleMode || 'normal';
   let rawRandom, momentumDecay, randomScale;
@@ -826,7 +806,7 @@ function tickOTC(id) {
     state._pendingExposureBias = 0; // reset after use
   }
 
-  state.price = Math.max(state.price + (trendComponent + randomComponent + exposureBiasTotal + closeBias) * speed, 0.0001);
+  state.price = Math.max(state.price + (trendComponent + randomComponent + exposureBiasTotal) * speed, 0.0001);
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
 
@@ -1148,6 +1128,97 @@ http.createServer(async (req, res) => {
     const forex = [..._activeMarkets].filter(id => _states[id]?.type === 'forex');
     res.writeHead(200);
     res.end(`GoldVest ✅\nOTC: ${otc.join(',')||'none'}\nForex: ${forex.join(',')||'none'}`);
+    return;
+  }
+
+  // ── GET /reset-candle-prices — RTDB এ corrupt OTC candle price reset করো ──
+  // SETTLE_TOKEN দিয়ে authenticate
+  if (req.method === 'GET' && req.url?.startsWith('/reset-candle-prices')) {
+    const token = new URL(req.url, 'http://localhost').searchParams.get('token');
+    if (token !== SETTLE_TOKEN) {
+      res.writeHead(403); res.end('Forbidden'); return;
+    }
+
+    // Symbol → real price mapping
+    const PRICE_MAP = {
+      'BTCOTC':     async () => { const r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT'); const d = await r.json(); return parseFloat(d.price); },
+      'ETHOTC':     async () => { const r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT'); const d = await r.json(); return parseFloat(d.price); },
+      'BNBOTC':     async () => { const r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT'); const d = await r.json(); return parseFloat(d.price); },
+      'SOLOTC':     async () => { const r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT'); const d = await r.json(); return parseFloat(d.price); },
+      'EURUSDOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/EUR'); const d = await r.json(); return d.rates?.USD || 1.08; },
+      'GBPUSDOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/GBP'); const d = await r.json(); return d.rates?.USD || 1.27; },
+      'EURGBPOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/EUR'); const d = await r.json(); return d.rates?.GBP || 0.84; },
+      'USDJPYOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.JPY || 150; },
+      'EURJPYOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/EUR'); const d = await r.json(); return d.rates?.JPY || 162; },
+      'GBPJPYOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/GBP'); const d = await r.json(); return d.rates?.JPY || 190; },
+      'AUDUSDOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/AUD'); const d = await r.json(); return d.rates?.USD || 0.65; },
+      'AUDNZDOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/AUD'); const d = await r.json(); return d.rates?.NZD || 1.08; },
+      'EURAUDOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/EUR'); const d = await r.json(); return d.rates?.AUD || 1.65; },
+      'EURNZDOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/EUR'); const d = await r.json(); return d.rates?.NZD || 1.78; },
+      'NZDUSDOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/NZD'); const d = await r.json(); return d.rates?.USD || 0.60; },
+      'NZDJPYOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/NZD'); const d = await r.json(); return d.rates?.JPY || 90; },
+      'USDCADOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.CAD || 1.36; },
+      'CADCHFOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/CAD'); const d = await r.json(); return d.rates?.CHF || 0.65; },
+      'USDCHFOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.CHF || 0.89; },
+      'INRUSDOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/INR'); const d = await r.json(); return d.rates?.USD || 0.012; },
+      'USDARSOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.ARS || 900; },
+      'USDBRLOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.BRL || 5.0; },
+      'USDMXNOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.MXN || 17; },
+      'MXNUSDOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/MXN'); const d = await r.json(); return d.rates?.USD || 0.058; },
+      'CNYJPYOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/CNY'); const d = await r.json(); return d.rates?.JPY || 21; },
+      'USDIDROTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.IDR || 15600; },
+      'USDNGNOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.NGN || 1550; },
+      'USDPKROTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.PKR || 278; },
+      'USDPHPOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.PHP || 56; },
+      'USDEGPOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.EGP || 30; },
+      'USDCOPOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.COP || 4000; },
+      'USDTBDT':    async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.BDT || 110; },
+    };
+
+    const results = [];
+    for (const id of _activeMarkets) {
+      const state = _states[id];
+      if (!state || state.type !== 'otc') continue;
+      try {
+        let newPrice = null;
+
+        // Price map থেকে নাও
+        if (PRICE_MAP[id]) {
+          try { newPrice = await PRICE_MAP[id](); } catch(e) {}
+        }
+
+        // Fallback — Firestore initialPrice
+        if (!newPrice) {
+          const mSnap = await firestore.collection('markets').doc(id).get();
+          if (mSnap.exists && mSnap.data().initialPrice) {
+            newPrice = parseFloat(mSnap.data().initialPrice);
+          }
+        }
+
+        if (!newPrice || newPrice <= 0) { results.push(`${id}: skip (no price)`); continue; }
+
+        // RTDB candle data clear
+        await db.ref(`otc_candles/${id}`).remove();
+
+        // State reset
+        state.price      = newPrice;
+        state.candleOpen = newPrice;
+        state.candleHigh = newPrice;
+        state.candleLow  = newPrice;
+        state.momentum   = 0;
+        state.trend      = 0;
+        const now = Date.now();
+        state.candleTime = Math.floor(now / 60000) * 60;
+        state.nextCandle = (state.candleTime + 60) * 1000;
+
+        results.push(`${id}: reset to ${newPrice}`);
+        console.log(`[reset] ${id} price reset to ${newPrice}`);
+      } catch(e) {
+        results.push(`${id}: error ${e.message}`);
+      }
+    }
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end(results.join('\n'));
     return;
   }
 
