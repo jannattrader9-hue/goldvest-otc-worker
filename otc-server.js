@@ -117,8 +117,6 @@ async function _batchSettleAndBroadcast(symbol, trades, closePrice) {
   if (!trades || trades.length === 0) return;
 
   // ── live_market_stats: settled trades remove করো ──
-  // transaction এর বদলে increment/decrement — পুরো node delete না করে
-  // নতুন trades এ type/amount আছে, তাই সঠিক decrement হবে
   try {
     let upDec = 0, downDec = 0, upAmt = 0, downAmt = 0;
     let hasTypeInfo = false;
@@ -134,12 +132,22 @@ async function _batchSettleAndBroadcast(symbol, trades, closePrice) {
         curr.down       = Math.max(0, (curr.down       || 0) - downDec);
         curr.upAmount   = Math.max(0, (curr.upAmount   || 0) - upAmt);
         curr.downAmount = Math.max(0, (curr.downAmount || 0) - downAmt);
-        // সব 0 হলে node delete করো
         if ((curr.up || 0) <= 0 && (curr.down || 0) <= 0) return null;
         return curr;
       }).catch(() => {});
+
+      // ── otc_trade_stats decrement — trade-based mode এর জন্য ──
+      db.ref(`otc_trade_stats/${symbol}`).transaction(curr => {
+        if (!curr) return curr;
+        curr.upAmount     = Math.max(0, (curr.upAmount     || 0) - upAmt);
+        curr.downAmount   = Math.max(0, (curr.downAmount   || 0) - downAmt);
+        curr.upCount      = Math.max(0, (curr.upCount      || 0) - upDec);
+        curr.downCount    = Math.max(0, (curr.downCount    || 0) - downDec);
+        curr.totalExposure = Math.max(0, (curr.totalExposure || 0) - upAmt - downAmt);
+        curr.updatedAt    = Date.now();
+        return curr;
+      }).catch(() => {});
     } else {
-      // পুরানো trades (type নেই) — node clear করো
       db.ref('live_market_stats/' + symbol).remove().catch(() => {});
     }
   } catch (e) {}
@@ -1184,6 +1192,22 @@ http.createServer(async (req, res) => {
       // ── Exposure Protection — user এর last trade direction save ──
       if (trade.type === 'up' || trade.type === 'down') {
         _userTradeDir.set(userId, trade.type);
+      }
+
+      // ── Trade Stats update — trade-based mode এর জন্য ──
+      const symbol = trade.symbol || '';
+      if (symbol && (trade.type === 'up' || trade.type === 'down')) {
+        const statsRef = db.ref(`otc_trade_stats/${symbol}`);
+        const field = trade.type === 'up' ? 'upAmount' : 'downAmount';
+        const countField = trade.type === 'up' ? 'upCount' : 'downCount';
+        statsRef.transaction(curr => {
+          if (!curr) curr = { upAmount: 0, downAmount: 0, upCount: 0, downCount: 0, totalExposure: 0 };
+          curr[field]       = (curr[field]       || 0) + amount;
+          curr[countField]  = (curr[countField]  || 0) + 1;
+          curr.totalExposure = (curr.totalExposure || 0) + amount;
+          curr.updatedAt    = Date.now();
+          return curr;
+        }).catch(e => console.warn('[trade-stats] update failed:', e.message));
       }
 
       // 4a. Firestore থেকে market এর real payout নাও — client value বিশ্বাস করা হচ্ছে না
