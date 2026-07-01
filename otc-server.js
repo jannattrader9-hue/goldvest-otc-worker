@@ -800,49 +800,40 @@ function tickOTC(id) {
   }
 
   // ── Smooth noise (Perlin-like) ────────────────────────────────────────────
-  const noise1 = (_smoothNoise(state._noiseSeed * 0.5) - 0.5) * 2;        // slow wave
-  const noise2 = (_smoothNoise(state._noiseSeed * 2.0) - 0.5) * 2;        // fast detail
-  const noise3 = (_smoothNoise(state._noiseSeed * 5.0) - 0.5) * 2;        // micro detail
-  const smoothNoise = noise1 * 0.5 + noise2 * 0.35 + noise3 * 0.15;       // weighted mix
+  const noise1 = (_smoothNoise(state._noiseSeed * 0.3) - 0.5) * 2;
+  const noise2 = (_smoothNoise(state._noiseSeed * 1.2) - 0.5) * 2;
+  const noise3 = (_smoothNoise(state._noiseSeed * 4.0) - 0.5) * 2;
+  const smoothNoise = noise1 * 0.5 + noise2 * 0.35 + noise3 * 0.15;
 
   // ── Dynamic Support / Resistance ─────────────────────────────────────────
   if (!state.srHigh) state.srHigh = state.price * 1.003;
   if (!state.srLow)  state.srLow  = state.price * 0.997;
   if (!state.srTick) state.srTick = 0;
   state.srTick++;
-  if (state.srTick % 25 === 0) {
-    // Swing high/low থেকে update
-    state.srHigh = Math.max(state.srHigh, state.candleHigh) * 1.0005;
-    state.srLow  = Math.min(state.srLow,  state.candleLow)  * 0.9995;
-    // Slowly tighten range
-    state.srHigh = state.srHigh * 0.995 + state.price * 0.005;
-    state.srLow  = state.srLow  * 0.995 + state.price * 0.005;
+  if (state.srTick % 30 === 0) {
+    state.srHigh = state.srHigh * 0.997 + state.candleHigh * 0.003;
+    state.srLow  = state.srLow  * 0.997 + state.candleLow  * 0.003;
   }
 
-  // ── Mean reversion force (Ornstein-Uhlenbeck) ────────────────────────────
+  // ── Mean reversion (Ornstein-Uhlenbeck) ──────────────────────────────────
   const midPoint  = (state.srHigh + state.srLow) / 2;
-  const rangeSize = state.srHigh - state.srLow;
-  const deviation = rangeSize > 0 ? (state.price - midPoint) / (rangeSize * 0.5) : 0;
-  const meanReversionForce = -deviation * v * 0.6; // ranging এ ফিরে আসে
+  const rangeSize = Math.max(state.srHigh - state.srLow, v * 2);
+  const deviation = (state.price - midPoint) / (rangeSize * 0.5);
+  const meanReversionForce = -deviation * v * 0.4;
 
-  // ── Candle close push — trade-based mode শেষ ১৫s এ ──────────────────────
+  // ── Trade-based mode — candle শেষ ৭s এ very subtle drift ────────────────
   const timeToNextCandle = state.nextCandle ? (state.nextCandle - now) : 99999;
-
-  // ── Trade-based subtle drift — শেষ ৭s এ very gentle bias ────────────────
-  // Market এর natural movement এর সাথে মিশে যাবে — spike হবে না
   let closePush = 0;
   if (ctrl.mode === 'trade-based' && state.trend !== 0 && timeToNextCandle <= 7000) {
-    // শুধু velocity এ সামান্য nudge — direct price push না
-    // v * 0.15 = মাত্র ১৫% extra drift, natural দেখাবে
-    closePush = -state.trend * v * 0.15;
+    closePush = -state.trend * v * 0.12; // খুব ছোট — natural দেখাবে
   }
 
-  // ── Velocity + Acceleration model ────────────────────────────────────────
-  const targetVelocity = (directionBias * v * 0.4) + (smoothNoise * v * 0.6);
-  state.acceleration   = (targetVelocity - state.velocity) * 0.25;
-  state.velocity       = state.velocity * 0.75 + state.acceleration;
-  const maxV = v * 3;
-  state.velocity = Math.max(-maxV, Math.min(maxV, state.velocity));
+  // ── Velocity + Acceleration ───────────────────────────────────────────────
+  const targetVelocity = (directionBias * v * 0.35) + (smoothNoise * v * 0.55);
+  state.acceleration   = (targetVelocity - state.velocity) * 0.20;
+  state.velocity       = state.velocity * 0.80 + state.acceleration;
+  const maxV           = v * 2.5;
+  state.velocity       = Math.max(-maxV, Math.min(maxV, state.velocity));
 
   // ── Final price update ────────────────────────────────────────────────────
   const delta = (state.velocity + meanReversionForce + closePush) * speed;
