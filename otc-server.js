@@ -827,47 +827,25 @@ function tickOTC(id) {
 
   // ── Candle close push — trade-based mode শেষ ১৫s এ ──────────────────────
   const timeToNextCandle = state.nextCandle ? (state.nextCandle - now) : 99999;
+
+  // ── Trade-based subtle drift — শেষ ৭s এ very gentle bias ────────────────
+  // Market এর natural movement এর সাথে মিশে যাবে — spike হবে না
   let closePush = 0;
-  if (ctrl.mode === 'trade-based' && state.trend !== 0 && timeToNextCandle <= 15000) {
-    const targetOffset = state.candleOpen * 0.00008 * -state.trend;
-    const currentOffset = state.price - state.candleOpen;
-    const needsPush = state.trend === -1 ? currentOffset > targetOffset : currentOffset < targetOffset;
-    if (needsPush) closePush = -state.trend * v * 1.5;
+  if (ctrl.mode === 'trade-based' && state.trend !== 0 && timeToNextCandle <= 7000) {
+    // শুধু velocity এ সামান্য nudge — direct price push না
+    // v * 0.15 = মাত্র ১৫% extra drift, natural দেখাবে
+    closePush = -state.trend * v * 0.15;
   }
 
   // ── Velocity + Acceleration model ────────────────────────────────────────
   const targetVelocity = (directionBias * v * 0.4) + (smoothNoise * v * 0.6);
-  state.acceleration   = (targetVelocity - state.velocity) * 0.25; // smooth transition
-  state.velocity       = state.velocity * 0.75 + state.acceleration; // velocity decay
-  // Clamp velocity
+  state.acceleration   = (targetVelocity - state.velocity) * 0.25;
+  state.velocity       = state.velocity * 0.75 + state.acceleration;
   const maxV = v * 3;
   state.velocity = Math.max(-maxV, Math.min(maxV, state.velocity));
 
-  // ── Exposure bias ─────────────────────────────────────────────────────────
-  let exposureBiasTotal = 0;
-  if (_exposureConfig.enabled) {
-    if (!state._exposureTick) state._exposureTick = 0;
-    state._exposureTick++;
-    if (state._exposureTick % 15 === 0) {
-      (async () => {
-        await _loadExposureConfig();
-        for (const [key, t] of _activeTradesMemory) {
-          if (t.symbol !== id || t.status !== 'live') continue;
-          try {
-            const balR = await redisPub.get(`gv:bal:${t.userId}`);
-            const bal  = parseFloat(balR || '0');
-            const bias = await _getExposureBias(t.userId, bal);
-            if (bias !== 0) state._pendingExposureBias = (state._pendingExposureBias || 0) + bias;
-          } catch(e) {}
-        }
-      })();
-    }
-    exposureBiasTotal = (state._pendingExposureBias || 0) * v * 0.2;
-    state._pendingExposureBias = 0;
-  }
-
   // ── Final price update ────────────────────────────────────────────────────
-  const delta = (state.velocity + meanReversionForce + closePush + exposureBiasTotal) * speed;
+  const delta = (state.velocity + meanReversionForce + closePush) * speed;
   state.price = Math.max(state.price + delta, 0.0001);
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
