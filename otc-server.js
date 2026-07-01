@@ -684,6 +684,20 @@ async function initOTC(market) {
     candleTime:start/1000, nextCandle:start+CANDLE_MS,
     trend:0, trendSteps:0,
     momentum: 0,
+    // Market State Machine
+    marketState: 'ranging',
+    marketStateTick: 20 + Math.floor(Math.random() * 40),
+    // Velocity model
+    velocity: 0,
+    acceleration: 0,
+    // Noise seed
+    _noiseSeed: Math.random() * 1000,
+    // Support/Resistance
+    srHigh: price * 1.003,
+    srLow:  price * 0.997,
+    srTick: 0,
+    // Micro pullback
+    _microTick: 0,
     subStates,
   };
   _activeMarkets.add(id);
