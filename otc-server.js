@@ -52,7 +52,7 @@ if (REDIS_URL) {
     console.warn('[Redis] REDIS_URL not set — falling back to batchSettle HTTP');
 }
 
-const TICK_MS   = 200;
+const TICK_MS   = 500;
 const CANDLE_MS = 60 * 1000;
 const TD_KEY    = '392fa09f669c4cd7843f958e0fbbca36';
 
@@ -765,100 +765,97 @@ function _stateBias(s) {
 function tickOTC(id) {
   const state = _states[id];
   if (!state || state.type !== 'otc') return;
-  const ctrl    = _controls[id] || {};
-  const volMul  = { low:0.5, medium:1.0, high:1.8 }[ctrl.volatility] || 1.0;
-  const speed   = ctrl.speedMultiplier || 1.0;
-  const now     = Date.now();
-
-  // ── Base volatility — price এর ০.০২% per tick ──────────────────────────
-  const v = state.price * 0.00015 * volMul;
-
-  // ── Noise counter (smooth noise seed) ───────────────────────────────────
-  if (!state._noiseSeed) state._noiseSeed = Math.random() * 1000;
-  state._noiseSeed += 0.15;
-
-  // ── Market State Machine ─────────────────────────────────────────────────
-  if (!state.marketState) {
-    state.marketState     = 'ranging';
-    state.marketStateTick = _stateDuration('ranging');
-  }
-  state.marketStateTick--;
-  if (state.marketStateTick <= 0) {
-    state.marketState     = _nextMarketState(state.marketState);
-    state.marketStateTick = _stateDuration(state.marketState);
-  }
-
-  // ── Velocity model ───────────────────────────────────────────────────────
-  if (!state.velocity)     state.velocity     = 0;
-  if (!state.acceleration) state.acceleration = 0;
-
-  // ── Trade/Manual/Auto mode — direction bias ──────────────────────────────
-  let directionBias = 0;
+  const ctrl = _controls[id] || {};
+  const volMul = { low:0.4, medium:1.0, high:2.2 }[ctrl.volatility] || 1.0;
+  const speed = ctrl.speedMultiplier || 1.0;
+  const now = Date.now();
 
   if (!ctrl.mode || ctrl.mode === 'auto') {
-    // State machine controls direction
-    directionBias = _stateBias(state.marketState);
+    if (state.trendSteps <= 0) { state.trend = randomTrend(); state.trendSteps = Math.round((8+Math.floor(Math.random()*12))/speed); }
+    state.trendSteps--;
   } else if (ctrl.mode === 'manual') {
-    directionBias = ctrl.nextDirection === 'up' ? 1.5 : ctrl.nextDirection === 'down' ? -1.5 : 0;
+    state.trend = ctrl.nextDirection === 'up' ? 1 : ctrl.nextDirection === 'down' ? -1 : 0;
+    state.trendSteps = 99;
   } else if (ctrl.mode === 'trade-based') {
     const stats = _tradeStats[id] || {};
-    const up    = parseFloat(stats.upAmount)  || 0;
+    const up    = parseFloat(stats.upAmount)   || 0;
     const down  = parseFloat(stats.downAmount) || 0;
-    // State machine চলবে normally, শুধু close এ subtle push
-    directionBias = _stateBias(state.marketState);
-    // Trade direction store করো close push এর জন্য
-    if (up > down * 1.1)       state.trend = -1;
-    else if (down > up * 1.1)  state.trend =  1;
-    else                       state.trend =  0;
+    if (up > down * 1.1)        state.trend = -1;
+    else if (down > up * 1.1)   state.trend = 1;
+    else                        state.trend = 0;
+    state.trendSteps = 99;
   }
 
-  // ── Smooth noise (Perlin-like) ────────────────────────────────────────────
-  const noise1 = (_smoothNoise(state._noiseSeed * 0.3) - 0.5) * 2;
-  const noise2 = (_smoothNoise(state._noiseSeed * 1.2) - 0.5) * 2;
-  const noise3 = (_smoothNoise(state._noiseSeed * 4.0) - 0.5) * 2;
-  const smoothNoise = noise1 * 0.5 + noise2 * 0.35 + noise3 * 0.15;
+  const v = state.price * 0.0008 * volMul;
+  const trendComponent = state.trend * v * (ctrl.trendStrength || 0.6) * 0.35;
 
-  // ── Micro pullback + breathing ────────────────────────────────────────────
-  if (!state._microTick) state._microTick = 0;
-  state._microTick++;
-  const microPhase = state._microTick % 7;
-  let microFactor = 1.0;
-  if (microPhase === 5) microFactor = -0.25; // micro correction
-  if (microPhase === 6) microFactor = 0.3;   // mini pause (not full stop)
+  const candleMode = ctrl.candleMode || 'normal';
+  let rawRandom, momentumDecay, randomScale;
 
-  // ── Dynamic Support / Resistance ─────────────────────────────────────────
-  if (!state.srHigh) state.srHigh = state.price * 1.003;
-  if (!state.srLow)  state.srLow  = state.price * 0.997;
-  if (!state.srTick) state.srTick = 0;
-  state.srTick++;
-  if (state.srTick % 30 === 0) {
-    state.srHigh = state.srHigh * 0.997 + state.candleHigh * 0.003;
-    state.srLow  = state.srLow  * 0.997 + state.candleLow  * 0.003;
+  if (candleMode === 'choppy') {
+    rawRandom     = (Math.random() - 0.5) * v * 5.0;
+    momentumDecay = 0.2;
+    randomScale   = 0.8;
+  } else if (candleMode === 'spike') {
+    const isSpiking = Math.random() < 0.08;
+    rawRandom     = isSpiking
+      ? (Math.random() < 0.5 ? 1 : -1) * v * 12.0
+      : (Math.random() - 0.5) * v * 2.0;
+    momentumDecay = 0.85;
+    randomScale   = 0.15;
+  } else if (candleMode === 'slow') {
+    rawRandom     = (Math.random() - 0.5) * v * 1.2;
+    momentumDecay = 0.95;
+    randomScale   = 0.05;
+  } else {
+    const rand = Math.random();
+    if (rand < 0.58) {
+      rawRandom = 0;
+    } else if (rand < 0.79) {
+      rawRandom = v * (0.3 + Math.random() * 1.0);
+    } else if (rand < 0.97) {
+      rawRandom = -v * (0.3 + Math.random() * 1.0);
+    } else {
+      rawRandom = (Math.random() < 0.5 ? 1 : -1) * v * (2.5 + Math.random() * 1.5);
+    }
+    momentumDecay = 0.1;
+    randomScale   = 0.9;
   }
 
-  // ── Mean reversion (Ornstein-Uhlenbeck) ──────────────────────────────────
-  const midPoint  = (state.srHigh + state.srLow) / 2;
-  const rangeSize = Math.max(state.srHigh - state.srLow, v * 2);
-  const deviation = (state.price - midPoint) / (rangeSize * 0.5);
-  const meanReversionForce = -deviation * v * 0.35;
-
-  // ── Trade-based mode — candle শেষ ৭s এ subtle drift ─────────────────────
+  if (!state.momentum) state.momentum = 0;
   const timeToNextCandle = state.nextCandle ? (state.nextCandle - now) : 99999;
-  let closePush = 0;
-  if (ctrl.mode === 'trade-based' && state.trend !== 0 && timeToNextCandle <= 7000) {
-    closePush = -state.trend * v * 0.12;
+  if (timeToNextCandle <= 15000) {
+    state.momentum = 0;
+  } else {
+    state.momentum = state.momentum * momentumDecay + rawRandom * randomScale;
+  }
+  const randomComponent = state.momentum !== 0 ? state.momentum : rawRandom * randomScale;
+
+  let exposureBiasTotal = 0;
+  if (_exposureConfig.enabled) {
+    if (!state._exposureTick) state._exposureTick = 0;
+    state._exposureTick++;
+    if (state._exposureTick % 10 === 0) {
+      (async () => {
+        await _loadExposureConfig();
+        for (const [key, t] of _activeTradesMemory) {
+          if (t.symbol !== id || t.status !== 'live') continue;
+          try {
+            const balR = await redisPub.get(`gv:bal:${t.userId}`);
+            const bal  = parseFloat(balR || '0');
+            const bias = await _getExposureBias(t.userId, bal);
+            if (bias !== 0) {
+              state._pendingExposureBias = (state._pendingExposureBias || 0) + bias;
+            }
+          } catch(e) {}
+        }
+      })();
+    }
+    exposureBiasTotal = (state._pendingExposureBias || 0) * v * 0.25;
+    state._pendingExposureBias = 0;
   }
 
-  // ── Velocity + Acceleration ───────────────────────────────────────────────
-  const targetVelocity = (directionBias * v * 0.4) + (smoothNoise * v * 0.6);
-  state.acceleration   = (targetVelocity - state.velocity) * 0.22;
-  state.velocity       = state.velocity * 0.78 + state.acceleration;
-  const maxV           = v * 2.0;
-  state.velocity       = Math.max(-maxV, Math.min(maxV, state.velocity));
-
-  // ── Final price update ────────────────────────────────────────────────────
-  const delta = (state.velocity * microFactor + meanReversionForce + closePush) * speed;
-  state.price = Math.max(state.price + delta, 0.0001);
+  state.price = Math.max(state.price + (trendComponent + randomComponent + exposureBiasTotal) * speed, 0.0001);
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
 
