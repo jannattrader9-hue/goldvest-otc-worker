@@ -52,7 +52,7 @@ if (REDIS_URL) {
     console.warn('[Redis] REDIS_URL not set — falling back to batchSettle HTTP');
 }
 
-const TICK_MS   = 500;
+const TICK_MS   = 200;
 const CANDLE_MS = 60 * 1000;
 const TD_KEY    = '392fa09f669c4cd7843f958e0fbbca36';
 
@@ -694,129 +694,161 @@ async function initOTC(market) {
   console.log(`[${id}] OTC started @ ${price.toFixed(4)}`);
 }
 
+// ── Smooth noise (Perlin-like) — pure Math, no library ──────────────────────
+function _smoothNoise(t) {
+  const i = Math.floor(t);
+  const f = t - i;
+  const u = f * f * (3 - 2 * f); // smoothstep
+  const a = Math.sin(i * 127.1 + 311.7) * 43758.5453;
+  const b = Math.sin((i+1) * 127.1 + 311.7) * 43758.5453;
+  return (a - Math.floor(a)) * (1 - u) + (b - Math.floor(b)) * u;
+}
+
+// ── Market State Machine ─────────────────────────────────────────────────────
+// State গুলো: ranging, uptrend, downtrend, pullback_up, pullback_down, breakout_up, breakout_down
+const MARKET_STATES = ['ranging', 'uptrend', 'downtrend', 'pullback_up', 'pullback_down', 'breakout_up', 'breakout_down'];
+
+function _nextMarketState(current) {
+  const r = Math.random();
+  switch (current) {
+    case 'ranging':       return r < 0.35 ? 'breakout_up' : r < 0.70 ? 'breakout_down' : r < 0.85 ? 'uptrend' : 'downtrend';
+    case 'uptrend':       return r < 0.45 ? 'uptrend' : r < 0.75 ? 'pullback_up' : r < 0.90 ? 'ranging' : 'downtrend';
+    case 'downtrend':     return r < 0.45 ? 'downtrend' : r < 0.75 ? 'pullback_down' : r < 0.90 ? 'ranging' : 'uptrend';
+    case 'pullback_up':   return r < 0.60 ? 'uptrend' : r < 0.85 ? 'ranging' : 'downtrend';
+    case 'pullback_down': return r < 0.60 ? 'downtrend' : r < 0.85 ? 'ranging' : 'uptrend';
+    case 'breakout_up':   return r < 0.65 ? 'uptrend' : r < 0.85 ? 'pullback_up' : 'ranging';
+    case 'breakout_down': return r < 0.65 ? 'downtrend' : r < 0.85 ? 'pullback_down' : 'ranging';
+    default:              return 'ranging';
+  }
+}
+
+function _stateDuration(s) {
+  // tick count (200ms each)
+  switch (s) {
+    case 'ranging':       return 20 + Math.floor(Math.random() * 40); // 4–12s
+    case 'uptrend':       return 15 + Math.floor(Math.random() * 35); // 3–10s
+    case 'downtrend':     return 15 + Math.floor(Math.random() * 35);
+    case 'pullback_up':   return  8 + Math.floor(Math.random() * 12); // 1.6–4s
+    case 'pullback_down': return  8 + Math.floor(Math.random() * 12);
+    case 'breakout_up':   return  5 + Math.floor(Math.random() * 10); // 1–3s
+    case 'breakout_down': return  5 + Math.floor(Math.random() * 10);
+    default:              return 20;
+  }
+}
+
+function _stateBias(s) {
+  // direction bias: +1 up, -1 down, 0 neutral
+  switch (s) {
+    case 'uptrend':       return  0.7;
+    case 'downtrend':     return -0.7;
+    case 'pullback_up':   return -0.4;
+    case 'pullback_down': return  0.4;
+    case 'breakout_up':   return  1.2;
+    case 'breakout_down': return -1.2;
+    default:              return  0.0; // ranging
+  }
+}
+
 function tickOTC(id) {
   const state = _states[id];
   if (!state || state.type !== 'otc') return;
-  const ctrl = _controls[id] || {};
-  const volMul = { low:0.4, medium:1.0, high:2.2 }[ctrl.volatility] || 1.0;
-  const speed = ctrl.speedMultiplier || 1.0;
-  const now = Date.now();
+  const ctrl    = _controls[id] || {};
+  const volMul  = { low:0.5, medium:1.0, high:1.8 }[ctrl.volatility] || 1.0;
+  const speed   = ctrl.speedMultiplier || 1.0;
+  const now     = Date.now();
+
+  // ── Base volatility — price এর ০.০২% per tick ──────────────────────────
+  const v = state.price * 0.0002 * volMul;
+
+  // ── Noise counter (smooth noise seed) ───────────────────────────────────
+  if (!state._noiseSeed) state._noiseSeed = Math.random() * 1000;
+  state._noiseSeed += 0.15;
+
+  // ── Market State Machine ─────────────────────────────────────────────────
+  if (!state.marketState) {
+    state.marketState     = 'ranging';
+    state.marketStateTick = _stateDuration('ranging');
+  }
+  state.marketStateTick--;
+  if (state.marketStateTick <= 0) {
+    state.marketState     = _nextMarketState(state.marketState);
+    state.marketStateTick = _stateDuration(state.marketState);
+  }
+
+  // ── Velocity model ───────────────────────────────────────────────────────
+  if (!state.velocity)     state.velocity     = 0;
+  if (!state.acceleration) state.acceleration = 0;
+
+  // ── Trade/Manual/Auto mode — direction bias ──────────────────────────────
+  let directionBias = 0;
 
   if (!ctrl.mode || ctrl.mode === 'auto') {
-    if (state.trendSteps <= 0) { state.trend = randomTrend(); state.trendSteps = Math.round((8+Math.floor(Math.random()*12))/speed); }
-    state.trendSteps--;
+    // State machine controls direction
+    directionBias = _stateBias(state.marketState);
   } else if (ctrl.mode === 'manual') {
-    state.trend = ctrl.nextDirection === 'up' ? 1 : ctrl.nextDirection === 'down' ? -1 : 0;
-    state.trendSteps = 99;
+    directionBias = ctrl.nextDirection === 'up' ? 1.5 : ctrl.nextDirection === 'down' ? -1.5 : 0;
   } else if (ctrl.mode === 'trade-based') {
-    // Forex engine এর same pattern — majority pool এর দিকে subtle nudge (guaranteed outcome না)
     const stats = _tradeStats[id] || {};
-    const up    = parseFloat(stats.upAmount)   || 0;
+    const up    = parseFloat(stats.upAmount)  || 0;
     const down  = parseFloat(stats.downAmount) || 0;
-    if (up > down * 1.1)        state.trend = -1;
-    else if (down > up * 1.1)   state.trend = 1;
-    else                        state.trend = 0;
-    state.trendSteps = 99;
+    // State machine চলবে normally, শুধু close এ subtle push
+    directionBias = _stateBias(state.marketState);
+    // Trade direction store করো close push এর জন্য
+    if (up > down * 1.1)       state.trend = -1;
+    else if (down > up * 1.1)  state.trend =  1;
+    else                       state.trend =  0;
   }
 
-  const v = state.price * 0.0003 * volMul; // volatility কমানো — বড় movement বন্ধ
+  // ── Smooth noise (Perlin-like) ────────────────────────────────────────────
+  const noise1 = (_smoothNoise(state._noiseSeed * 0.5) - 0.5) * 2;        // slow wave
+  const noise2 = (_smoothNoise(state._noiseSeed * 2.0) - 0.5) * 2;        // fast detail
+  const noise3 = (_smoothNoise(state._noiseSeed * 5.0) - 0.5) * 2;        // micro detail
+  const smoothNoise = noise1 * 0.5 + noise2 * 0.35 + noise3 * 0.15;       // weighted mix
 
-  // ── Dynamic Support / Resistance ──────────────────────────────
-  // Recent candle high/low থেকে support/resistance track করি
-  if (!state.srHigh) state.srHigh = state.price * 1.002;
-  if (!state.srLow)  state.srLow  = state.price * 0.998;
-
-  // Support/Resistance slowly update হয় (20 tick window)
+  // ── Dynamic Support / Resistance ─────────────────────────────────────────
+  if (!state.srHigh) state.srHigh = state.price * 1.003;
+  if (!state.srLow)  state.srLow  = state.price * 0.997;
   if (!state.srTick) state.srTick = 0;
   state.srTick++;
-  if (state.srTick % 20 === 0) {
-    state.srHigh = state.candleHigh * 1.001;
-    state.srLow  = state.candleLow  * 0.999;
+  if (state.srTick % 25 === 0) {
+    // Swing high/low থেকে update
+    state.srHigh = Math.max(state.srHigh, state.candleHigh) * 1.0005;
+    state.srLow  = Math.min(state.srLow,  state.candleLow)  * 0.9995;
+    // Slowly tighten range
+    state.srHigh = state.srHigh * 0.995 + state.price * 0.005;
+    state.srLow  = state.srLow  * 0.995 + state.price * 0.005;
   }
 
-  // ── Mean Reversion — price বেশি একদিকে গেলে ফিরে আসে ──────
-  const midPoint   = (state.srHigh + state.srLow) / 2;
-  const rangeSize  = state.srHigh - state.srLow;
-  const deviation  = rangeSize > 0 ? (state.price - midPoint) / rangeSize : 0;
-  // deviation +1 = resistance, -1 = support → opposite force
-  const meanReversionComponent = -deviation * v * 0.8;
+  // ── Mean reversion force (Ornstein-Uhlenbeck) ────────────────────────────
+  const midPoint  = (state.srHigh + state.srLow) / 2;
+  const rangeSize = state.srHigh - state.srLow;
+  const deviation = rangeSize > 0 ? (state.price - midPoint) / (rangeSize * 0.5) : 0;
+  const meanReversionForce = -deviation * v * 0.6; // ranging এ ফিরে আসে
 
-  // ── Trade-based mode ─────────────────────────────────────────
-  const effectiveTrendStrength = (ctrl.mode === 'trade-based' && state.trend !== 0)
-    ? 0.6  // subtle — শুধু close এ 0.001% push, বড় movement না
-    : (ctrl.trendStrength || 0.6);
-
-  const trendComponent = state.trend * v * effectiveTrendStrength * 0.35;
-
-  // ── Candle Mode ───────────────────────────────────────────────
-  const candleMode = ctrl.candleMode || 'normal';
-  let rawRandom, momentumDecay, randomScale;
-
-  if (candleMode === 'choppy') {
-    rawRandom     = (Math.random() - 0.5) * v * 5.0;
-    momentumDecay = 0.2;
-    randomScale   = 0.8;
-  } else if (candleMode === 'spike') {
-    const isSpiking = Math.random() < 0.08;
-    rawRandom     = isSpiking
-      ? (Math.random() < 0.5 ? 1 : -1) * v * 8.0
-      : (Math.random() - 0.5) * v * 2.0;
-    momentumDecay = 0.85;
-    randomScale   = 0.15;
-  } else if (candleMode === 'slow') {
-    rawRandom     = (Math.random() - 0.5) * v * 1.2;
-    momentumDecay = 0.95;
-    randomScale   = 0.05;
-  } else {
-    // normal — Quotex style distribution
-    const rand = Math.random();
-    if (rand < 0.58) {
-      rawRandom = 0;
-    } else if (rand < 0.79) {
-      rawRandom = v * (0.3 + Math.random() * 1.0);
-    } else if (rand < 0.97) {
-      rawRandom = -v * (0.3 + Math.random() * 1.0);
-    } else {
-      rawRandom = (Math.random() < 0.5 ? 1 : -1) * v * (2.0 + Math.random() * 1.0);
-    }
-    momentumDecay = 0.1;
-    randomScale   = 0.9;
+  // ── Candle close push — trade-based mode শেষ ১৫s এ ──────────────────────
+  const timeToNextCandle = state.nextCandle ? (state.nextCandle - now) : 99999;
+  let closePush = 0;
+  if (ctrl.mode === 'trade-based' && state.trend !== 0 && timeToNextCandle <= 15000) {
+    const targetOffset = state.candleOpen * 0.00008 * -state.trend;
+    const currentOffset = state.price - state.candleOpen;
+    const needsPush = state.trend === -1 ? currentOffset > targetOffset : currentOffset < targetOffset;
+    if (needsPush) closePush = -state.trend * v * 1.5;
   }
 
-  // ── Momentum ──────────────────────────────────────────────────
-  if (!state.momentum) state.momentum = 0;
-  const now_ms = Date.now();
-  const timeToNextCandle = state.nextCandle ? (state.nextCandle - now_ms) : 99999;
+  // ── Velocity + Acceleration model ────────────────────────────────────────
+  const targetVelocity = (directionBias * v * 0.4) + (smoothNoise * v * 0.6);
+  state.acceleration   = (targetVelocity - state.velocity) * 0.25; // smooth transition
+  state.velocity       = state.velocity * 0.75 + state.acceleration; // velocity decay
+  // Clamp velocity
+  const maxV = v * 3;
+  state.velocity = Math.max(-maxV, Math.min(maxV, state.velocity));
 
-  if (timeToNextCandle <= 15000) {
-    // candle শেষ ১৫s — trade-based mode এ subtle close push
-    state.momentum = 0;
-    if (ctrl.mode === 'trade-based' && state.trend !== 0) {
-      // entry price থেকে 0.001% দিকে gentle push
-      const targetOffset = state.candleOpen * 0.00001 * state.trend * -1;
-      const currentOffset = state.price - state.candleOpen;
-      if (Math.sign(currentOffset) !== Math.sign(-state.trend) || Math.abs(currentOffset) < Math.abs(targetOffset)) {
-        // এখনো correct side এ নেই — gentle push
-        state.momentum = state.trend * -1 * v * 0.5;
-      }
-    }
-  } else {
-    state.momentum = state.momentum * momentumDecay + rawRandom * randomScale;
-  }
-
-  const randomScaleFinal = (ctrl.mode === 'trade-based' && state.trend !== 0) ? 0.6 : 1.0;
-  const randomComponent = (state.momentum !== 0 ? state.momentum : rawRandom * randomScale) * randomScaleFinal;
-
-  // ── Exposure bias — exposed user এর active trade দেখে subtle price nudge ──
-  // async হওয়ায় _activeTradesMemory থেকে এই market এর live trades এর
-  // user দের check করি — fire-and-forget, price এ lag নেই
+  // ── Exposure bias ─────────────────────────────────────────────────────────
   let exposureBiasTotal = 0;
   if (_exposureConfig.enabled) {
-    // প্রতি ১০ tick এ একবার check (500ms × 10 = 5s)
     if (!state._exposureTick) state._exposureTick = 0;
     state._exposureTick++;
-    if (state._exposureTick % 10 === 0) {
-      // fire-and-forget — price calculation block হবে না
+    if (state._exposureTick % 15 === 0) {
       (async () => {
         await _loadExposureConfig();
         for (const [key, t] of _activeTradesMemory) {
@@ -825,18 +857,18 @@ function tickOTC(id) {
             const balR = await redisPub.get(`gv:bal:${t.userId}`);
             const bal  = parseFloat(balR || '0');
             const bias = await _getExposureBias(t.userId, bal);
-            if (bias !== 0) {
-              state._pendingExposureBias = (state._pendingExposureBias || 0) + bias;
-            }
+            if (bias !== 0) state._pendingExposureBias = (state._pendingExposureBias || 0) + bias;
           } catch(e) {}
         }
       })();
     }
-    exposureBiasTotal = (state._pendingExposureBias || 0) * v * 0.25;
-    state._pendingExposureBias = 0; // reset after use
+    exposureBiasTotal = (state._pendingExposureBias || 0) * v * 0.2;
+    state._pendingExposureBias = 0;
   }
 
-  state.price = Math.max(state.price + (trendComponent + randomComponent + meanReversionComponent + exposureBiasTotal) * speed, 0.0001);
+  // ── Final price update ────────────────────────────────────────────────────
+  const delta = (state.velocity + meanReversionForce + closePush + exposureBiasTotal) * speed;
+  state.price = Math.max(state.price + delta, 0.0001);
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
 
