@@ -1150,24 +1150,11 @@ async function main() {
   await _loadExposureConfig();
   _startActiveTradesShadowListener();
 
-  // ── Variable tick timing — natural feel (80ms–350ms random interval) ──────
-  // Fixed interval এর বদলে setTimeout loop — প্রতিবার নতুন random delay
-  function _scheduleNextTick() {
-    const baseMs = 150; // average tick
-    const jitter = Math.floor(Math.random() * 200) - 100; // ±100ms
-    const delay  = Math.max(80, baseMs + jitter); // 80ms minimum
-    setTimeout(() => {
-      _activeMarkets.forEach(id => {
-        if (_states[id]?.type === 'otc')   tickOTC(id);
-        if (_states[id]?.type === 'forex') tickForex(id);
-      });
-      _scheduleNextTick();
-    }, delay);
-  }
-  _scheduleNextTick();
-
-  // Settlement — fixed 200ms (trade settle কে affect করব না)
   setInterval(() => {
+    _activeMarkets.forEach(id => {
+      if (_states[id]?.type === 'otc')   tickOTC(id);
+      if (_states[id]?.type === 'forex') tickForex(id);
+    });
     _settleDueTradesFromMemory().catch(e => console.error('[tick-settle] error:', e.message));
     _settleDueTradesFromRTDB().catch(e => console.error('[rtdb-tick-settle] error:', e.message));
   }, 200);
