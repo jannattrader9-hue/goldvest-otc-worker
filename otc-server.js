@@ -719,43 +719,57 @@ function tickOTC(id) {
     state.trendSteps = 99;
   }
 
-  const v = state.price * 0.0008 * volMul;
+  const v = state.price * 0.0003 * volMul; // volatility কমানো — বড় movement বন্ধ
 
-  // trade-based mode এ trendStrength বেশি, কিন্তু natural দেখানোর জন্য
-  // সারা candle এ consistent nudge — শেষে হঠাৎ push না
+  // ── Dynamic Support / Resistance ──────────────────────────────
+  // Recent candle high/low থেকে support/resistance track করি
+  if (!state.srHigh) state.srHigh = state.price * 1.002;
+  if (!state.srLow)  state.srLow  = state.price * 0.998;
+
+  // Support/Resistance slowly update হয় (20 tick window)
+  if (!state.srTick) state.srTick = 0;
+  state.srTick++;
+  if (state.srTick % 20 === 0) {
+    state.srHigh = state.candleHigh * 1.001;
+    state.srLow  = state.candleLow  * 0.999;
+  }
+
+  // ── Mean Reversion — price বেশি একদিকে গেলে ফিরে আসে ──────
+  const midPoint   = (state.srHigh + state.srLow) / 2;
+  const rangeSize  = state.srHigh - state.srLow;
+  const deviation  = rangeSize > 0 ? (state.price - midPoint) / rangeSize : 0;
+  // deviation +1 = resistance, -1 = support → opposite force
+  const meanReversionComponent = -deviation * v * 0.8;
+
+  // ── Trade-based mode ─────────────────────────────────────────
   const effectiveTrendStrength = (ctrl.mode === 'trade-based' && state.trend !== 0)
-    ? 1.2  // trade-based এ moderately stronger — natural দেখাবে
+    ? 0.6  // subtle — শুধু close এ 0.001% push, বড় movement না
     : (ctrl.trendStrength || 0.6);
 
   const trendComponent = state.trend * v * effectiveTrendStrength * 0.35;
 
-  // ── Candle Mode — admin panel থেকে control করা যাবে ──────
+  // ── Candle Mode ───────────────────────────────────────────────
   const candleMode = ctrl.candleMode || 'normal';
   let rawRandom, momentumDecay, randomScale;
 
   if (candleMode === 'choppy') {
-    // দ্রুত উপরে নিচে — momentum কম, random বেশি
     rawRandom     = (Math.random() - 0.5) * v * 5.0;
     momentumDecay = 0.2;
     randomScale   = 0.8;
   } else if (candleMode === 'spike') {
-    // মাঝে মাঝে হঠাৎ বড় spike
-    const isSpiking = Math.random() < 0.08; // 8% chance প্রতি tick এ
+    const isSpiking = Math.random() < 0.08;
     rawRandom     = isSpiking
-      ? (Math.random() < 0.5 ? 1 : -1) * v * 12.0
+      ? (Math.random() < 0.5 ? 1 : -1) * v * 8.0
       : (Math.random() - 0.5) * v * 2.0;
     momentumDecay = 0.85;
     randomScale   = 0.15;
   } else if (candleMode === 'slow') {
-    // ধীরে ধীরে drift — momentum বেশি, random কম
     rawRandom     = (Math.random() - 0.5) * v * 1.2;
     momentumDecay = 0.95;
     randomScale   = 0.05;
   } else {
-    // normal — fully random, Quotex distribution
-    // 58% zero, 21% up, 21% down — each tick independent
+    // normal — Quotex style distribution
     const rand = Math.random();
-
     if (rand < 0.58) {
       rawRandom = 0;
     } else if (rand < 0.79) {
@@ -763,28 +777,34 @@ function tickOTC(id) {
     } else if (rand < 0.97) {
       rawRandom = -v * (0.3 + Math.random() * 1.0);
     } else {
-      // rare spike 3%
-      rawRandom = (Math.random() < 0.5 ? 1 : -1) * v * (2.5 + Math.random() * 1.5);
+      rawRandom = (Math.random() < 0.5 ? 1 : -1) * v * (2.0 + Math.random() * 1.0);
     }
-
     momentumDecay = 0.1;
     randomScale   = 0.9;
   }
 
-  // Momentum — আগের tick এর movement carry করে smooth করে
+  // ── Momentum ──────────────────────────────────────────────────
   if (!state.momentum) state.momentum = 0;
-
-  // candle শেষ ১৫ সেকেন্ডে momentum reset — predictable reverse এড়াতে
   const now_ms = Date.now();
   const timeToNextCandle = state.nextCandle ? (state.nextCandle - now_ms) : 99999;
+
   if (timeToNextCandle <= 15000) {
-    state.momentum = 0; // momentum clear — এখন fully random
+    // candle শেষ ১৫s — trade-based mode এ subtle close push
+    state.momentum = 0;
+    if (ctrl.mode === 'trade-based' && state.trend !== 0) {
+      // entry price থেকে 0.001% দিকে gentle push
+      const targetOffset = state.candleOpen * 0.00001 * state.trend * -1;
+      const currentOffset = state.price - state.candleOpen;
+      if (Math.sign(currentOffset) !== Math.sign(-state.trend) || Math.abs(currentOffset) < Math.abs(targetOffset)) {
+        // এখনো correct side এ নেই — gentle push
+        state.momentum = state.trend * -1 * v * 0.5;
+      }
+    }
   } else {
     state.momentum = state.momentum * momentumDecay + rawRandom * randomScale;
   }
 
-  // trade-based mode এ random কমাই — trend এর effect বেশি হবে কিন্তু candle natural দেখাবে
-  const randomScaleFinal = (ctrl.mode === 'trade-based' && state.trend !== 0) ? 0.7 : 1.0;
+  const randomScaleFinal = (ctrl.mode === 'trade-based' && state.trend !== 0) ? 0.6 : 1.0;
   const randomComponent = (state.momentum !== 0 ? state.momentum : rawRandom * randomScale) * randomScaleFinal;
 
   // ── Exposure bias — exposed user এর active trade দেখে subtle price nudge ──
@@ -816,7 +836,7 @@ function tickOTC(id) {
     state._pendingExposureBias = 0; // reset after use
   }
 
-  state.price = Math.max(state.price + (trendComponent + randomComponent + exposureBiasTotal) * speed, 0.0001);
+  state.price = Math.max(state.price + (trendComponent + randomComponent + meanReversionComponent + exposureBiasTotal) * speed, 0.0001);
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
 
