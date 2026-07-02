@@ -190,14 +190,16 @@ function _liquidityForce(state, v) {
   const p = state.price;
   let force = 0;
   for (const l of state._liq) {
-    const dist = (l.price - p) / (v * 20 + 1e-9); // normalized distance
-    if (Math.abs(dist) < 3) {
-      // কাছাকাছি — টান (magnet effect), strength ও distance অনুযায়ী
-      const pull = Math.sign(dist) * Math.exp(-Math.abs(dist)) * l.strength;
-      force += pull;
+    const dist = (l.price - p) / (v * 20 + 1e-9);
+    // [GPT V5.2] magnet বাদ — শুধু level এর খুব কাছে (|dist|<0.8) এলে
+    // দুর্বল bounce (price কে level থেকে দূরে ঠেলে, টানে না)।
+    if (Math.abs(dist) < 0.8) {
+      // bounce = level থেকে দূরে (opposite of pull)
+      const bounce = -Math.sign(dist) * (0.8 - Math.abs(dist)) * l.strength;
+      force += bounce;
     }
   }
-  return force * v * 0.15;
+  return force * v * 0.10;
 }
 
 
@@ -301,8 +303,9 @@ function generateTickV5(state, ctrl, stats) {
     state._clusterStr  = 0.5 + Math.random() * 0.5;
   }
   state._clusterTick--;
-  // [v5] cluster force — 0.35 → 0.45 (আরও directional drive)
-  const clusterForce = state._clusterDir * v * state._clusterStr * 0.45;
+  // [GPT V5.2] cluster force কমানো 0.45 → 0.28 — regime market চালাবে,
+  // cluster না। এতে forward force এর সংঘর্ষ কমে।
+  const clusterForce = state._clusterDir * v * state._clusterStr * 0.28;
 
   // ── FORCE 1: Trend force (regime direction) ─────────────────────────
   let trendForce = rp.trend * v * 0.5;
@@ -316,8 +319,8 @@ function generateTickV5(state, ctrl, stats) {
     // regime চলবে normally, শুধু শেষ ৮s এ subtle push (নিচে যোগ হবে)
   }
 
-  // ── FORCE 2: Noise force (Perlin/FBM, correlated) ───────────────────
-  const noiseForce = _fbm(state._noiseSeed, state._noiseX) * v * 0.7;
+  // ── FORCE 2: Noise force (Perlin/FBM) — wick এর জন্য কিছুটা বাড়ানো ──
+  const noiseForce = _fbm(state._noiseSeed, state._noiseX) * v * 0.9;
 
   // ── FORCE 3: Liquidity force (trend এ দুর্বল, spring এড়াতে) ─────────
   _updateLiquidity(state);
@@ -329,19 +332,27 @@ function generateTickV5(state, ctrl, stats) {
     liqForce *= 0.35;
   }
 
-  // ── FORCE 4: Mean reversion (trend এ দুর্বল, spring effect কমাতে) ────
+  // ── FORCE 4: Mean reversion (slow VWAP anchor + distance-based) ─────
+  // [GPT V5.2] anchor আর price কে chase করে না — অনেক ধীরে move করে
+  // (session-mean এর মতো)। আর reversion সব distance এ সমান না —
+  // center এর কাছে প্রায় শূন্য, দূরে গেলে বাড়ে। এতে spring ভাঙে।
   if (state._anchor === undefined) state._anchor = state.price;
-  state._anchor = state._anchor * 0.998 + state.price * 0.002;
-  // [GPT V5] strong trend (markup/markdown/breakout) এ center-pull খুব কম,
-  // যাতে price একদিকে glide করতে পারে — rubber-band না হয়।
-  let revMul = 0.025;
+  state._anchor = state._anchor * 0.9995 + state.price * 0.0005; // খুব ধীর
+  const dist = (state.price - state._anchor) / (state.price * 0.006 + 1e-9);
+  // dead zone: |dist| < 1 হলে reversion প্রায় শূন্য; বাইরে quadratic বাড়ে
+  let revShape = 0;
+  if (Math.abs(dist) > 1) {
+    const over = Math.abs(dist) - 1;
+    revShape = Math.sign(dist) * Math.min(over * over, 4);
+  }
+  let revMul = 0.03;
   if (state._regime === 'markup' || state._regime === 'markdown' ||
       state._regime === 'liquidity_grab') {
-    revMul = 0.012; // trend এ দুর্বল কিন্তু overshoot রোধ করার মতো যথেষ্ট
+    revMul = 0.015;
   } else if (state._regime === 'expansion') {
-    revMul = 0.018;
+    revMul = 0.02;
   }
-  const reversionForce = (state._anchor - state.price) * revMul * rp.rev;
+  const reversionForce = -revShape * v * revMul * rp.rev;
 
   // ── FORCE 5: Micro hesitation (probabilistic, fixed pattern না) ─────
   // [GPT V5] %6 fixed pattern predictable — random probability ব্যবহার করি।
