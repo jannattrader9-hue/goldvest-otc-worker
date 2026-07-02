@@ -231,31 +231,54 @@ function generateTickV4(state, ctrl, stats) {
   if (state._noiseSeed === undefined) state._noiseSeed = (Math.random() * 1e9) | 0;
   state._noiseX += 0.08; // slow advance = smooth correlated noise
 
-  // ── Regime state machine ─────────────────────────────────────────────
+  // ── Regime state machine (trend-age + volatility aware) ──────────────
   if (!state._regime) {
     state._regime = 'ranging';
     state._regimeTick = _regimeDuration('ranging');
     state._grabDir = 1;
+    state._trendAge = 0;
   }
   state._regimeTick--;
-  if (state._regimeTick <= 0) {
-    // liquidity_grab এ ঢোকার সময় random direction ঠিক করি
+  state._trendAge = (state._trendAge || 0) + 1;
+
+  // GPT: regime change শুধু timer না — trend age বেশি হলে বা velocity
+  // অস্বাভাবিক হলে early change এর সম্ভাবনা বাড়ে।
+  let forceChange = false;
+  const trendingRegime = (state._regime === 'markup' || state._regime === 'markdown');
+  if (trendingRegime && state._trendAge > 30) {
+    // দীর্ঘ trend — exhaustion এর সম্ভাবনা, early change chance
+    if (Math.random() < 0.04) forceChange = true;
+  }
+
+  if (state._regimeTick <= 0 || forceChange) {
     const next = _nextRegime(state._regime);
     if (next === 'liquidity_grab') state._grabDir = Math.random() < 0.5 ? 1 : -1;
     state._regime = next;
     state._regimeTick = _regimeDuration(next);
+    state._trendAge = 0;
   }
 
   const rp = _regimeParams(state._regime, state._grabDir);
   const v  = vBase * rp.vol;
 
-  // ── [v4] TICK CLUSTERING — এক direction এ ৪–৮ tick cluster ──────────
-  // Real market এক দিকে কয়েক tick টানা যায়, তারপর pause/reverse।
-  // প্রতি cluster এ একটা intent direction থাকে।
+  // ── [v4.1] SMART TICK CLUSTERING ────────────────────────────────────
+  // Cluster direction pure random না — regime bias + velocity + আগের
+  // cluster মিলিয়ে ঠিক হয়। Duration ও volatility অনুযায়ী variable।
   if (state._clusterTick === undefined || state._clusterTick <= 0) {
-    state._clusterDir  = Math.random() < 0.5 ? 1 : -1;
-    state._clusterTick = 4 + (Math.random() * 5 | 0); // 4–8 tick
-    state._clusterStr  = 0.3 + Math.random() * 0.5;   // cluster strength
+    // Direction weights: regime trend + current velocity + previous cluster momentum
+    const regimeBias = rp.trend;                          // -1.2 .. +1.2
+    const velBias    = Math.sign(state._velocity || 0) * 0.5;
+    const prevBias   = (state._clusterDir || 0) * 0.3;    // continuation ঝোঁক
+    const score      = regimeBias + velBias + prevBias;
+    // score কে probability তে রূপান্তর — বেশি score → up cluster বেশি সম্ভব
+    const pUp = 0.5 + Math.max(-0.4, Math.min(0.4, score * 0.35));
+    state._clusterDir = Math.random() < pUp ? 1 : -1;
+
+    // Variable duration — volatility বেশি হলে ছোট cluster, কম হলে বড়
+    const volFactor = rp.vol; // 0.3 .. 1.8
+    const baseDur   = volFactor > 1.2 ? 3 : volFactor < 0.5 ? 8 : 5;
+    state._clusterTick = Math.max(2, baseDur + (Math.random() * 7 - 3 | 0)); // 2–14 range
+    state._clusterStr  = 0.3 + Math.random() * 0.5;
   }
   state._clusterTick--;
   const clusterForce = state._clusterDir * v * state._clusterStr * 0.4;
@@ -272,18 +295,40 @@ function generateTickV4(state, ctrl, stats) {
     // regime চলবে normally, শুধু শেষ ৮s এ subtle push (নিচে যোগ হবে)
   }
 
-  // ── FORCE 2: Noise force (Perlin, correlated) ───────────────────────
-  const noiseForce = _fbm(state._noiseSeed, state._noiseX) * v * 0.7;
+  // ── FORCE 2: Noise force (FBM + micro burst/compression) ────────────
+  // GPT: শুধু FBM বেশি smooth। মাঝে মাঝে micro burst (sharp) ও
+  // compression (quiet) যোগ করে natural texture আনি।
+  let noiseForce = _fbm(state._noiseSeed, state._noiseX) * v * 0.7;
+  // micro burst — rare, ছোট কিন্তু sharp (Gaussian-ish)
+  if (!state._burstTick) state._burstTick = 0;
+  state._burstTick--;
+  if (state._burstTick <= 0) {
+    // পরের burst/compression কখন হবে
+    state._burstTick = 15 + (Math.random() * 30 | 0);
+    state._burstMode = Math.random(); // 0-1
+  }
+  if (state._burstMode > 0.85) {
+    // micro burst — noise amplify
+    noiseForce *= 1.8;
+  } else if (state._burstMode < 0.25) {
+    // micro compression — noise dampen (quiet period)
+    noiseForce *= 0.4;
+  }
 
   // ── FORCE 3: Liquidity force (support/resistance magnet) ────────────
   _updateLiquidity(state);
   const liqForce = _liquidityForce(state, v);
 
-  // ── FORCE 4: Mean reversion (regime অনুযায়ী) ───────────────────────
-  if (state._anchor === undefined) state._anchor = state.price;
-  // anchor ধীরে current price follow করে, কিন্তু বেশি drift হলে টেনে ধরে
-  state._anchor = state._anchor * 0.998 + state.price * 0.002;
-  const reversionForce = (state._anchor - state.price) * 0.05 * rp.rev;
+  // ── FORCE 4: Mean reversion (VWAP-style rolling equilibrium) ────────
+  // GPT: single anchor weak। Rolling equilibrium — recent price এর
+  // weighted average, trend এ drift allow করে কিন্তু extreme এ টানে।
+  if (state._equilibrium === undefined) state._equilibrium = state.price;
+  // equilibrium recent price follow করে (EMA), কিন্তু ধীরে
+  state._equilibrium = state._equilibrium * 0.992 + state.price * 0.008;
+  // deviation যত বেশি, reversion তত strong (quadratic-ish)
+  const devRatio = (state.price - state._equilibrium) / (state.price * 0.01 + 1e-9);
+  const revStrength = Math.min(Math.abs(devRatio), 3) * Math.sign(devRatio);
+  const reversionForce = -revStrength * v * 0.22 * rp.rev;
 
   // ── FORCE 5: Micro hesitation (human behaviour) ─────────────────────
   // প্রতি কয়েক tick এ ছোট বিপরীত পা — trend এও hesitation
@@ -313,9 +358,9 @@ function generateTickV4(state, ctrl, stats) {
   state._acceleration = netForce;
   state._velocity += state._acceleration;
 
-  // ── [v4] DYNAMIC FRICTION — fixed 0.86 এর বদলে regime অনুযায়ী random ──
-  // Breakout/expansion এ কম friction (দ্রুত glide), ranging এ বেশি (ধীর)।
-  // প্রতি tick এ ছোট random walk করে — deterministic লাগবে না।
+  // ── [v4.1] DYNAMIC FRICTION — smooth lerp, per-tick random বাদ ──────
+  // Friction regime অনুযায়ী target এর দিকে smoothly move করে।
+  // GPT: per-tick Math.random() বাদ — professional engine এ friction smooth।
   if (state._friction === undefined) state._friction = 0.85;
   let frictionTarget;
   if (state._regime === 'markup' || state._regime === 'markdown' ||
@@ -327,10 +372,9 @@ function generateTickV4(state, ctrl, stats) {
   } else {
     frictionTarget = 0.84;
   }
-  // friction target এর দিকে ধীরে move + ছোট random jitter
-  state._friction += (frictionTarget - state._friction) * 0.1;
-  const frictionNow = state._friction + (Math.random() - 0.5) * 0.06; // ±0.03 jitter
-  state._velocity *= Math.max(0.70, Math.min(0.95, frictionNow));
+  // smooth transition — কোনো per-tick random নেই
+  state._friction += (frictionTarget - state._friction) * 0.08;
+  state._velocity *= Math.max(0.70, Math.min(0.94, state._friction));
 
   // velocity clamp — বড় spike রোধ
   const maxVel = v * 2.2;
@@ -368,6 +412,11 @@ function initStateV4(price) {
     _clusterDir:   Math.random() < 0.5 ? 1 : -1,
     _clusterStr:   0.3 + Math.random() * 0.5,
     _friction:     0.85,
+    // [v4.1] equilibrium, burst, trend age
+    _equilibrium:  price,
+    _burstTick:    15 + (Math.random() * 30 | 0),
+    _burstMode:    0.5,
+    _trendAge:     0,
   };
 }
 
