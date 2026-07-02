@@ -223,39 +223,26 @@ function generateTickV4(state, ctrl, stats) {
   const speed  = ctrl.speedMultiplier || 1.0;
   const now    = Date.now();
 
-  // Base unit of movement — price এর ০.০১২%
-  const vBase = state.price * 0.00012 * volCfg;
+  // Base unit of movement — v3 এর মতো ০.০২৫%
+  const vBase = state.price * 0.00025 * volCfg;
 
   // ── Perlin noise position advance ────────────────────────────────────
   if (state._noiseX === undefined) state._noiseX = Math.random() * 1000;
   if (state._noiseSeed === undefined) state._noiseSeed = (Math.random() * 1e9) | 0;
   state._noiseX += 0.08; // slow advance = smooth correlated noise
 
-  // ── Regime state machine (trend-age + volatility aware) ──────────────
+  // ── Regime state machine ─────────────────────────────────────────────
   if (!state._regime) {
     state._regime = 'ranging';
     state._regimeTick = _regimeDuration('ranging');
     state._grabDir = 1;
-    state._trendAge = 0;
   }
   state._regimeTick--;
-  state._trendAge = (state._trendAge || 0) + 1;
-
-  // GPT: regime change শুধু timer না — trend age বেশি হলে বা velocity
-  // অস্বাভাবিক হলে early change এর সম্ভাবনা বাড়ে।
-  let forceChange = false;
-  const trendingRegime = (state._regime === 'markup' || state._regime === 'markdown');
-  if (trendingRegime && state._trendAge > 30) {
-    // দীর্ঘ trend — exhaustion এর সম্ভাবনা, early change chance
-    if (Math.random() < 0.04) forceChange = true;
-  }
-
-  if (state._regimeTick <= 0 || forceChange) {
+  if (state._regimeTick <= 0) {
     const next = _nextRegime(state._regime);
     if (next === 'liquidity_grab') state._grabDir = Math.random() < 0.5 ? 1 : -1;
     state._regime = next;
     state._regimeTick = _regimeDuration(next);
-    state._trendAge = 0;
   }
 
   const rp = _regimeParams(state._regime, state._grabDir);
@@ -281,7 +268,7 @@ function generateTickV4(state, ctrl, stats) {
     state._clusterStr  = 0.3 + Math.random() * 0.5;
   }
   state._clusterTick--;
-  const clusterForce = state._clusterDir * v * state._clusterStr * 0.4;
+  const clusterForce = state._clusterDir * v * state._clusterStr * 0.18;
 
   // ── FORCE 1: Trend force (regime direction) ─────────────────────────
   let trendForce = rp.trend * v * 0.5;
@@ -295,40 +282,17 @@ function generateTickV4(state, ctrl, stats) {
     // regime চলবে normally, শুধু শেষ ৮s এ subtle push (নিচে যোগ হবে)
   }
 
-  // ── FORCE 2: Noise force (FBM + micro burst/compression) ────────────
-  // GPT: শুধু FBM বেশি smooth। মাঝে মাঝে micro burst (sharp) ও
-  // compression (quiet) যোগ করে natural texture আনি।
-  let noiseForce = _fbm(state._noiseSeed, state._noiseX) * v * 0.7;
-  // micro burst — rare, ছোট কিন্তু sharp (Gaussian-ish)
-  if (!state._burstTick) state._burstTick = 0;
-  state._burstTick--;
-  if (state._burstTick <= 0) {
-    // পরের burst/compression কখন হবে
-    state._burstTick = 15 + (Math.random() * 30 | 0);
-    state._burstMode = Math.random(); // 0-1
-  }
-  if (state._burstMode > 0.85) {
-    // micro burst — noise amplify
-    noiseForce *= 1.8;
-  } else if (state._burstMode < 0.25) {
-    // micro compression — noise dampen (quiet period)
-    noiseForce *= 0.4;
-  }
+  // ── FORCE 2: Noise force (Perlin/FBM, correlated) ───────────────────
+  const noiseForce = _fbm(state._noiseSeed, state._noiseX) * v * 0.7;
 
   // ── FORCE 3: Liquidity force (support/resistance magnet) ────────────
   _updateLiquidity(state);
   const liqForce = _liquidityForce(state, v);
 
-  // ── FORCE 4: Mean reversion (VWAP-style rolling equilibrium) ────────
-  // GPT: single anchor weak। Rolling equilibrium — recent price এর
-  // weighted average, trend এ drift allow করে কিন্তু extreme এ টানে।
-  if (state._equilibrium === undefined) state._equilibrium = state.price;
-  // equilibrium recent price follow করে (EMA), কিন্তু ধীরে
-  state._equilibrium = state._equilibrium * 0.992 + state.price * 0.008;
-  // deviation যত বেশি, reversion তত strong (quadratic-ish)
-  const devRatio = (state.price - state._equilibrium) / (state.price * 0.01 + 1e-9);
-  const revStrength = Math.min(Math.abs(devRatio), 3) * Math.sign(devRatio);
-  const reversionForce = -revStrength * v * 0.22 * rp.rev;
+  // ── FORCE 4: Mean reversion (v3 simple anchor) ──────────────────────
+  if (state._anchor === undefined) state._anchor = state.price;
+  state._anchor = state._anchor * 0.998 + state.price * 0.002;
+  const reversionForce = (state._anchor - state.price) * 0.05 * rp.rev;
 
   // ── FORCE 5: Micro hesitation (human behaviour) ─────────────────────
   // প্রতি কয়েক tick এ ছোট বিপরীত পা — trend এও hesitation
@@ -407,16 +371,11 @@ function initStateV4(price) {
     _recentLow:    price,
     _hesTick:      0,
     _tradeTrend:   0,
-    // [v4] tick clustering + dynamic friction
+    // [v4-stable] tick clustering + dynamic friction
     _clusterTick:  4 + (Math.random() * 5 | 0),
     _clusterDir:   Math.random() < 0.5 ? 1 : -1,
     _clusterStr:   0.3 + Math.random() * 0.5,
     _friction:     0.85,
-    // [v4.1] equilibrium, burst, trend age
-    _equilibrium:  price,
-    _burstTick:    15 + (Math.random() * 30 | 0),
-    _burstMode:    0.5,
-    _trendAge:     0,
   };
 }
 
