@@ -248,6 +248,23 @@ function generateTickV5(state, ctrl, stats) {
   const rp = _regimeParams(state._regime, state._grabDir);
   const v  = vBase * rp.vol;
 
+  // ── [V5.1] DIRECTIONAL CANDLE MEMORY ─────────────────────────────────
+  // প্রতি নতুন candle শুরুতে একটা "personality" ঠিক হয় (bullish/bearish/
+  // neutral) এবং পুরো candle জুড়ে সেই bias ধরে রাখে — মাঝপথে এলোমেলো
+  // দিক বদলায় না। এতে body বড় হয়, wick কম।
+  if (state._candleMemOpen !== state.candleOpen) {
+    // নতুন candle detect হলো
+    state._candleMemOpen = state.candleOpen;
+    // personality: regime trend + সামান্য random
+    const lean = rp.trend + (Math.random() - 0.5) * 0.6;
+    if (lean > 0.15)      state._candlePersonality =  1; // bullish
+    else if (lean < -0.15) state._candlePersonality = -1; // bearish
+    else                   state._candlePersonality =  0; // neutral/doji
+    // personality strength — কত জোরে bias ধরে রাখবে
+    state._candleConviction = 0.3 + Math.random() * 0.5;
+  }
+  // candle bias force — পুরো candle জুড়ে consistent push
+  const candleBiasForce = (state._candlePersonality || 0) * v * (state._candleConviction || 0.4) * 0.3;
   // ── [v4.1] SMART TICK CLUSTERING ────────────────────────────────────
   // Cluster direction pure random না — regime bias + velocity + আগের
   // cluster মিলিয়ে ঠিক হয়। Duration ও volatility অনুযায়ী variable।
@@ -314,7 +331,7 @@ function generateTickV5(state, ctrl, stats) {
   }
 
   // ── PHYSICS: net force → acceleration → velocity → price ────────────
-  const netForce = trendForce + clusterForce + noiseForce + liqForce + reversionForce + hesitationForce + closePush;
+  const netForce = trendForce + candleBiasForce + clusterForce + noiseForce + liqForce + reversionForce + hesitationForce + closePush;
 
   if (state._velocity === undefined)     state._velocity = 0;
   if (state._acceleration === undefined) state._acceleration = 0;
@@ -377,6 +394,10 @@ function initStateV5(price) {
     _clusterDir:   Math.random() < 0.5 ? 1 : -1,
     _clusterStr:   0.3 + Math.random() * 0.5,
     _friction:     0.85,
+    // [V5.1] directional candle memory
+    _candleMemOpen:     null,
+    _candlePersonality: 0,
+    _candleConviction:  0.4,
   };
 }
 
