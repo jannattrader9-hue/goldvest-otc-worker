@@ -284,11 +284,20 @@ function generateTickV5(state, ctrl, stats) {
     const pUp = 0.5 + Math.max(-0.45, Math.min(0.45, score * 0.4));
     state._clusterDir = Math.random() < pUp ? 1 : -1;
 
-    // [v5] Directional persistence — cluster লম্বা (৬–১৮ tick)
-    // এতে candle এর মধ্যে price এক দিকে বেশি যায় → বড় body, ছোট wick
+    // [GPT V5.1.1] Directional persistence — cluster লম্বা।
+    // Trend এ ২০–৩৫ tick, ranging এ ছোট — Quotex এর মতো smooth glide।
     const volFactor = rp.vol;
-    const baseDur   = volFactor > 1.2 ? 6 : volFactor < 0.5 ? 14 : 10;
-    state._clusterTick = Math.max(5, baseDur + (Math.random() * 8 - 4 | 0)); // 5–18 range
+    let baseDur;
+    if (state._regime === 'markup' || state._regime === 'markdown') {
+      baseDur = 26; // strong trend — খুব লম্বা cluster
+    } else if (volFactor > 1.2) {
+      baseDur = 8;  // high vol — ছোট
+    } else if (volFactor < 0.5) {
+      baseDur = 16;
+    } else {
+      baseDur = 12;
+    }
+    state._clusterTick = Math.max(5, baseDur + (Math.random() * 10 - 5 | 0));
     state._clusterStr  = 0.5 + Math.random() * 0.5;
   }
   state._clusterTick--;
@@ -310,9 +319,15 @@ function generateTickV5(state, ctrl, stats) {
   // ── FORCE 2: Noise force (Perlin/FBM, correlated) ───────────────────
   const noiseForce = _fbm(state._noiseSeed, state._noiseX) * v * 0.7;
 
-  // ── FORCE 3: Liquidity force (support/resistance magnet) ────────────
+  // ── FORCE 3: Liquidity force (trend এ দুর্বল, spring এড়াতে) ─────────
   _updateLiquidity(state);
-  const liqForce = _liquidityForce(state, v);
+  let liqForce = _liquidityForce(state, v);
+  // [GPT V5.1.1] strong trend এ liquidity pull কমাই — নাহলে trend এর
+  // বিপরীতে টেনে spring তৈরি করে।
+  if (state._regime === 'markup' || state._regime === 'markdown' ||
+      state._regime === 'liquidity_grab' || state._regime === 'expansion') {
+    liqForce *= 0.35;
+  }
 
   // ── FORCE 4: Mean reversion (trend এ দুর্বল, spring effect কমাতে) ────
   if (state._anchor === undefined) state._anchor = state.price;
@@ -322,9 +337,9 @@ function generateTickV5(state, ctrl, stats) {
   let revMul = 0.025;
   if (state._regime === 'markup' || state._regime === 'markdown' ||
       state._regime === 'liquidity_grab') {
-    revMul = 0.006; // trend এ খুব দুর্বল reversion
+    revMul = 0.012; // trend এ দুর্বল কিন্তু overshoot রোধ করার মতো যথেষ্ট
   } else if (state._regime === 'expansion') {
-    revMul = 0.012;
+    revMul = 0.018;
   }
   const reversionForce = (state._anchor - state.price) * revMul * rp.rev;
 
@@ -345,14 +360,10 @@ function generateTickV5(state, ctrl, stats) {
     }
   }
 
-  // ── [GPT V5] MOMENTUM FORCE — velocity continuity (spring effect কমায়) ──
-  // আলাদা momentum force যা আগের velocity এর দিকে ঝোঁক ধরে রাখে।
-  // এতে force→velocity→friction এর rubber-band cycle ভাঙে — price
-  // একদিকে গেলে সেই দিকে চলতে থাকে, হঠাৎ ফেরত আসে না।
-  const momentumForce = (state._velocity || 0) * 0.35;
-
   // ── PHYSICS: net force → acceleration → velocity → price ────────────
-  const netForce = trendForce + candleBiasForce + clusterForce + momentumForce + noiseForce + liqForce + reversionForce + hesitationForce + closePush;
+  // [GPT V5.1.1] momentum-as-force বাদ — positive feedback loop এড়াতে।
+  // Inertia এখন friction/damping দিয়ে maintain হয় (নিচে দেখো)।
+  const netForce = trendForce + candleBiasForce + clusterForce + noiseForce + liqForce + reversionForce + hesitationForce + closePush;
 
   if (state._velocity === undefined)     state._velocity = 0;
   if (state._acceleration === undefined) state._acceleration = 0;
@@ -361,23 +372,24 @@ function generateTickV5(state, ctrl, stats) {
   state._acceleration = netForce;
   state._velocity += state._acceleration;
 
-  // ── [v4.1] DYNAMIC FRICTION — smooth lerp, per-tick random বাদ ──────
-  // Friction regime অনুযায়ী target এর দিকে smoothly move করে।
-  // GPT: per-tick Math.random() বাদ — professional engine এ friction smooth।
+  // ── DYNAMIC FRICTION — inertia এখানেই maintain হয় (momentum force ছাড়া) ──
+  // [GPT V5.1.1] trend এ friction বেশি (কম damping) → velocity ধরে রাখে →
+  // natural momentum continuity, কোনো feedback loop ছাড়া।
   if (state._friction === undefined) state._friction = 0.85;
   let frictionTarget;
   if (state._regime === 'markup' || state._regime === 'markdown' ||
-      state._regime === 'expansion' || state._regime === 'liquidity_grab') {
-    frictionTarget = 0.90; // কম damping → বেশি glide
+      state._regime === 'liquidity_grab') {
+    frictionTarget = 0.93; // strong trend — খুব কম damping, বেশি glide
+  } else if (state._regime === 'expansion') {
+    frictionTarget = 0.90;
   } else if (state._regime === 'ranging' || state._regime === 'compression' ||
              state._regime === 'accumulation' || state._regime === 'distribution') {
-    frictionTarget = 0.78; // বেশি damping → ধীর
+    frictionTarget = 0.80; // ranging — বেশি damping, ধীর
   } else {
-    frictionTarget = 0.84;
+    frictionTarget = 0.86;
   }
-  // smooth transition — কোনো per-tick random নেই
   state._friction += (frictionTarget - state._friction) * 0.08;
-  state._velocity *= Math.max(0.70, Math.min(0.94, state._friction));
+  state._velocity *= Math.max(0.72, Math.min(0.95, state._friction));
 
   // velocity clamp — বড় spike রোধ
   const maxVel = v * 2.2;
