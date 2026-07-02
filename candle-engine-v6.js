@@ -71,6 +71,17 @@ function _newWave(state) {
 
   const curvature = 0.5 + Math.random() * 1.2; // 0.5–1.7 বেশি variation
 
+  // [GPT] প্রতি wave এর নিজস্ব PHYSICS PROFILE — motion signature আর
+  // একই থাকে না। কোনো wave ভারী (heavy inertia), কোনোটা responsive,
+  // কোনো pullback দ্রুত, কোনো reversal ধীরে। এটাই "একই animation"
+  // সমস্যা ভাঙে — user আর predict করতে পারে না চার্ট কীভাবে নড়বে।
+  state._physAccel   = 0.08 + Math.random() * 0.16;  // 0.08–0.24 (responsive vs heavy)
+  state._physDamping = 0.82 + Math.random() * 0.14;  // 0.82–0.96 (friction variation)
+  state._physMaxVel  = 1.3  + Math.random() * 1.2;   // 1.3–2.5 (velocity ceiling)
+  state._physBlend   = 6    + (Math.random() * 12|0);// 6–18 tick blend
+  // envelope skew — কোনো wave শুরুতে fast, কোনো শেষে fast
+  state._physSkew    = 0.5  + Math.random() * 1.0;   // 0.5–1.5
+
   // [GPT FIX] _newWave শুধু wave তৈরি করে — velocity এখানে modify করি না।
   // carry-over এর intent সংরক্ষণ করি, প্রয়োগ হয় generateTickV6 এ।
   state._carryOverSameDir = (dir === prevDir);
@@ -81,7 +92,7 @@ function _newWave(state) {
   state._prevWaveCurvature = state._waveCurvature || 1.0;
   state._prevWaveProgress  = state._waveDuration
                              ? (state._waveElapsed / state._waveDuration) : 1;
-  state._blendTicks        = 10;
+  state._blendTicks        = state._physBlend || 10;
   state._justStartedWave   = true; // generateTick এ carry-over প্রয়োগের signal
 
   state._waveDir       = dir;
@@ -177,7 +188,10 @@ function generateTickV6(state, ctrl, stats) {
   }
   state._waveElapsed++;
   const progress = state._waveElapsed / state._waveDuration;
-  const envelope = _waveEnvelope(progress, state._waveCurvature);
+  // [GPT] skew দিয়ে envelope এর peak সরাই — কোনো wave শুরুতে fast
+  // (skew<1), কোনো শেষে fast (skew>1)। প্রতি wave আলাদা acceleration timing।
+  const skewedProg = Math.pow(progress, state._physSkew || 1.0);
+  const envelope = _waveEnvelope(skewedProg, state._waveCurvature);
 
   // Manual override on direction
   let waveDir = state._waveDir;
@@ -264,13 +278,13 @@ function generateTickV6(state, ctrl, stats) {
   }
 
   const targetVel = (waveForce + liqForce + tradeForce) * vBase;
-  const accel = (targetVel - state._velocity) * 0.16;
+  // [GPT] এই wave এর নিজস্ব physics — সব wave এ একই না।
+  const accel = (targetVel - state._velocity) * (state._physAccel || 0.16);
   state._acceleration += (accel - state._acceleration) * 0.5;
-  // [GPT FIX] acceleration damping — long-term oscillation রোধ করে।
-  state._acceleration *= 0.9;
+  state._acceleration *= (state._physDamping || 0.9);
   state._velocity += state._acceleration;
 
-  const maxVel = vBase * 1.8;
+  const maxVel = vBase * (state._physMaxVel || 1.8);
   state._velocity = Math.max(-maxVel, Math.min(maxVel, state._velocity));
 
   // ── price = velocity (macro trend) + medium swing + noise ────────────
@@ -303,6 +317,11 @@ function initStateV6(price) {
     _medStrength:   0.5,
     _medElapsed:    0,
     _medDuration:   1,
+    _physAccel:     0.16,
+    _physDamping:   0.9,
+    _physMaxVel:    1.8,
+    _physBlend:     10,
+    _physSkew:      1.0,
     _waveDuration:  0,
     _waveElapsed:   0,
     _waveCurvature: 1.0,
