@@ -50,24 +50,23 @@ function _newWave(state) {
   if (prevDir === 0) {
     dir = Math.random() < 0.5 ? 1 : -1;
   } else if (prevWasStrong) {
-    // আগের wave strong → এবার বেশি সম্ভাবনা pullback/reverse (একদিকে
-    // যেতেই থাকা বন্ধ করতে)
-    if (r < 0.35)      dir = prevDir;      // continuation কম
-    else if (r < 0.75) dir = -prevDir;     // pullback বেশি
-    else               dir = -prevDir;     // reverse
+    // strong wave এর পর বেশি reverse/pullback — একটানা এক দিকে না
+    if (r < 0.30)      dir = prevDir;
+    else               dir = -prevDir;
   } else {
-    if (r < 0.35)      dir = prevDir;
-    else if (r < 0.75) dir = -prevDir;
+    // দুর্বল wave এর পর প্রায় সমান সম্ভাবনা
+    if (r < 0.45)      dir = prevDir;
+    else if (r < 0.85) dir = -prevDir;
     else               dir = Math.random() < 0.5 ? 1 : -1;
   }
 
   const isPullback = (dir === -prevDir && prevWasStrong);
   if (isPullback) {
     strength = 0.3 + Math.random() * 0.35;
-    duration = 8 + (Math.random() * 12 | 0);   // ছোট: 8–20 tick
+    duration = 6 + (Math.random() * 8 | 0);    // ছোট: 6–14 tick
   } else {
     strength = 0.4 + Math.random() * 0.45;
-    duration = 15 + (Math.random() * 25 | 0);  // মাঝারি: 15–40 tick (আগে 30–85)
+    duration = 10 + (Math.random() * 16 | 0);  // মাঝারি: 10–26 tick
   }
 
   // Curvature — wave কত sharp/smooth ease করবে
@@ -204,10 +203,11 @@ function generateTickV6(state, ctrl, stats) {
   }
 
   // ── VELOCITY PIPELINE — inertia + carry-over ─────────────────────────
-  // wave force velocity কে push করে (smooth inertia)।
+  // wave force velocity কে push করে। smoothing 0.12 → 0.28 (কম inertia,
+  // দ্রুত দিক বদলাতে পারে — একটানা এক দিকে যায় না)।
   if (state._velocity === undefined) state._velocity = 0;
   const waveTarget = (waveForce + liqForce + tradeForce) * vBase;
-  state._velocity += (waveTarget - state._velocity) * 0.12;
+  state._velocity += (waveTarget - state._velocity) * 0.28;
   const maxVel = vBase * 1.8;
   state._velocity = Math.max(-maxVel, Math.min(maxVel, state._velocity));
 
