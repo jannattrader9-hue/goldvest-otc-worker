@@ -47,39 +47,49 @@ function _newWave(state) {
   const r = Math.random();
   let dir, strength, duration;
 
+  // [UNPREDICTABLE] direction অনেক বেশি random — pattern ধরা যাবে না।
+  // continuation/reverse এর কোনো নির্দিষ্ট নিয়ম নেই, প্রতিবার ভিন্ন।
   if (prevDir === 0) {
     dir = Math.random() < 0.5 ? 1 : -1;
-  } else if (prevWasStrong) {
-    // strong wave এর পর বেশি reverse/pullback — একটানা এক দিকে না
-    if (r < 0.30)      dir = prevDir;
-    else               dir = -prevDir;
   } else {
-    // দুর্বল wave এর পর প্রায় সমান সম্ভাবনা
-    if (r < 0.45)      dir = prevDir;
-    else if (r < 0.85) dir = -prevDir;
-    else               dir = Math.random() < 0.5 ? 1 : -1;
+    // continuation probability নিজেই random (35%–65%) — fixed না
+    const contProb = 0.35 + Math.random() * 0.30;
+    dir = (r < contProb) ? prevDir : -prevDir;
+    // মাঝে মাঝে (~12%) সম্পূর্ণ random surprise
+    if (Math.random() < 0.12) dir = Math.random() < 0.5 ? 1 : -1;
   }
 
-  const isPullback = (dir === -prevDir && prevWasStrong);
-  if (isPullback) {
-    strength = 0.3 + Math.random() * 0.35;
-    duration = 10 + (Math.random() * 12 | 0);  // 10–22 tick
-  } else {
-    strength = 0.4 + Math.random() * 0.45;
-    duration = 25 + (Math.random() * 35 | 0);  // 25–60 tick (GPT: main wave লম্বা)
-  }
+  // strength সম্পূর্ণ random — দুর্বল/মাঝারি/শক্তিশালী সব হতে পারে
+  strength = 0.25 + Math.random() * 0.75; // 0.25–1.0
 
-  const curvature = 0.6 + Math.random() * 0.8;
+  // duration অনেক বড় random range — timing unpredictable
+  // কখনো ছোট (৮), কখনো বড় (৭০) — কোনো নির্দিষ্ট pattern নেই
+  const durRoll = Math.random();
+  if (durRoll < 0.25)      duration =  8 + (Math.random() * 12 | 0); // 8–20 ছোট
+  else if (durRoll < 0.70) duration = 20 + (Math.random() * 30 | 0); // 20–50 মাঝারি
+  else                     duration = 40 + (Math.random() * 35 | 0); // 40–75 বড়
 
-  // [GPT] Wave energy carry-over — পুরনো wave এর momentum নতুন wave এ
-  // inherit হয়। আগের wave same direction হলে বেশি energy, opposite হলে কম।
+  const curvature = 0.5 + Math.random() * 1.2; // 0.5–1.7 বেশি variation
+
+  // [GPT FIX] Wave energy carry-over — পুরনো wave এর momentum নতুন wave এ
+  // সত্যিই inherit হয়। same direction হলে বেশি energy বজায় থাকে, opposite
+  // হলে velocity ধীরে ঘোরে (হঠাৎ না)। এটা velocity তে সরাসরি প্রয়োগ হয়।
   const prevMomentum = state._velocity || 0;
-  state._waveInheritedEnergy = prevMomentum;
+  if (dir === prevDir) {
+    // same direction — momentum প্রায় পুরোটা রাখি (smooth continuation)
+    state._velocity = prevMomentum * 0.85;
+  } else {
+    // reverse — momentum ধীরে কমে, হঠাৎ উল্টো না (rubber-band এড়াতে)
+    state._velocity = prevMomentum * 0.5;
+  }
 
-  // [GPT] Wave blending — নতুন wave এর প্রথম কয়েক tick পুরনোটার সাথে blend হয়
-  state._prevWaveDir      = state._waveDir || dir;
-  state._prevWaveStrength = state._waveStrength || strength;
-  state._blendTicks       = 10; // 10 tick overlap
+  // [GPT FIX] Wave blending — পুরনো wave এর নিজের progress/envelope সংরক্ষণ
+  state._prevWaveDir       = state._waveDir || dir;
+  state._prevWaveStrength  = state._waveStrength || strength;
+  state._prevWaveCurvature = state._waveCurvature || 1.0;
+  state._prevWaveProgress  = state._waveDuration
+                             ? (state._waveElapsed / state._waveDuration) : 1;
+  state._blendTicks        = 10;
 
   state._waveDir       = dir;
   state._waveStrength  = strength;
@@ -188,18 +198,18 @@ function generateTickV6(state, ctrl, stats) {
   // price কখনো একটু ধীরে, কখনো দ্রুত, কিন্তু direction carry থাকে।
   if (state._microTick === undefined || state._microTick <= 0) {
     const roll = Math.random();
-    if (roll < 0.15) {
-      // ~15% — ছোট reverse (পুরো flip না, wave এর বিপরীতে হালকা)
+    // [GPT FIX] reverse কম ঘন ঘন (~8%) এবং amplitude ছোট (gentle pullback)
+    if (roll < 0.08) {
       state._microTick = 2 + (Math.random() * 2 | 0);
-      state._microScale = -0.3 - Math.random() * 0.3; // negative = বিপরীত
-    } else if (roll < 0.45) {
-      // ~30% — slowdown
-      state._microTick = 2 + (Math.random() * 3 | 0);
-      state._microScale = 0.15 + Math.random() * 0.35;
+      state._microScale = -0.1 - Math.random() * 0.15; // -0.1 থেকে -0.25 (ছোট)
+    } else if (roll < 0.42) {
+      // slowdown
+      state._microTick = 2 + (Math.random() * 4 | 0);
+      state._microScale = 0.15 + Math.random() * 0.4;
     } else {
-      // ~55% — পূর্ণ গতি
-      state._microTick = 3 + (Math.random() * 6 | 0);
-      state._microScale = 0.85 + Math.random() * 0.4;
+      // full speed
+      state._microTick = 2 + (Math.random() * 7 | 0);
+      state._microScale = 0.8 + Math.random() * 0.5;
     }
   }
   state._microTick--;
@@ -207,11 +217,14 @@ function generateTickV6(state, ctrl, stats) {
   // ── TARGET FORCES — wave velocity কে push করে ────────────────────────
   let waveForce = waveDir * state._waveStrength * envelope * (state._microScale || 1);
 
-  // [GPT] WAVE BLENDING — নতুন wave এর প্রথম ~10 tick পুরনো wave এর সাথে
-  // blend হয় (hard transition বাদ)। blend শেষে পুরোপুরি নতুন wave।
+  // [GPT FIX] WAVE BLENDING — পুরনো wave এর নিজের envelope ব্যবহার হয়
+  // (fake না)। পুরনো wave তার শেষ progress থেকে ধীরে fade হয়।
   if (state._blendTicks && state._blendTicks > 0) {
     const blendProg = 1 - (state._blendTicks / 10); // 0→1
-    const prevForce = (state._prevWaveDir || waveDir) * (state._prevWaveStrength || 0) * envelope;
+    // পুরনো wave নিজের progress থেকে এগিয়ে যাচ্ছে (fade out)
+    const prevProg = Math.min(1, (state._prevWaveProgress || 1) + (1 - state._blendTicks / 10) * 0.3);
+    const prevEnv  = _waveEnvelope(prevProg, state._prevWaveCurvature || 1.0);
+    const prevForce = (state._prevWaveDir || waveDir) * (state._prevWaveStrength || 0) * prevEnv;
     waveForce = prevForce * (1 - blendProg) + waveForce * blendProg;
     state._blendTicks--;
   }
@@ -241,11 +254,9 @@ function generateTickV6(state, ctrl, stats) {
   const maxVel = vBase * 1.8;
   state._velocity = Math.max(-maxVel, Math.min(maxVel, state._velocity));
 
-  // ── price = smooth velocity (glide) + noticeable tick noise (up-down) ─
-  // velocity smooth momentum দেয় (Quotex glide), noise tick-level texture
-  // দেয় (সোজা লাইন ভাঙে)। noise price এ যোগ হয় velocity তে না — তাই
-  // inertia তে হারায় না।
-  const noiseTick = _perlin1D(state._noiseSeed, state._noiseX) * vBase * 0.55;
+  // ── price = smooth velocity (glide) + small tick noise ───────────────
+  // [GPT FIX] noise কমানো 0.55 → 0.20 — Quotex candle jitter করে না।
+  const noiseTick = _perlin1D(state._noiseSeed, state._noiseX) * vBase * 0.30;
   let delta = (state._velocity + noiseTick) * speed;
   const maxStep = state.price * 0.0015;
   delta = Math.max(-maxStep, Math.min(maxStep, delta));
@@ -261,7 +272,8 @@ function initStateV6(price) {
     _blendTicks:    0,
     _prevWaveDir:   0,
     _prevWaveStrength: 0,
-    _waveInheritedEnergy: 0,
+    _prevWaveCurvature: 1.0,
+    _prevWaveProgress: 1,
     _waveDuration:  0,
     _waveElapsed:   0,
     _waveCurvature: 1.0,
