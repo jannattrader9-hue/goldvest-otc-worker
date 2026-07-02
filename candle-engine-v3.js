@@ -223,8 +223,8 @@ function generateTickV3(state, ctrl, stats) {
   const speed  = ctrl.speedMultiplier || 1.0;
   const now    = Date.now();
 
-  // Base unit of movement — price এর ০.০২৫%
-  const vBase = state.price * 0.00025 * volCfg;
+  // Base unit of movement — price এর ০.০১২%
+  const vBase = state.price * 0.00012 * volCfg;
 
   // ── Perlin noise position advance ────────────────────────────────────
   if (state._noiseX === undefined) state._noiseX = Math.random() * 1000;
@@ -270,9 +270,9 @@ function generateTickV3(state, ctrl, stats) {
 
   // ── FORCE 4: Mean reversion (regime অনুযায়ী) ───────────────────────
   if (state._anchor === undefined) state._anchor = state.price;
-  // anchor ধীরে ধীরে current price কে follow করে (drift allow করে)
-  state._anchor = state._anchor * 0.995 + state.price * 0.005;
-  const reversionForce = (state._anchor - state.price) * 0.02 * rp.rev;
+  // anchor ধীরে current price follow করে, কিন্তু বেশি drift হলে টেনে ধরে
+  state._anchor = state._anchor * 0.998 + state.price * 0.002;
+  const reversionForce = (state._anchor - state.price) * 0.05 * rp.rev;
 
   // ── FORCE 5: Micro hesitation (human behaviour) ─────────────────────
   // প্রতি কয়েক tick এ ছোট বিপরীত পা — trend এও hesitation
@@ -308,9 +308,9 @@ function generateTickV3(state, ctrl, stats) {
   const maxVel = v * 2.2;
   state._velocity = Math.max(-maxVel, Math.min(maxVel, state._velocity));
 
-  // ── HARD SAFETY CLAMP — এক tick এ price max ±0.5% এর বেশি নড়বে না ──────
+  // ── HARD SAFETY CLAMP — এক tick এ price max ±0.15% এর বেশি নড়বে না ──────
   const proposedPrice = state.price + state._velocity * speed;
-  const maxStep = state.price * 0.005; // 0.5% max per tick
+  const maxStep = state.price * 0.0015; // 0.15% max per tick
   const clampedDelta = Math.max(-maxStep, Math.min(maxStep, proposedPrice - state.price));
   state.price = Math.max(state.price + clampedDelta, 0.0001);
 }
