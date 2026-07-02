@@ -40,9 +40,48 @@ function _perlin1D(seed,x){
 // এতে trend (পরপর same-direction wave), pullback (দুর্বল opposite wave),
 // consolidation (ছোট alternating wave) সব naturally আসে।
 
+function _selectFamily(state) {
+  // Phase 1: ৩টা family — Momentum, Impulse, Elastic
+  // GPT: hierarchical base probability + Markov transition + anti-repeat memory
+  const prev = state._waveFamily || 'momentum';
+
+  // Markov transition — একই family পরপর হওয়ার chance কম
+  // (chart personality evolve করে, robotic repeat হয় না)
+  let probs;
+  if (prev === 'momentum') {
+    probs = { momentum: 0.35, impulse: 0.30, elastic: 0.35 };
+  } else if (prev === 'impulse') {
+    probs = { momentum: 0.50, impulse: 0.15, elastic: 0.35 };
+  } else { // elastic
+    probs = { momentum: 0.50, impulse: 0.30, elastic: 0.20 };
+  }
+
+  // anti-repetition memory — impulse পরপর ৩ বার না, elastic ২ বার না
+  state._famStreak = (state._famStreakOf === prev) ? (state._famStreak || 1) : 0;
+  if (prev === 'impulse' && state._famStreak >= 2) probs.impulse = 0;
+  if (prev === 'elastic'  && state._famStreak >= 1) probs.elastic = 0;
+
+  // normalize + pick
+  const total = probs.momentum + probs.impulse + probs.elastic;
+  let roll = Math.random() * total;
+  let picked;
+  if ((roll -= probs.momentum) < 0)      picked = 'momentum';
+  else if ((roll -= probs.impulse) < 0)  picked = 'impulse';
+  else                                    picked = 'elastic';
+
+  // streak update
+  if (picked === state._famStreakOf) state._famStreak = (state._famStreak || 0) + 1;
+  else { state._famStreakOf = picked; state._famStreak = 1; }
+
+  return picked;
+}
+
 function _newWave(state) {
   const prevDir = state._waveDir || 0;
   const prevWasStrong = (state._waveStrength || 0) > 0.6;
+
+  // [GPT WAVE FAMILY] এই wave এর motion personality
+  state._waveFamily = _selectFamily(state);
 
   const r = Math.random();
   let dir, strength, duration;
@@ -102,15 +141,46 @@ function _newWave(state) {
   state._waveCurvature = curvature;
 }
 
-// Wave envelope — ease-in-out (শুরুতে ধীরে, মাঝে দ্রুত, শেষে ধীরে)
-// এটাই "acceleration → glide → deceleration" natural feel দেয়।
+// ── WAVE FAMILY ENVELOPES — প্রতি family এর নিজস্ব motion topology ────────
+// GPT: amplitude না, rhythm/shape ই robotic feel এর কারণ। প্রতি family
+// সম্পূর্ণ আলাদা velocity profile — user আর একই rhythm অনুভব করবে না।
+
+// Momentum — classic bell (accelerate → peak → decelerate)
+function _envMomentum(p, curv) {
+  const bell = Math.sin(Math.PI * p);
+  return 0.3 + Math.pow(bell, 1 / curv) * 0.7;
+}
+// Impulse — শুরুতেই peak, তারপর দ্রুত decay (front-loaded burst)
+function _envImpulse(p) {
+  // দ্রুত rise (প্রথম 15%), তারপর exponential decay
+  const rise = Math.min(1, p / 0.15);
+  const decay = Math.exp(-3 * Math.max(0, p - 0.15));
+  return 0.25 + rise * decay * 0.85;
+}
+// Elastic — যায়, overshoot করে, bounce back (damped oscillation)
+function _envElastic(p) {
+  // মূল push + একটা damped sine oscillation (bounce feel)
+  const base = Math.sin(Math.PI * p);
+  const bounce = Math.sin(Math.PI * p * 3) * Math.exp(-2 * p) * 0.4;
+  return 0.3 + (base * 0.7 + bounce) * 0.7;
+}
+
+// Family অনুযায়ী envelope route করে
+function _familyEnvelope(family, p, curv) {
+  switch (family) {
+    case 'impulse': return _envImpulse(p);
+    case 'elastic': return _envElastic(p);
+    case 'momentum':
+    default:        return _envMomentum(p, curv);
+  }
+}
+
+// Wave envelope — legacy (medium wave এ ব্যবহৃত)
 function _waveEnvelope(progress, curvature) {
-  // [GPT] wave শেষে envelope পুরো শূন্য হয় না — একটা residual (0.3) থাকে,
-  // যাতে velocity পরের wave এ carry হয়। এই continuity-ই smooth animation।
   const p = Math.min(1, Math.max(0, progress));
   const bell = Math.sin(Math.PI * p);
   const shaped = Math.pow(bell, 1 / curvature);
-  return 0.3 + shaped * 0.7; // 0.3–1.0, কখনো শূন্য না
+  return 0.3 + shaped * 0.7;
 }
 
 
@@ -191,7 +261,8 @@ function generateTickV6(state, ctrl, stats) {
   // [GPT] skew দিয়ে envelope এর peak সরাই — কোনো wave শুরুতে fast
   // (skew<1), কোনো শেষে fast (skew>1)। প্রতি wave আলাদা acceleration timing।
   const skewedProg = Math.pow(progress, state._physSkew || 1.0);
-  const envelope = _waveEnvelope(skewedProg, state._waveCurvature);
+  // [GPT WAVE FAMILY] macro envelope family অনুযায়ী — আলাদা shape।
+  const envelope = _familyEnvelope(state._waveFamily || 'momentum', skewedProg, state._waveCurvature);
 
   // Manual override on direction
   let waveDir = state._waveDir;
@@ -322,6 +393,9 @@ function initStateV6(price) {
     _physMaxVel:    1.8,
     _physBlend:     10,
     _physSkew:      1.0,
+    _waveFamily:    'momentum',
+    _famStreak:     0,
+    _famStreakOf:   'momentum',
     _waveDuration:  0,
     _waveElapsed:   0,
     _waveCurvature: 1.0,
