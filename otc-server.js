@@ -10,9 +10,10 @@ const Redis  = require('ioredis');
 const crypto = require('crypto');
 const { generateTick, initCandleState } = require('./candle-engine');
 const { generateTickV3, initStateV3 } = require('./candle-engine-v3');
+const { generateTickV4, initStateV4 } = require('./candle-engine-v4');
 
-// Engine toggle — Railway Variables এ CANDLE_ENGINE=v2 দিলে পুরনোতে ফিরবে
-const CANDLE_ENGINE = process.env.CANDLE_ENGINE || 'v3';
+// Engine toggle — Railway Variables এ CANDLE_ENGINE=v3/v2 দিলে সেটায় ফিরবে
+const CANDLE_ENGINE = process.env.CANDLE_ENGINE || 'v4';
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
@@ -690,7 +691,9 @@ async function initOTC(market) {
     trend:0, trendSteps:0,
     momentum: 0,
     subStates,
-    ...(CANDLE_ENGINE === 'v3' ? initStateV3(price) : initCandleState(price)),
+    ...(CANDLE_ENGINE === 'v4' ? initStateV4(price)
+      : CANDLE_ENGINE === 'v3' ? initStateV3(price)
+      : initCandleState(price)),
   };
   _activeMarkets.add(id);
 
@@ -763,8 +766,9 @@ function tickOTC(id) {
 
   // ── Candle Engine — price update ─────────────────────────────────────────
   const _priceBefore = state.price;
-  if (CANDLE_ENGINE === 'v3') generateTickV3(state, ctrl, stats);
-  else                        generateTick(state, ctrl, stats);
+  if (CANDLE_ENGINE === 'v4')      generateTickV4(state, ctrl, stats);
+  else if (CANDLE_ENGINE === 'v3') generateTickV3(state, ctrl, stats);
+  else                             generateTick(state, ctrl, stats);
 
   // DEBUG — বড় jump ধরো (এক tick এ ১% এর বেশি)
   if (Math.abs(state.price - _priceBefore) > _priceBefore * 0.01) {
