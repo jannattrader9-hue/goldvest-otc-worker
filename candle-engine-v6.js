@@ -110,16 +110,19 @@ function _newWave(state) {
 
   const curvature = 0.5 + Math.random() * 1.2; // 0.5–1.7 বেশি variation
 
-  // [GPT] প্রতি wave এর নিজস্ব PHYSICS PROFILE — motion signature আর
-  // একই থাকে না। কোনো wave ভারী (heavy inertia), কোনোটা responsive,
-  // কোনো pullback দ্রুত, কোনো reversal ধীরে। এটাই "একই animation"
-  // সমস্যা ভাঙে — user আর predict করতে পারে না চার্ট কীভাবে নড়বে।
-  state._physAccel   = 0.08 + Math.random() * 0.16;  // 0.08–0.24 (responsive vs heavy)
-  state._physDamping = 0.82 + Math.random() * 0.14;  // 0.82–0.96 (friction variation)
-  state._physMaxVel  = 1.3  + Math.random() * 1.2;   // 1.3–2.5 (velocity ceiling)
-  state._physBlend   = 6    + (Math.random() * 12|0);// 6–18 tick blend
-  // envelope skew — কোনো wave শুরুতে fast, কোনো শেষে fast
-  state._physSkew    = 0.5  + Math.random() * 1.0;   // 0.5–1.5
+  // [GPT WAVE FAMILY] physics family থেকে আসে — random না। family = personality।
+  // সামান্য random variation রাখি (±15%) যাতে একই family ও একঘেয়ে না হয়।
+  const fp = _FAMILY_PHYSICS[state._waveFamily] || _FAMILY_PHYSICS.momentum;
+  const jit = () => 0.85 + Math.random() * 0.30; // ±15% jitter
+  state._physAccel   = fp.accel   * jit();
+  state._physDamping = Math.min(0.97, fp.damping * jit());
+  state._physMaxVel  = fp.maxVel  * jit();
+  state._physBlend   = Math.max(4, fp.blend * jit() | 0);
+  state._physSkew    = 0.5 + Math.random() * 1.0;
+  // family-specific medium ও noise behavior
+  state._famMedStrength = fp.medStrength;
+  state._famMedPullback = fp.medPullback;
+  state._famNoiseScale  = fp.noiseScale;
 
   // [GPT FIX] _newWave শুধু wave তৈরি করে — velocity এখানে modify করি না।
   // carry-over এর intent সংরক্ষণ করি, প্রয়োগ হয় generateTickV6 এ।
@@ -140,6 +143,27 @@ function _newWave(state) {
   state._waveElapsed   = 0;
   state._waveCurvature = curvature;
 }
+
+// ── FAMILY PHYSICS PROFILES — GPT: family = সম্পূর্ণ motion personality ──
+// প্রতি family শুধু envelope না — acceleration, damping, medium behavior,
+// pullback সব আলাদা। এক wave personality পুরো system জুড়ে (macro+medium)।
+const _FAMILY_PHYSICS = {
+  momentum: {
+    accel: 0.10, damping: 0.90, maxVel: 1.8, blend: 12,
+    medStrength: 0.9, medPullback: 0.35, noiseScale: 0.22,
+    // ধীরে গড়ে ওঠা, দীর্ঘ glide
+  },
+  impulse: {
+    accel: 0.22, damping: 0.82, maxVel: 2.4, blend: 6,
+    medStrength: 0.6, medPullback: 0.20, noiseScale: 0.30,
+    // দ্রুত burst, কম pullback, বেশি noise (sharp)
+  },
+  elastic: {
+    accel: 0.16, damping: 0.94, maxVel: 2.0, blend: 9,
+    medStrength: 1.2, medPullback: 0.55, noiseScale: 0.18,
+    // বেশি medium swing, বেশি pullback (bounce feel), কম noise
+  },
+};
 
 // ── WAVE FAMILY ENVELOPES — প্রতি family এর নিজস্ব motion topology ────────
 // GPT: amplitude না, rhythm/shape ই robotic feel এর কারণ। প্রতি family
@@ -275,20 +299,25 @@ function generateTickV6(state, ctrl, stats) {
   // Medium wave macro এর ভেতরে ছোট swing দেয় — মাঝে মাঝে বিপরীতে যায়,
   // trend ভাঙে না কিন্তু short-term unpredictable করে।
   if (state._medTick === undefined || state._medTick <= 0) {
-    state._medTick = 5 + (Math.random() * 12 | 0); // 5–17 tick medium wave
-    // medium direction: বেশিরভাগ macro এর সাথে, ~35% বিপরীত (pullback)
-    const medAgainst = Math.random() < 0.35;
+    state._medTick = 5 + (Math.random() * 12 | 0);
+    // [GPT] medium pullback probability family থেকে — Elastic এ বেশি
+    // pullback (bounce), Impulse এ কম। এক personality পুরো system জুড়ে।
+    const medAgainst = Math.random() < (state._famMedPullback || 0.35);
     state._medDir = medAgainst ? -state._waveDir : state._waveDir;
+    // medium strength ও family থেকে
+    const fms = state._famMedStrength || 0.9;
     state._medStrength = medAgainst
-      ? (0.3 + Math.random() * 0.4)   // pullback দুর্বল
-      : (0.5 + Math.random() * 0.5);  // continuation
+      ? (0.3 + Math.random() * 0.4) * fms
+      : (0.5 + Math.random() * 0.5) * fms;
     state._medElapsed = 0;
     state._medDuration = state._medTick;
   }
   state._medTick--;
   state._medElapsed = (state._medElapsed || 0) + 1;
   const medProg = state._medElapsed / (state._medDuration || 1);
-  const medEnv = _waveEnvelope(medProg, 1.0);
+  // [GPT] medium envelope ও family অনুযায়ী — আর bell এ আটকে নেই।
+  // এটাই ছিল সবচেয়ে বড় ফাঁক (medium 58% dominant, কিন্তু সবসময় bell)।
+  const medEnv = _familyEnvelope(state._waveFamily || 'momentum', medProg, 1.0);
   const medComponent = (state._medDir || state._waveDir) * state._medStrength * medEnv;
 
   // ── MICRO MODULATION — direction flip না, velocity slow/accelerate ───
@@ -363,7 +392,7 @@ function generateTickV6(state, ctrl, stats) {
   // ও noise সরাসরি price এ যোগ হয় (velocity bypass) — short-term up-down
   // বাঁচে, user পরের tick predict করতে পারে না, কিন্তু trend থাকে।
   const medMove   = medComponent * vBase * 0.9;
-  const noiseTick = _perlin1D(state._noiseSeed, state._noiseX) * vBase * 0.22;
+  const noiseTick = _perlin1D(state._noiseSeed, state._noiseX) * vBase * (state._famNoiseScale || 0.22);
   let delta = (state._velocity * 0.75 + medMove + noiseTick) * speed;
   const maxStep = state.price * 0.0015;
   delta = Math.max(-maxStep, Math.min(maxStep, delta));
@@ -396,6 +425,9 @@ function initStateV6(price) {
     _waveFamily:    'momentum',
     _famStreak:     0,
     _famStreakOf:   'momentum',
+    _famMedStrength: 0.9,
+    _famMedPullback: 0.35,
+    _famNoiseScale:  0.22,
     _waveDuration:  0,
     _waveElapsed:   0,
     _waveCurvature: 1.0,
