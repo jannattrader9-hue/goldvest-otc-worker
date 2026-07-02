@@ -83,10 +83,12 @@ function _newWave(state) {
 // Wave envelope — ease-in-out (শুরুতে ধীরে, মাঝে দ্রুত, শেষে ধীরে)
 // এটাই "acceleration → glide → deceleration" natural feel দেয়।
 function _waveEnvelope(progress, curvature) {
-  // progress 0..1 → smooth bell-ish velocity profile
-  // sin(π·p) দেয় ০→১→০ (মাঝে peak), curvature দিয়ে shape adjust
-  const base = Math.sin(Math.PI * Math.min(1, Math.max(0, progress)));
-  return Math.pow(base, 1 / curvature);
+  // [GPT] wave শেষে envelope পুরো শূন্য হয় না — একটা residual (0.3) থাকে,
+  // যাতে velocity পরের wave এ carry হয়। এই continuity-ই smooth animation।
+  const p = Math.min(1, Math.max(0, progress));
+  const bell = Math.sin(Math.PI * p);
+  const shaped = Math.pow(bell, 1 / curvature);
+  return 0.3 + shaped * 0.7; // 0.3–1.0, কখনো শূন্য না
 }
 
 
@@ -158,7 +160,7 @@ function generateTickV6(state, ctrl, stats) {
   if (state._noiseSeed === undefined) state._noiseSeed = (Math.random()*1e9)|0;
   state._noiseX += 0.10;
 
-  // ── WAVE ENGINE (80%) — Main Wave + Nested Micro Wave ────────────────
+  // ── WAVE ENGINE — velocity-based (position না) ───────────────────────
   if (!state._waveDuration || state._waveElapsed >= state._waveDuration) {
     _newWave(state);
   }
@@ -172,58 +174,48 @@ function generateTickV6(state, ctrl, stats) {
     waveDir = ctrl.nextDirection === 'up' ? 1 : ctrl.nextDirection === 'down' ? -1 : state._waveDir;
   }
 
-  // ── NESTED MICRO-WAVE ────────────────────────────────────────────────
-  // Main wave overall direction ঠিক করে, কিন্তু ভেতরে ছোট micro-swing
-  // থাকে — মাঝে মাঝে ২-৫ tick বিপরীতে যায়, তারপর আবার trend continue।
-  // এতে motion সোজা লাইন না হয়ে Quotex এর মতো natural হয়:
-  //   ↗↗↗↘↗↗↗↘↗↗  (overall up কিন্তু micro correction সহ)
+  // ── MICRO MODULATION — direction flip না, velocity slow/accelerate ───
+  // GPT: micro wave direction উল্টায় না, শুধু force কমায় (slowdown)।
+  // এতে ↑↑↑↓↓↑↑ এর মতো নয়, বরং velocity 0.8→0.5→0.2→0.4→0.8 হয় —
+  // price কখনো একটু ধীরে, কখনো দ্রুত, কিন্তু direction carry থাকে।
   if (state._microTick === undefined || state._microTick <= 0) {
-    // নতুন micro-swing: বেশিরভাগ সময় main direction, মাঝে মাঝে বিপরীত
-    const againstMain = Math.random() < 0.32; // ~32% micro-swing বিপরীতে
-    state._microDir = againstMain ? -waveDir : waveDir;
-    if (againstMain) {
-      state._microTick = 2 + (Math.random() * 3 | 0);   // ছোট বিপরীত: 2–4 tick
-      state._microMag  = 0.4 + Math.random() * 0.4;      // দুর্বল
+    const slowdown = Math.random() < 0.35; // ~35% সময় slowdown phase
+    if (slowdown) {
+      state._microTick = 2 + (Math.random() * 3 | 0);
+      state._microScale = 0.15 + Math.random() * 0.35; // velocity কমায় (0.15–0.5)
     } else {
-      state._microTick = 3 + (Math.random() * 6 | 0);   // main: 3–8 tick
-      state._microMag  = 0.8 + Math.random() * 0.5;      // শক্তিশালী
+      state._microTick = 3 + (Math.random() * 6 | 0);
+      state._microScale = 0.85 + Math.random() * 0.4;  // পূর্ণ গতি (0.85–1.25)
     }
   }
   state._microTick--;
 
-  // Wave contribution — main + micro-swing মিশিয়ে।
-  // micro-swing বিপরীতে গেলে সেই tick এ সত্যিই বিপরীত move হয় (net negative)
-  // — তাই ↗↗↗↘↗↗↘ এর মতো natural motion আসে।
-  const mainComponent  = waveDir * state._waveStrength * envelope;
-  const microComponent = (state._microDir || waveDir) * (state._microMag || 1);
-  // micro against main হলে সেটা main কে ছাপিয়ে যেতে পারে (net reverse tick)
-  const waveMove = (mainComponent * 0.45 + microComponent * 0.75) * vBase;
-
-  // ── Micro noise (10%) ────────────────────────────────────────────────
-  const noiseMove = _perlin1D(state._noiseSeed, state._noiseX) * vBase * 0.55;
-
-  // ── Liquidity reaction (5%) ──────────────────────────────────────────
+  // ── TARGET FORCES — wave velocity কে push করে ────────────────────────
+  const waveForce = waveDir * state._waveStrength * envelope * (state._microScale || 1);
   _updateLiquidity(state);
-  const liqMove = _liquidityReaction(state, vBase);
+  const liqForce = _liquidityReaction(state, 1) / (vBase + 1e-9); // normalize to force
 
-  // ── Trade bias (5%) — শুধু close এর আগে ─────────────────────────────
-  let tradeMove = 0;
+  let tradeForce = 0;
   if (ctrl.mode === 'trade-based') {
     const tb = _tradeBias(stats);
     const dur = state._candleDurMs || 60000;
     const tLeft = state.nextCandle ? (state.nextCandle - now) : dur;
-    if (tb !== 0 && tLeft <= 8000 && tLeft > 0) {
-      tradeMove = tb * vBase * 0.25;
-    }
+    if (tb !== 0 && tLeft <= 8000 && tLeft > 0) tradeForce = tb * 0.25;
   }
 
-  // ── Combine — wave dominant, বাকিরা ছোট ──────────────────────────────
-  let delta = (waveMove + noiseMove + liqMove + tradeMove) * speed;
+  // ── VELOCITY PIPELINE — inertia + carry-over ─────────────────────────
+  // wave force velocity কে push করে (smooth inertia)।
+  if (state._velocity === undefined) state._velocity = 0;
+  const waveTarget = (waveForce + liqForce + tradeForce) * vBase;
+  state._velocity += (waveTarget - state._velocity) * 0.12;
+  const maxVel = vBase * 1.8;
+  state._velocity = Math.max(-maxVel, Math.min(maxVel, state._velocity));
 
-  // Hard safety clamp — এক tick এ max ±0.15%
+  // ── price = velocity (momentum) + direct noise (tick texture) ────────
+  const noiseTick = _perlin1D(state._noiseSeed, state._noiseX) * vBase * 0.45;
+  let delta = (state._velocity + noiseTick) * speed;
   const maxStep = state.price * 0.0015;
   delta = Math.max(-maxStep, Math.min(maxStep, delta));
-
   state.price = Math.max(state.price + delta, 0.0001);
 }
 
