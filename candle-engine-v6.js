@@ -320,21 +320,25 @@ function generateTickV6(state, ctrl, stats) {
   const medEnv = _familyEnvelope(state._waveFamily || 'momentum', medProg, 1.0);
   const medComponent = (state._medDir || state._waveDir) * state._medStrength * medEnv;
 
-  // ── MICRO MODULATION — direction flip না, velocity slow/accelerate ───
+  // ── MICRO MODULATION — family-specific (GPT: micro ও family follow করবে) ─
   if (state._microTick === undefined || state._microTick <= 0) {
     const roll = Math.random();
-    // [GPT FIX] reverse কম ঘন ঘন (~8%) এবং amplitude ছোট (gentle pullback)
-    if (roll < 0.08) {
-      state._microTick = 2 + (Math.random() * 2 | 0);
-      state._microScale = -0.1 - Math.random() * 0.15; // -0.1 থেকে -0.25 (ছোট)
-    } else if (roll < 0.42) {
-      // slowdown
-      state._microTick = 2 + (Math.random() * 4 | 0);
-      state._microScale = 0.15 + Math.random() * 0.4;
+    const fam = state._waveFamily || 'momentum';
+    if (fam === 'impulse') {
+      // Impulse — ছোট sharp burst, দ্রুত পরিবর্তন
+      if (roll < 0.10) { state._microTick = 1 + (Math.random()*2|0); state._microScale = -0.15 - Math.random()*0.2; }
+      else if (roll < 0.35) { state._microTick = 1 + (Math.random()*2|0); state._microScale = 1.2 + Math.random()*0.6; } // burst
+      else { state._microTick = 2 + (Math.random()*3|0); state._microScale = 0.7 + Math.random()*0.5; }
+    } else if (fam === 'elastic') {
+      // Elastic — বেশি reverse (bounce), oscillating micro
+      if (roll < 0.20) { state._microTick = 2 + (Math.random()*3|0); state._microScale = -0.2 - Math.random()*0.3; } // strong reverse
+      else if (roll < 0.45) { state._microTick = 2 + (Math.random()*3|0); state._microScale = 0.1 + Math.random()*0.3; }
+      else { state._microTick = 3 + (Math.random()*5|0); state._microScale = 0.7 + Math.random()*0.5; }
     } else {
-      // full speed
-      state._microTick = 2 + (Math.random() * 7 | 0);
-      state._microScale = 0.8 + Math.random() * 0.5;
+      // Momentum — smooth, কম reverse, দীর্ঘ consistent
+      if (roll < 0.05) { state._microTick = 2 + (Math.random()*2|0); state._microScale = -0.08 - Math.random()*0.1; }
+      else if (roll < 0.35) { state._microTick = 3 + (Math.random()*4|0); state._microScale = 0.3 + Math.random()*0.4; }
+      else { state._microTick = 4 + (Math.random()*7|0); state._microScale = 0.85 + Math.random()*0.4; }
     }
   }
   state._microTick--;
@@ -393,7 +397,14 @@ function generateTickV6(state, ctrl, stats) {
   // বাঁচে, user পরের tick predict করতে পারে না, কিন্তু trend থাকে।
   const medMove   = medComponent * vBase * 0.9;
   const noiseTick = _perlin1D(state._noiseSeed, state._noiseX) * vBase * (state._famNoiseScale || 0.22);
-  let delta = (state._velocity * 0.75 + medMove + noiseTick) * speed;
+
+  // [GPT] integrator (velocity smoothing) family shape blur করে। তাই
+  // family macro envelope এর একটা অংশ সরাসরি price এ যোগ করি (velocity
+  // bypass) — এতে impulse এর sharp burst, elastic এর bounce integrator
+  // এ হারায় না, চোখে family পার্থক্য টিকে থাকে।
+  const famSignature = macroComponent * vBase * 0.35;
+
+  let delta = (state._velocity * 0.6 + famSignature + medMove + noiseTick) * speed;
   const maxStep = state.price * 0.0015;
   delta = Math.max(-maxStep, Math.min(maxStep, delta));
   state.price = Math.max(state.price + delta, 0.0001);
