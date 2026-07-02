@@ -264,7 +264,14 @@ function generateTickV5(state, ctrl, stats) {
     state._candleConviction = 0.3 + Math.random() * 0.5;
   }
   // candle bias force — পুরো candle জুড়ে consistent push
-  const candleBiasForce = (state._candlePersonality || 0) * v * (state._candleConviction || 0.4) * 0.3;
+  // [GPT পরামর্শ] candle এর শেষ ২০% এ personality দুর্বল হয় — close এর
+  // আগে natural pullback এর সুযোগ দেয়।
+  let personalityScale = 1.0;
+  const tLeft = state.nextCandle ? (state.nextCandle - now) : 60000;
+  const candleProgress = 1 - (tLeft / 60000); // 0 (শুরু) → 1 (শেষ)
+  if (candleProgress > 0.9)      personalityScale = 0.5;
+  else if (candleProgress > 0.7) personalityScale = 0.8;
+  const candleBiasForce = (state._candlePersonality || 0) * v * (state._candleConviction || 0.4) * 0.3 * personalityScale;
   // ── [v4.1] SMART TICK CLUSTERING ────────────────────────────────────
   // Cluster direction pure random না — regime bias + velocity + আগের
   // cluster মিলিয়ে ঠিক হয়। Duration ও volatility অনুযায়ী variable।
