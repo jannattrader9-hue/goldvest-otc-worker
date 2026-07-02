@@ -71,25 +71,18 @@ function _newWave(state) {
 
   const curvature = 0.5 + Math.random() * 1.2; // 0.5–1.7 বেশি variation
 
-  // [GPT FIX] Wave energy carry-over — পুরনো wave এর momentum নতুন wave এ
-  // সত্যিই inherit হয়। same direction হলে বেশি energy বজায় থাকে, opposite
-  // হলে velocity ধীরে ঘোরে (হঠাৎ না)। এটা velocity তে সরাসরি প্রয়োগ হয়।
-  const prevMomentum = state._velocity || 0;
-  if (dir === prevDir) {
-    // same direction — momentum প্রায় পুরোটা রাখি (smooth continuation)
-    state._velocity = prevMomentum * 0.85;
-  } else {
-    // reverse — momentum ধীরে কমে, হঠাৎ উল্টো না (rubber-band এড়াতে)
-    state._velocity = prevMomentum * 0.5;
-  }
+  // [GPT FIX] _newWave শুধু wave তৈরি করে — velocity এখানে modify করি না।
+  // carry-over এর intent সংরক্ষণ করি, প্রয়োগ হয় generateTickV6 এ।
+  state._carryOverSameDir = (dir === prevDir);
 
-  // [GPT FIX] Wave blending — পুরনো wave এর নিজের progress/envelope সংরক্ষণ
+  // Wave blending — পুরনো wave এর নিজের progress/envelope সংরক্ষণ
   state._prevWaveDir       = state._waveDir || dir;
   state._prevWaveStrength  = state._waveStrength || strength;
   state._prevWaveCurvature = state._waveCurvature || 1.0;
   state._prevWaveProgress  = state._waveDuration
                              ? (state._waveElapsed / state._waveDuration) : 1;
   state._blendTicks        = 10;
+  state._justStartedWave   = true; // generateTick এ carry-over প্রয়োগের signal
 
   state._waveDir       = dir;
   state._waveStrength  = strength;
@@ -240,15 +233,21 @@ function generateTickV6(state, ctrl, stats) {
     if (tb !== 0 && tLeft <= 8000 && tLeft > 0) tradeForce = tb * 0.25;
   }
 
-  // ── ACCELERATION → VELOCITY → PRICE (GPT: proper physics pipeline) ───
-  // Wave → target velocity → acceleration → velocity → price।
-  // এই extra acceleration layer motion কে জীবন্ত করে (jump না)।
+  // ── ACCELERATION → VELOCITY → PRICE (proper physics pipeline) ────────
   if (state._velocity === undefined)     state._velocity = 0;
   if (state._acceleration === undefined) state._acceleration = 0;
+
+  // [GPT FIX] carry-over এখানে প্রয়োগ (physics generateTick এ, _newWave এ না)।
+  if (state._justStartedWave) {
+    state._justStartedWave = false;
+    state._velocity = (state._velocity || 0) * (state._carryOverSameDir ? 0.85 : 0.5);
+  }
 
   const targetVel = (waveForce + liqForce + tradeForce) * vBase;
   const accel = (targetVel - state._velocity) * 0.16;
   state._acceleration += (accel - state._acceleration) * 0.5;
+  // [GPT FIX] acceleration damping — long-term oscillation রোধ করে।
+  state._acceleration *= 0.9;
   state._velocity += state._acceleration;
 
   const maxVel = vBase * 1.8;
@@ -274,6 +273,8 @@ function initStateV6(price) {
     _prevWaveStrength: 0,
     _prevWaveCurvature: 1.0,
     _prevWaveProgress: 1,
+    _carryOverSameDir: false,
+    _justStartedWave:  false,
     _waveDuration:  0,
     _waveElapsed:   0,
     _waveCurvature: 1.0,
