@@ -386,11 +386,36 @@ function generateTickV6(state, ctrl, stats) {
   }
 
   const targetVel = (waveForce + liqForce + tradeForce) * vBase;
-  // [GPT] এই wave এর নিজস্ব physics — সব wave এ একই না।
+
+  // [GPT: physics না, animation] integrator অতিরিক্ত smooth ছিল — এটাই
+  // ৮০% সমস্যা। double-smoothing সরালাম, acceleration সরাসরি প্রয়োগ।
   const accel = (targetVel - state._velocity) * (state._physAccel || 0.16);
-  state._acceleration += (accel - state._acceleration) * 0.5;
+  state._acceleration = accel; // আর smooth করি না (responsive)
   state._acceleration *= (state._physDamping || 0.9);
   state._velocity += state._acceleration;
+
+  // ── [GPT: LIFE] imperfections — jerk / dead-tick / burst ────────────
+  // v4 জীবন্ত লাগত কারণ imperfection ছিল। এগুলো ফেরাই।
+  if (state._impTick === undefined || state._impTick <= 0) {
+    const roll = Math.random();
+    if (roll < 0.06) {
+      // dead tick — হঠাৎ প্রায় freeze (২-৩ tick)
+      state._impMode = 'dead'; state._impTick = 2 + (Math.random()*2|0);
+    } else if (roll < 0.12) {
+      // burst — হঠাৎ jump (১-২ tick)
+      state._impMode = 'burst'; state._impTick = 1 + (Math.random()*2|0);
+    } else if (roll < 0.20) {
+      // jerk — uneven acceleration (২-৪ tick)
+      state._impMode = 'jerk'; state._impTick = 2 + (Math.random()*3|0);
+    } else {
+      state._impMode = 'normal'; state._impTick = 3 + (Math.random()*8|0);
+    }
+  }
+  state._impTick--;
+  let impMul = 1.0;
+  if (state._impMode === 'dead')  impMul = 0.15 + Math.random()*0.15;       // প্রায় থেমে
+  else if (state._impMode === 'burst') impMul = 1.4 + Math.random()*0.5;    // হঠাৎ jump
+  else if (state._impMode === 'jerk')  impMul = 0.5 + Math.random()*0.9;    // uneven
 
   const maxVel = vBase * (state._physMaxVel || 1.8);
   state._velocity = Math.max(-maxVel, Math.min(maxVel, state._velocity));
@@ -407,7 +432,8 @@ function generateTickV6(state, ctrl, stats) {
   // overshoot এড়াতে family-tuned।
   const famSignature = macroComponent * vBase * (state._famSigStrength || 0.25);
 
-  let delta = (state._velocity * 0.6 + famSignature + medMove + noiseTick) * speed;
+  // impMul (dead/burst/jerk) delta তে প্রয়োগ — এটাই "জীবন্ত" feel দেয়।
+  let delta = (state._velocity * 0.6 + famSignature + medMove + noiseTick) * impMul * speed;
   const maxStep = state.price * 0.0015;
   delta = Math.max(-maxStep, Math.min(maxStep, delta));
   state.price = Math.max(state.price + delta, 0.0001);
@@ -443,6 +469,8 @@ function initStateV6(price) {
     _famMedPullback: 0.35,
     _famNoiseScale:  0.22,
     _famSigStrength: 0.25,
+    _impTick:       0,
+    _impMode:       "normal",
     _waveDuration:  0,
     _waveElapsed:   0,
     _waveCurvature: 1.0,
