@@ -8,6 +8,7 @@ const admin = require('firebase-admin');
 const pLimit = require('p-limit');
 const Redis  = require('ioredis');
 const crypto = require('crypto');
+const { generateTick, initCandleState } = require('./candle-engine');
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
@@ -684,21 +685,8 @@ async function initOTC(market) {
     candleTime:start/1000, nextCandle:start+CANDLE_MS,
     trend:0, trendSteps:0,
     momentum: 0,
-    // Market State Machine
-    marketState: 'ranging',
-    marketStateTick: 20 + Math.floor(Math.random() * 40),
-    // Velocity model
-    velocity: 0,
-    acceleration: 0,
-    // Noise seed
-    _noiseSeed: Math.random() * 1000,
-    // Support/Resistance
-    srHigh: price * 1.003,
-    srLow:  price * 0.997,
-    srTick: 0,
-    // Micro pullback
-    _microTick: 0,
     subStates,
+    ...initCandleState(price),
   };
   _activeMarkets.add(id);
 
@@ -765,97 +753,12 @@ function _stateBias(s) {
 function tickOTC(id) {
   const state = _states[id];
   if (!state || state.type !== 'otc') return;
-  const ctrl = _controls[id] || {};
-  const volMul = { low:0.4, medium:1.0, high:2.2 }[ctrl.volatility] || 1.0;
-  const speed = ctrl.speedMultiplier || 1.0;
-  const now = Date.now();
+  const ctrl  = _controls[id] || {};
+  const stats = _tradeStats[id] || {};
+  const now   = Date.now();
 
-  if (!ctrl.mode || ctrl.mode === 'auto') {
-    if (state.trendSteps <= 0) { state.trend = randomTrend(); state.trendSteps = Math.round((8+Math.floor(Math.random()*12))/speed); }
-    state.trendSteps--;
-  } else if (ctrl.mode === 'manual') {
-    state.trend = ctrl.nextDirection === 'up' ? 1 : ctrl.nextDirection === 'down' ? -1 : 0;
-    state.trendSteps = 99;
-  } else if (ctrl.mode === 'trade-based') {
-    const stats = _tradeStats[id] || {};
-    const up    = parseFloat(stats.upAmount)   || 0;
-    const down  = parseFloat(stats.downAmount) || 0;
-    if (up > down * 1.1)        state.trend = -1;
-    else if (down > up * 1.1)   state.trend = 1;
-    else                        state.trend = 0;
-    state.trendSteps = 99;
-  }
-
-  const v = state.price * 0.0008 * volMul;
-  const trendComponent = state.trend * v * (ctrl.trendStrength || 0.6) * 0.35;
-
-  const candleMode = ctrl.candleMode || 'normal';
-  let rawRandom, momentumDecay, randomScale;
-
-  if (candleMode === 'choppy') {
-    rawRandom     = (Math.random() - 0.5) * v * 5.0;
-    momentumDecay = 0.2;
-    randomScale   = 0.8;
-  } else if (candleMode === 'spike') {
-    const isSpiking = Math.random() < 0.08;
-    rawRandom     = isSpiking
-      ? (Math.random() < 0.5 ? 1 : -1) * v * 12.0
-      : (Math.random() - 0.5) * v * 2.0;
-    momentumDecay = 0.85;
-    randomScale   = 0.15;
-  } else if (candleMode === 'slow') {
-    rawRandom     = (Math.random() - 0.5) * v * 1.2;
-    momentumDecay = 0.95;
-    randomScale   = 0.05;
-  } else {
-    const rand = Math.random();
-    if (rand < 0.58) {
-      rawRandom = 0;
-    } else if (rand < 0.79) {
-      rawRandom = v * (0.3 + Math.random() * 1.0);
-    } else if (rand < 0.97) {
-      rawRandom = -v * (0.3 + Math.random() * 1.0);
-    } else {
-      rawRandom = (Math.random() < 0.5 ? 1 : -1) * v * (2.5 + Math.random() * 1.5);
-    }
-    momentumDecay = 0.1;
-    randomScale   = 0.9;
-  }
-
-  if (!state.momentum) state.momentum = 0;
-  const timeToNextCandle = state.nextCandle ? (state.nextCandle - now) : 99999;
-  if (timeToNextCandle <= 15000) {
-    state.momentum = 0;
-  } else {
-    state.momentum = state.momentum * momentumDecay + rawRandom * randomScale;
-  }
-  const randomComponent = state.momentum !== 0 ? state.momentum : rawRandom * randomScale;
-
-  let exposureBiasTotal = 0;
-  if (_exposureConfig.enabled) {
-    if (!state._exposureTick) state._exposureTick = 0;
-    state._exposureTick++;
-    if (state._exposureTick % 10 === 0) {
-      (async () => {
-        await _loadExposureConfig();
-        for (const [key, t] of _activeTradesMemory) {
-          if (t.symbol !== id || t.status !== 'live') continue;
-          try {
-            const balR = await redisPub.get(`gv:bal:${t.userId}`);
-            const bal  = parseFloat(balR || '0');
-            const bias = await _getExposureBias(t.userId, bal);
-            if (bias !== 0) {
-              state._pendingExposureBias = (state._pendingExposureBias || 0) + bias;
-            }
-          } catch(e) {}
-        }
-      })();
-    }
-    exposureBiasTotal = (state._pendingExposureBias || 0) * v * 0.25;
-    state._pendingExposureBias = 0;
-  }
-
-  state.price = Math.max(state.price + (trendComponent + randomComponent + exposureBiasTotal) * speed, 0.0001);
+  // ── Candle Engine — price update ─────────────────────────────────────────
+  generateTick(state, ctrl, stats);
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
 
