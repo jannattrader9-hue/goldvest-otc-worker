@@ -308,8 +308,11 @@ function generateTickV3(state, ctrl, stats) {
   const maxVel = v * 2.2;
   state._velocity = Math.max(-maxVel, Math.min(maxVel, state._velocity));
 
-  // price update
-  state.price = Math.max(state.price + state._velocity * speed, 0.0001);
+  // ── HARD SAFETY CLAMP — এক tick এ price max ±0.5% এর বেশি নড়বে না ──────
+  const proposedPrice = state.price + state._velocity * speed;
+  const maxStep = state.price * 0.005; // 0.5% max per tick
+  const clampedDelta = Math.max(-maxStep, Math.min(maxStep, proposedPrice - state.price));
+  state.price = Math.max(state.price + clampedDelta, 0.0001);
 }
 
 
