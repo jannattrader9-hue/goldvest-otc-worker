@@ -48,29 +48,26 @@ function _newWave(state) {
   let dir, strength, duration;
 
   if (prevDir === 0) {
-    // প্রথম wave — random
     dir = Math.random() < 0.5 ? 1 : -1;
   } else if (prevWasStrong) {
-    // আগের wave strong ছিল → বেশিরভাগ সময় trend continue (same dir),
-    // মাঝে মাঝে pullback (opposite, দুর্বল)
-    if (r < 0.55)      dir = prevDir;      // continuation
-    else if (r < 0.85) dir = -prevDir;     // pullback
-    else               dir = prevDir;      // strong continuation
+    // আগের wave strong → এবার বেশি সম্ভাবনা pullback/reverse (একদিকে
+    // যেতেই থাকা বন্ধ করতে)
+    if (r < 0.35)      dir = prevDir;      // continuation কম
+    else if (r < 0.75) dir = -prevDir;     // pullback বেশি
+    else               dir = -prevDir;     // reverse
   } else {
-    // আগের wave দুর্বল ছিল → এবার নতুন দিক নিতে পারে
-    if (r < 0.45)      dir = prevDir;
-    else if (r < 0.80) dir = -prevDir;
+    if (r < 0.35)      dir = prevDir;
+    else if (r < 0.75) dir = -prevDir;
     else               dir = Math.random() < 0.5 ? 1 : -1;
   }
 
-  // Strength: pullback হলে দুর্বল, continuation হলে variable
   const isPullback = (dir === -prevDir && prevWasStrong);
   if (isPullback) {
-    strength = 0.25 + Math.random() * 0.30;   // 0.25–0.55 দুর্বল
-    duration = 12 + (Math.random() * 20 | 0);  // ছোট: 12–32 tick
+    strength = 0.3 + Math.random() * 0.35;
+    duration = 8 + (Math.random() * 12 | 0);   // ছোট: 8–20 tick
   } else {
-    strength = 0.45 + Math.random() * 0.55;   // 0.45–1.0
-    duration = 30 + (Math.random() * 55 | 0);  // লম্বা: 30–85 tick
+    strength = 0.4 + Math.random() * 0.45;
+    duration = 15 + (Math.random() * 25 | 0);  // মাঝারি: 15–40 tick (আগে 30–85)
   }
 
   // Curvature — wave কত sharp/smooth ease করবে
@@ -179,7 +176,7 @@ function generateTickV6(state, ctrl, stats) {
   const waveMove = waveDir * state._waveStrength * envelope * vBase;
 
   // ── Micro noise (10%) ────────────────────────────────────────────────
-  const noiseMove = _perlin1D(state._noiseSeed, state._noiseX) * vBase * 0.35;
+  const noiseMove = _perlin1D(state._noiseSeed, state._noiseX) * vBase * 0.55;
 
   // ── Liquidity reaction (5%) ──────────────────────────────────────────
   _updateLiquidity(state);
