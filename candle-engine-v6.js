@@ -98,15 +98,12 @@ function _newWave(state) {
     if (Math.random() < 0.12) dir = Math.random() < 0.5 ? 1 : -1;
   }
 
-  // strength সম্পূর্ণ random — দুর্বল/মাঝারি/শক্তিশালী সব হতে পারে
-  strength = 0.25 + Math.random() * 0.75; // 0.25–1.0
-
-  // duration অনেক বড় random range — timing unpredictable
-  // কখনো ছোট (৮), কখনো বড় (৭০) — কোনো নির্দিষ্ট pattern নেই
-  const durRoll = Math.random();
-  if (durRoll < 0.25)      duration =  8 + (Math.random() * 12 | 0); // 8–20 ছোট
-  else if (durRoll < 0.70) duration = 20 + (Math.random() * 30 | 0); // 20–50 মাঝারি
-  else                     duration = 40 + (Math.random() * 35 | 0); // 40–75 বড়
+  // [GPT] strength ও duration family থেকে — নাটকীয়ভাবে আলাদা যাতে চোখে
+  // পড়ে। Impulse ছোট+শক্তিশালী (burst), Momentum লম্বা+মাঝারি (glide),
+  // Elastic মাঝারি (bounce)।
+  const fpw = _FAMILY_PHYSICS[state._waveFamily] || _FAMILY_PHYSICS.momentum;
+  strength = fpw.strMin + Math.random() * (fpw.strMax - fpw.strMin);
+  duration = fpw.durMin + (Math.random() * (fpw.durMax - fpw.durMin) | 0);
 
   const curvature = 0.5 + Math.random() * 1.2; // 0.5–1.7 বেশি variation
 
@@ -123,6 +120,7 @@ function _newWave(state) {
   state._famMedStrength = fp.medStrength;
   state._famMedPullback = fp.medPullback;
   state._famNoiseScale  = fp.noiseScale;
+  state._famSigStrength = fp.sigStrength;
 
   // [GPT FIX] _newWave শুধু wave তৈরি করে — velocity এখানে modify করি না।
   // carry-over এর intent সংরক্ষণ করি, প্রয়োগ হয় generateTickV6 এ।
@@ -151,17 +149,23 @@ const _FAMILY_PHYSICS = {
   momentum: {
     accel: 0.10, damping: 0.90, maxVel: 1.8, blend: 12,
     medStrength: 0.9, medPullback: 0.35, noiseScale: 0.22,
-    // ধীরে গড়ে ওঠা, দীর্ঘ glide
+    durMin: 35, durMax: 70,      // লম্বা — ধীর দীর্ঘ trend
+    strMin: 0.45, strMax: 0.75,  // মাঝারি
+    sigStrength: 0.10,           // smooth (কম direct signature)
   },
   impulse: {
-    accel: 0.22, damping: 0.82, maxVel: 2.4, blend: 6,
-    medStrength: 0.6, medPullback: 0.20, noiseScale: 0.30,
-    // দ্রুত burst, কম pullback, বেশি noise (sharp)
+    accel: 0.26, damping: 0.80, maxVel: 2.6, blend: 5,
+    medStrength: 0.5, medPullback: 0.18, noiseScale: 0.32,
+    durMin: 8, durMax: 20,       // ছোট — দ্রুত burst
+    strMin: 0.80, strMax: 1.10,  // শক্তিশালী
+    sigStrength: 0.50,           // strong burst (বেশি direct)
   },
   elastic: {
-    accel: 0.16, damping: 0.94, maxVel: 2.0, blend: 9,
-    medStrength: 1.2, medPullback: 0.55, noiseScale: 0.18,
-    // বেশি medium swing, বেশি pullback (bounce feel), কম noise
+    accel: 0.16, damping: 0.95, maxVel: 2.0, blend: 8,
+    medStrength: 1.3, medPullback: 0.60, noiseScale: 0.16,
+    durMin: 18, durMax: 42,      // মাঝারি
+    strMin: 0.40, strMax: 0.80,
+    sigStrength: 0.28,           // bounce
   },
 };
 
@@ -398,11 +402,10 @@ function generateTickV6(state, ctrl, stats) {
   const medMove   = medComponent * vBase * 0.9;
   const noiseTick = _perlin1D(state._noiseSeed, state._noiseX) * vBase * (state._famNoiseScale || 0.22);
 
-  // [GPT] integrator (velocity smoothing) family shape blur করে। তাই
-  // family macro envelope এর একটা অংশ সরাসরি price এ যোগ করি (velocity
-  // bypass) — এতে impulse এর sharp burst, elastic এর bounce integrator
-  // এ হারায় না, চোখে family পার্থক্য টিকে থাকে।
-  const famSignature = macroComponent * vBase * 0.35;
+  // [GPT] famSignature family অনুযায়ী — impulse burst (0.50), momentum
+  // smooth (0.10), elastic bounce (0.28)। এক signal দুইবার যাওয়ার
+  // overshoot এড়াতে family-tuned।
+  const famSignature = macroComponent * vBase * (state._famSigStrength || 0.25);
 
   let delta = (state._velocity * 0.6 + famSignature + medMove + noiseTick) * speed;
   const maxStep = state.price * 0.0015;
@@ -439,6 +442,7 @@ function initStateV6(price) {
     _famMedStrength: 0.9,
     _famMedPullback: 0.35,
     _famNoiseScale:  0.22,
+    _famSigStrength: 0.25,
     _waveDuration:  0,
     _waveElapsed:   0,
     _waveCurvature: 1.0,
