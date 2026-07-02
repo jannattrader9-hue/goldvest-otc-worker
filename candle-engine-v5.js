@@ -264,11 +264,12 @@ function generateTickV5(state, ctrl, stats) {
     state._candleConviction = 0.3 + Math.random() * 0.5;
   }
   // candle bias force — পুরো candle জুড়ে consistent push
-  // [GPT পরামর্শ] candle এর শেষ ২০% এ personality দুর্বল হয় — close এর
-  // আগে natural pullback এর সুযোগ দেয়।
+  // [GPT পরামর্শ] candle এর শেষ ২০% এ personality দুর্বল হয়।
+  // candle duration hardcoded না — actual duration থেকে হিসাব।
   let personalityScale = 1.0;
-  const tLeft = state.nextCandle ? (state.nextCandle - now) : 60000;
-  const candleProgress = 1 - (tLeft / 60000); // 0 (শুরু) → 1 (শেষ)
+  if (state._candleDurMs === undefined) state._candleDurMs = 60000;
+  const tLeft = state.nextCandle ? (state.nextCandle - now) : state._candleDurMs;
+  const candleProgress = 1 - (tLeft / state._candleDurMs);
   if (candleProgress > 0.9)      personalityScale = 0.5;
   else if (candleProgress > 0.7) personalityScale = 0.8;
   const candleBiasForce = (state._candlePersonality || 0) * v * (state._candleConviction || 0.4) * 0.3 * personalityScale;
