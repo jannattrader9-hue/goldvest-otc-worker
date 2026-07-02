@@ -127,8 +127,8 @@ function generateTick(state, ctrl, stats) {
   const speed  = ctrl.speedMultiplier || 1.0;
   const now    = Date.now();
 
-  // Base volatility — price এর ০.০৫% per tick (natural feel)
-  const v = state.price * 0.0005 * volMul;
+  // Base volatility — price এর ০.০২% per tick (natural, small movement)
+  const v = state.price * 0.0002 * volMul;
 
   // ── Market State Machine ──────────────────────────────────
   if (!state._marketState) {
@@ -145,39 +145,34 @@ function generateTick(state, ctrl, stats) {
   let bias = 0;
 
   if (ctrl.mode === 'manual') {
-    bias = ctrl.nextDirection === 'up' ? 1.5
-         : ctrl.nextDirection === 'down' ? -1.5
+    bias = ctrl.nextDirection === 'up' ? 1.2
+         : ctrl.nextDirection === 'down' ? -1.2
          : 0;
   } else if (ctrl.mode === 'trade-based') {
-    // State machine এর মতো natural চলবে
-    // শুধু শেষ ৮s এ subtle push
     bias = _stateBias(state._marketState);
     state._tradeTrend = _tradeBias(stats);
   } else {
-    // auto — pure State Machine
     bias = _stateBias(state._marketState);
   }
 
-  // ── Random noise (Quotex-style distribution) ──────────────
+  // ── Random noise — no spike, smooth ──────────────────────
   const r = Math.random();
   let noise;
-  if (r < 0.55) {
-    noise = 0; // flat tick — 55%
-  } else if (r < 0.77) {
-    noise = v * (0.2 + Math.random() * 0.8); // small up — 22%
-  } else if (r < 0.97) {
-    noise = -v * (0.2 + Math.random() * 0.8); // small down — 20%
+  if (r < 0.58) {
+    noise = 0;                                    // flat — 58%
+  } else if (r < 0.79) {
+    noise = v * (0.1 + Math.random() * 0.4);      // small up — 21%
   } else {
-    noise = (Math.random() < 0.5 ? 1 : -1) * v * (1.5 + Math.random()); // spike — 3%
+    noise = -v * (0.1 + Math.random() * 0.4);     // small down — 21%
   }
+  // spike সম্পূর্ণ বাদ — wick কম হবে
 
-  // ── Momentum ──────────────────────────────────────────────
+  // ── Momentum — slow decay, smooth movement ────────────────
   if (!state._momentum) state._momentum = 0;
-  // Momentum: bias দিকে ধীরে drift, noise এ ছোট jump
-  state._momentum = state._momentum * 0.55 + (bias * v * 0.35) + (noise * 0.45);
+  state._momentum = state._momentum * 0.82 + (bias * v * 0.25) + (noise * 0.35);
 
-  // Clamp momentum
-  const maxMom = v * 2.5;
+  // Clamp momentum — বড় jump বন্ধ
+  const maxMom = v * 1.5;
   state._momentum = Math.max(-maxMom, Math.min(maxMom, state._momentum));
 
   // ── Support/Resistance + Mean Reversion ───────────────────
