@@ -314,20 +314,27 @@ function generateTickV5(state, ctrl, stats) {
   _updateLiquidity(state);
   const liqForce = _liquidityForce(state, v);
 
-  // ── FORCE 4: Mean reversion (v3 simple anchor) ──────────────────────
+  // ── FORCE 4: Mean reversion (trend এ দুর্বল, spring effect কমাতে) ────
   if (state._anchor === undefined) state._anchor = state.price;
   state._anchor = state._anchor * 0.998 + state.price * 0.002;
-  // [v5] Mean reversion কমানো — 0.05 → 0.025 (কম center-pull, বড় body)
-  const reversionForce = (state._anchor - state.price) * 0.025 * rp.rev;
+  // [GPT V5] strong trend (markup/markdown/breakout) এ center-pull খুব কম,
+  // যাতে price একদিকে glide করতে পারে — rubber-band না হয়।
+  let revMul = 0.025;
+  if (state._regime === 'markup' || state._regime === 'markdown' ||
+      state._regime === 'liquidity_grab') {
+    revMul = 0.006; // trend এ খুব দুর্বল reversion
+  } else if (state._regime === 'expansion') {
+    revMul = 0.012;
+  }
+  const reversionForce = (state._anchor - state.price) * revMul * rp.rev;
 
-  // ── FORCE 5: Micro hesitation (human behaviour) ─────────────────────
-  // প্রতি কয়েক tick এ ছোট বিপরীত পা — trend এও hesitation
-  if (!state._hesTick) state._hesTick = 0;
-  state._hesTick++;
+  // ── FORCE 5: Micro hesitation (probabilistic, fixed pattern না) ─────
+  // [GPT V5] %6 fixed pattern predictable — random probability ব্যবহার করি।
   let hesitationForce = 0;
-  const hesPhase = state._hesTick % 6;
-  if (hesPhase === 4) hesitationForce = -Math.sign(state._velocity || 0) * v * 0.15;
-  if (hesPhase === 5) hesitationForce = -(state._velocity || 0) * 0.08; // brief brake
+  if (Math.random() < 0.10) {
+    // ~১০% tick এ ছোট hesitation — কখন হবে অনিশ্চিত
+    hesitationForce = -Math.sign(state._velocity || 0) * v * 0.12;
+  }
 
   // ── FORCE 6: Trade-based close push (শেষ ৮s, subtle) ────────────────
   let closePush = 0;
@@ -338,8 +345,14 @@ function generateTickV5(state, ctrl, stats) {
     }
   }
 
+  // ── [GPT V5] MOMENTUM FORCE — velocity continuity (spring effect কমায়) ──
+  // আলাদা momentum force যা আগের velocity এর দিকে ঝোঁক ধরে রাখে।
+  // এতে force→velocity→friction এর rubber-band cycle ভাঙে — price
+  // একদিকে গেলে সেই দিকে চলতে থাকে, হঠাৎ ফেরত আসে না।
+  const momentumForce = (state._velocity || 0) * 0.35;
+
   // ── PHYSICS: net force → acceleration → velocity → price ────────────
-  const netForce = trendForce + candleBiasForce + clusterForce + noiseForce + liqForce + reversionForce + hesitationForce + closePush;
+  const netForce = trendForce + candleBiasForce + clusterForce + momentumForce + noiseForce + liqForce + reversionForce + hesitationForce + closePush;
 
   if (state._velocity === undefined)     state._velocity = 0;
   if (state._acceleration === undefined) state._acceleration = 0;
