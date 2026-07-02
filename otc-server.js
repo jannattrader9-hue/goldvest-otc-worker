@@ -12,9 +12,10 @@ const { generateTick, initCandleState } = require('./candle-engine');
 const { generateTickV3, initStateV3 } = require('./candle-engine-v3');
 const { generateTickV4, initStateV4 } = require('./candle-engine-v4');
 const { generateTickV5, initStateV5 } = require('./candle-engine-v5');
+const { generateTickV6, initStateV6 } = require('./candle-engine-v6');
 
-// Engine toggle — Railway Variables এ CANDLE_ENGINE=v4/v3/v2 দিলে সেটায় ফিরবে
-const CANDLE_ENGINE = process.env.CANDLE_ENGINE || 'v5';
+// Engine toggle — Railway এ CANDLE_ENGINE=v5/v4/v3/v2 দিলে সেটায় ফিরবে
+const CANDLE_ENGINE = process.env.CANDLE_ENGINE || 'v6';
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
@@ -692,7 +693,8 @@ async function initOTC(market) {
     trend:0, trendSteps:0,
     momentum: 0,
     subStates,
-    ...(CANDLE_ENGINE === 'v5' ? initStateV5(price)
+    ...(CANDLE_ENGINE === 'v6' ? initStateV6(price)
+      : CANDLE_ENGINE === 'v5' ? initStateV5(price)
       : CANDLE_ENGINE === 'v4' ? initStateV4(price)
       : CANDLE_ENGINE === 'v3' ? initStateV3(price)
       : initCandleState(price)),
@@ -768,7 +770,8 @@ function tickOTC(id) {
 
   // ── Candle Engine — price update ─────────────────────────────────────────
   const _priceBefore = state.price;
-  if (CANDLE_ENGINE === 'v5')      generateTickV5(state, ctrl, stats);
+  if (CANDLE_ENGINE === 'v6')      generateTickV6(state, ctrl, stats);
+  else if (CANDLE_ENGINE === 'v5') generateTickV5(state, ctrl, stats);
   else if (CANDLE_ENGINE === 'v4') generateTickV4(state, ctrl, stats);
   else if (CANDLE_ENGINE === 'v3') generateTickV3(state, ctrl, stats);
   else                             generateTick(state, ctrl, stats);
