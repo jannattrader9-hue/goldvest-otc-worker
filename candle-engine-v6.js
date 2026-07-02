@@ -158,7 +158,7 @@ function generateTickV6(state, ctrl, stats) {
   if (state._noiseSeed === undefined) state._noiseSeed = (Math.random()*1e9)|0;
   state._noiseX += 0.10;
 
-  // ── WAVE ENGINE (80%) ────────────────────────────────────────────────
+  // ── WAVE ENGINE (80%) — Main Wave + Nested Micro Wave ────────────────
   if (!state._waveDuration || state._waveElapsed >= state._waveDuration) {
     _newWave(state);
   }
@@ -166,14 +166,38 @@ function generateTickV6(state, ctrl, stats) {
   const progress = state._waveElapsed / state._waveDuration;
   const envelope = _waveEnvelope(progress, state._waveCurvature);
 
-  // Manual/trade override on direction
+  // Manual override on direction
   let waveDir = state._waveDir;
   if (ctrl.mode === 'manual') {
     waveDir = ctrl.nextDirection === 'up' ? 1 : ctrl.nextDirection === 'down' ? -1 : state._waveDir;
   }
 
-  // Wave contribution — direction × strength × envelope
-  const waveMove = waveDir * state._waveStrength * envelope * vBase;
+  // ── NESTED MICRO-WAVE ────────────────────────────────────────────────
+  // Main wave overall direction ঠিক করে, কিন্তু ভেতরে ছোট micro-swing
+  // থাকে — মাঝে মাঝে ২-৫ tick বিপরীতে যায়, তারপর আবার trend continue।
+  // এতে motion সোজা লাইন না হয়ে Quotex এর মতো natural হয়:
+  //   ↗↗↗↘↗↗↗↘↗↗  (overall up কিন্তু micro correction সহ)
+  if (state._microTick === undefined || state._microTick <= 0) {
+    // নতুন micro-swing: বেশিরভাগ সময় main direction, মাঝে মাঝে বিপরীত
+    const againstMain = Math.random() < 0.32; // ~32% micro-swing বিপরীতে
+    state._microDir = againstMain ? -waveDir : waveDir;
+    if (againstMain) {
+      state._microTick = 2 + (Math.random() * 3 | 0);   // ছোট বিপরীত: 2–4 tick
+      state._microMag  = 0.4 + Math.random() * 0.4;      // দুর্বল
+    } else {
+      state._microTick = 3 + (Math.random() * 6 | 0);   // main: 3–8 tick
+      state._microMag  = 0.8 + Math.random() * 0.5;      // শক্তিশালী
+    }
+  }
+  state._microTick--;
+
+  // Wave contribution — main + micro-swing মিশিয়ে।
+  // micro-swing বিপরীতে গেলে সেই tick এ সত্যিই বিপরীত move হয় (net negative)
+  // — তাই ↗↗↗↘↗↗↘ এর মতো natural motion আসে।
+  const mainComponent  = waveDir * state._waveStrength * envelope;
+  const microComponent = (state._microDir || waveDir) * (state._microMag || 1);
+  // micro against main হলে সেটা main কে ছাপিয়ে যেতে পারে (net reverse tick)
+  const waveMove = (mainComponent * 0.45 + microComponent * 0.75) * vBase;
 
   // ── Micro noise (10%) ────────────────────────────────────────────────
   const noiseMove = _perlin1D(state._noiseSeed, state._noiseX) * vBase * 0.55;
@@ -211,6 +235,9 @@ function initStateV6(price) {
     _waveDuration:  0,
     _waveElapsed:   0,
     _waveCurvature: 1.0,
+    _microTick:     0,
+    _microDir:      0,
+    _microMag:      1.0,
     _noiseX:        Math.random()*1000,
     _noiseSeed:     (Math.random()*1e9)|0,
     _liq:           [],
