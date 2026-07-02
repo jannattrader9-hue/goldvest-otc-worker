@@ -185,10 +185,28 @@ function generateTickV6(state, ctrl, stats) {
     waveDir = ctrl.nextDirection === 'up' ? 1 : ctrl.nextDirection === 'down' ? -1 : state._waveDir;
   }
 
+  // ── [MULTI-TIMEFRAME] MEDIUM WAVE — macro wave এর ভেতরে swing/pullback ─
+  // GPT: শুধু একটা wave layer থাকলে user ৪-৫ tick দেখেই trend বোঝে।
+  // Medium wave macro এর ভেতরে ছোট swing দেয় — মাঝে মাঝে বিপরীতে যায়,
+  // trend ভাঙে না কিন্তু short-term unpredictable করে।
+  if (state._medTick === undefined || state._medTick <= 0) {
+    state._medTick = 5 + (Math.random() * 12 | 0); // 5–17 tick medium wave
+    // medium direction: বেশিরভাগ macro এর সাথে, ~35% বিপরীত (pullback)
+    const medAgainst = Math.random() < 0.35;
+    state._medDir = medAgainst ? -state._waveDir : state._waveDir;
+    state._medStrength = medAgainst
+      ? (0.3 + Math.random() * 0.4)   // pullback দুর্বল
+      : (0.5 + Math.random() * 0.5);  // continuation
+    state._medElapsed = 0;
+    state._medDuration = state._medTick;
+  }
+  state._medTick--;
+  state._medElapsed = (state._medElapsed || 0) + 1;
+  const medProg = state._medElapsed / (state._medDuration || 1);
+  const medEnv = _waveEnvelope(medProg, 1.0);
+  const medComponent = (state._medDir || state._waveDir) * state._medStrength * medEnv;
+
   // ── MICRO MODULATION — direction flip না, velocity slow/accelerate ───
-  // GPT: micro wave direction উল্টায় না, শুধু force কমায় (slowdown)।
-  // এতে ↑↑↑↓↓↑↑ এর মতো নয়, বরং velocity 0.8→0.5→0.2→0.4→0.8 হয় —
-  // price কখনো একটু ধীরে, কখনো দ্রুত, কিন্তু direction carry থাকে।
   if (state._microTick === undefined || state._microTick <= 0) {
     const roll = Math.random();
     // [GPT FIX] reverse কম ঘন ঘন (~8%) এবং amplitude ছোট (gentle pullback)
@@ -207,8 +225,10 @@ function generateTickV6(state, ctrl, stats) {
   }
   state._microTick--;
 
-  // ── TARGET FORCES — wave velocity কে push করে ────────────────────────
-  let waveForce = waveDir * state._waveStrength * envelope * (state._microScale || 1);
+  // ── TARGET FORCES — Macro drives velocity (smooth trend) ─────────────
+  // Macro wave velocity কে push করে (smooth momentum/trend)।
+  const macroComponent = waveDir * state._waveStrength * envelope;
+  let waveForce = macroComponent * (state._microScale || 1);
 
   // [GPT FIX] WAVE BLENDING — পুরনো wave এর নিজের envelope ব্যবহার হয়
   // (fake না)। পুরনো wave তার শেষ progress থেকে ধীরে fade হয়।
@@ -253,10 +273,13 @@ function generateTickV6(state, ctrl, stats) {
   const maxVel = vBase * 1.8;
   state._velocity = Math.max(-maxVel, Math.min(maxVel, state._velocity));
 
-  // ── price = smooth velocity (glide) + small tick noise ───────────────
-  // [GPT FIX] noise কমানো 0.55 → 0.20 — Quotex candle jitter করে না।
-  const noiseTick = _perlin1D(state._noiseSeed, state._noiseX) * vBase * 0.30;
-  let delta = (state._velocity + noiseTick) * speed;
+  // ── price = velocity (macro trend) + medium swing + noise ────────────
+  // GPT multi-timeframe: velocity macro trend দেয় (smooth)। Medium swing
+  // ও noise সরাসরি price এ যোগ হয় (velocity bypass) — short-term up-down
+  // বাঁচে, user পরের tick predict করতে পারে না, কিন্তু trend থাকে।
+  const medMove   = medComponent * vBase * 0.9;
+  const noiseTick = _perlin1D(state._noiseSeed, state._noiseX) * vBase * 0.22;
+  let delta = (state._velocity * 0.75 + medMove + noiseTick) * speed;
   const maxStep = state.price * 0.0015;
   delta = Math.max(-maxStep, Math.min(maxStep, delta));
   state.price = Math.max(state.price + delta, 0.0001);
@@ -275,6 +298,11 @@ function initStateV6(price) {
     _prevWaveProgress: 1,
     _carryOverSameDir: false,
     _justStartedWave:  false,
+    _medTick:       0,
+    _medDir:        0,
+    _medStrength:   0.5,
+    _medElapsed:    0,
+    _medDuration:   1,
     _waveDuration:  0,
     _waveElapsed:   0,
     _waveCurvature: 1.0,
