@@ -762,8 +762,21 @@ function tickOTC(id) {
   const now   = Date.now();
 
   // ── Candle Engine — price update ─────────────────────────────────────────
+  const _priceBefore = state.price;
   if (CANDLE_ENGINE === 'v3') generateTickV3(state, ctrl, stats);
   else                        generateTick(state, ctrl, stats);
+
+  // DEBUG — বড় jump ধরো (এক tick এ ১% এর বেশি)
+  if (Math.abs(state.price - _priceBefore) > _priceBefore * 0.01) {
+    console.error(`[SPIKE] ${id}: ${_priceBefore.toFixed(5)} → ${state.price.toFixed(5)} | vel=${(state._velocity||0).toFixed(6)} regime=${state._regime}`);
+  }
+  // NaN/Infinity guard
+  if (!isFinite(state.price) || state.price <= 0) {
+    console.error(`[BADPRICE] ${id}: ${state.price} — reset to ${_priceBefore}`);
+    state.price = _priceBefore;
+    state._velocity = 0;
+  }
+
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
 
