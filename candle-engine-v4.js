@@ -1,382 +1,485 @@
 'use strict';
 
 // ═══════════════════════════════════════════════════════════════════════════
-// GoldVest Candle Engine v4 — Professional Force-Based OTC Simulator
+// GoldVest Candle Engine v6 — WAVE-BASED
 // ═══════════════════════════════════════════════════════════════════════════
 //
-// Design philosophy: price generate করি না — FORCE calculate করি।
-// প্রতি tick এ multiple force যোগ হয় → net force → velocity → price।
+// দর্শন: force এর উপর force বসাই না। Movement এর ভিত্তি একটাই — WAVE।
 //
-// Forces:
-//   - Trend force      (regime এর দিক)
-//   - Momentum force    (inertia — আগের গতি ধরে রাখে)
-//   - Mean reversion    (liquidity level এর দিকে টান)
-//   - Noise force       (Perlin — correlated smooth randomness)
-//   - Micro hesitation  (human-like pause/reversal)
-//   - Trade bias        (trade-based mode)
+//   Wave (৮০%)          → price এর মূল চলন
+//   Micro noise (১০%)   → ছোট imperfection (wick, texture)
+//   Liquidity (৫%)      → level touch এ reaction
+//   Trade bias (৫%)     → close এর আগে subtle influence
 //
-// otc-server.js থেকে:  generateTickV4(state, ctrl, stats)
-// নতুন market এ:        initStateV4(price)  → spread into state
+// প্রতিটা wave এর: direction, strength, duration, curvature (ease-in-out)।
+// একটা wave শেষ হলে পরেরটা শুরু — chaining। Wave নিজেই trend, pullback,
+// consolidation naturally তৈরি করে — আলাদা cluster/personality/hesitation
+// লাগে না।
+//
+// otc-server.js থেকে:  generateTickV6(state, ctrl, stats)
+// নতুন market এ:        initStateV6(price)
 // ═══════════════════════════════════════════════════════════════════════════
+
+
+// ── Perlin 1D noise (micro imperfection only) ───────────────────────────────
+function _fade(t){ return t*t*t*(t*(t*6-15)+10); }
+function _lerp(a,b,t){ return a+t*(b-a); }
+function _hash(seed,i){ let h=seed+i*374761393; h=(h^(h>>>13))*1274126177; h=h^(h>>>16); return h>>>0; }
+function _grad(h,x){ return (h&1)===0 ? x : -x; }
+function _perlin1D(seed,x){
+  const x0=Math.floor(x), x1=x0+1, dx=x-x0;
+  const g0=_grad(_hash(seed,x0),dx), g1=_grad(_hash(seed,x1),dx-1);
+  return _lerp(g0,g1,_fade(dx))*2;
+}
 
 
 // ─────────────────────────────────────────────────────────────────────────
-// PERLIN-STYLE 1D NOISE — correlated, smooth randomness
+// WAVE GENERATOR — একটা wave এর সব property ঠিক করে
 // ─────────────────────────────────────────────────────────────────────────
-// প্রতিটা market এর নিজস্ব permutation seed। fade + lerp দিয়ে smooth।
+// Wave chaining: আগের wave এর direction/strength দেখে পরেরটা ঠিক হয়।
+// এতে trend (পরপর same-direction wave), pullback (দুর্বল opposite wave),
+// consolidation (ছোট alternating wave) সব naturally আসে।
 
-function _fade(t) { return t * t * t * (t * (t * 6 - 15) + 10); }
-function _lerp(a, b, t) { return a + t * (b - a); }
+function _selectFamily(state) {
+  // Phase 1: ৩টা family — Momentum, Impulse, Elastic
+  // GPT: hierarchical base probability + Markov transition + anti-repeat memory
+  const prev = state._waveFamily || 'momentum';
 
-function _grad(hash, x) {
-  // hash থেকে +1 বা -1 gradient
-  return (hash & 1) === 0 ? x : -x;
-}
-
-// Deterministic hash — seed + integer
-function _hash(seed, i) {
-  let h = seed + i * 374761393;
-  h = (h ^ (h >>> 13)) * 1274126177;
-  h = h ^ (h >>> 16);
-  return h >>> 0;
-}
-
-// 1D Perlin noise at position x (returns -1..1 approx)
-function _perlin1D(seed, x) {
-  const x0 = Math.floor(x);
-  const x1 = x0 + 1;
-  const dx = x - x0;
-  const g0 = _grad(_hash(seed, x0), dx);
-  const g1 = _grad(_hash(seed, x1), dx - 1);
-  const u  = _fade(dx);
-  return _lerp(g0, g1, u) * 2; // scale to ~-1..1
-}
-
-// Fractal Brownian Motion — multiple octaves মিলিয়ে natural texture
-function _fbm(seed, x) {
-  let total = 0, amp = 1, freq = 1, maxAmp = 0;
-  for (let o = 0; o < 3; o++) {
-    total  += _perlin1D(seed + o * 97, x * freq) * amp;
-    maxAmp += amp;
-    amp    *= 0.5;
-    freq   *= 2.1;
+  // Markov transition — একই family পরপর হওয়ার chance কম
+  // (chart personality evolve করে, robotic repeat হয় না)
+  let probs;
+  if (prev === 'momentum') {
+    probs = { momentum: 0.35, impulse: 0.30, elastic: 0.35 };
+  } else if (prev === 'impulse') {
+    probs = { momentum: 0.50, impulse: 0.15, elastic: 0.35 };
+  } else { // elastic
+    probs = { momentum: 0.50, impulse: 0.30, elastic: 0.20 };
   }
-  return total / maxAmp; // normalized ~-1..1
+
+  // anti-repetition memory — impulse পরপর ৩ বার না, elastic ২ বার না
+  state._famStreak = (state._famStreakOf === prev) ? (state._famStreak || 1) : 0;
+  if (prev === 'impulse' && state._famStreak >= 2) probs.impulse = 0;
+  if (prev === 'elastic'  && state._famStreak >= 1) probs.elastic = 0;
+
+  // normalize + pick
+  const total = probs.momentum + probs.impulse + probs.elastic;
+  let roll = Math.random() * total;
+  let picked;
+  if ((roll -= probs.momentum) < 0)      picked = 'momentum';
+  else if ((roll -= probs.impulse) < 0)  picked = 'impulse';
+  else                                    picked = 'elastic';
+
+  // streak update
+  if (picked === state._famStreakOf) state._famStreak = (state._famStreak || 0) + 1;
+  else { state._famStreakOf = picked; state._famStreak = 1; }
+
+  return picked;
 }
 
+function _newWave(state) {
+  const prevDir = state._waveDir || 0;
+  const prevWasStrong = (state._waveStrength || 0) > 0.6;
 
-// ─────────────────────────────────────────────────────────────────────────
-// MARKET REGIME STATE MACHINE — extended states
-// ─────────────────────────────────────────────────────────────────────────
-// Real market behaviour phases:
-//   accumulation  : tight range, low vol (before move)
-//   markup        : strong uptrend
-//   distribution  : tight range at top
-//   markdown      : strong downtrend
-//   expansion     : high volatility both ways
-//   compression   : shrinking range (before breakout)
-//   pullback_up   : correction in uptrend
-//   pullback_dn   : correction in downtrend
-//   liquidity_grab: fake spike then reverse
-//   exhaustion    : trend slowing, about to reverse
-//   ranging       : normal sideways
+  // [GPT WAVE FAMILY] এই wave এর motion personality
+  state._waveFamily = _selectFamily(state);
 
-function _nextRegime(cur) {
   const r = Math.random();
-  switch (cur) {
-    case 'accumulation':
-      return r < 0.45 ? 'markup' : r < 0.65 ? 'compression' : r < 0.85 ? 'accumulation' : 'markdown';
-    case 'markup':
-      return r < 0.35 ? 'markup' : r < 0.60 ? 'pullback_up' : r < 0.75 ? 'distribution'
-           : r < 0.88 ? 'exhaustion' : 'expansion';
-    case 'distribution':
-      return r < 0.45 ? 'markdown' : r < 0.65 ? 'distribution' : r < 0.85 ? 'compression' : 'markup';
-    case 'markdown':
-      return r < 0.35 ? 'markdown' : r < 0.60 ? 'pullback_dn' : r < 0.75 ? 'accumulation'
-           : r < 0.88 ? 'exhaustion' : 'expansion';
-    case 'expansion':
-      return r < 0.30 ? 'markup' : r < 0.60 ? 'markdown' : r < 0.80 ? 'ranging' : 'compression';
-    case 'compression':
-      return r < 0.40 ? 'liquidity_grab' : r < 0.70 ? 'markup' : 'markdown';
-    case 'pullback_up':
-      return r < 0.60 ? 'markup' : r < 0.80 ? 'ranging' : r < 0.92 ? 'distribution' : 'markdown';
-    case 'pullback_dn':
-      return r < 0.60 ? 'markdown' : r < 0.80 ? 'ranging' : r < 0.92 ? 'accumulation' : 'markup';
-    case 'liquidity_grab':
-      // fake move — তারপর reverse
-      return r < 0.55 ? 'markup' : r < 0.90 ? 'markdown' : 'ranging';
-    case 'exhaustion':
-      return r < 0.45 ? 'ranging' : r < 0.70 ? 'pullback_up' : 'pullback_dn';
-    case 'ranging':
-    default:
-      return r < 0.25 ? 'accumulation' : r < 0.45 ? 'compression'
-           : r < 0.60 ? 'markup' : r < 0.75 ? 'markdown'
-           : r < 0.90 ? 'ranging' : 'expansion';
+  let dir, strength, duration;
+
+  // [UNPREDICTABLE] direction অনেক বেশি random — pattern ধরা যাবে না।
+  // continuation/reverse এর কোনো নির্দিষ্ট নিয়ম নেই, প্রতিবার ভিন্ন।
+  if (prevDir === 0) {
+    dir = Math.random() < 0.5 ? 1 : -1;
+  } else {
+    // continuation probability নিজেই random (35%–65%) — fixed না
+    const contProb = 0.35 + Math.random() * 0.30;
+    dir = (r < contProb) ? prevDir : -prevDir;
+    // মাঝে মাঝে (~12%) সম্পূর্ণ random surprise
+    if (Math.random() < 0.12) dir = Math.random() < 0.5 ? 1 : -1;
+  }
+
+  // [GPT] strength ও duration family থেকে — নাটকীয়ভাবে আলাদা যাতে চোখে
+  // পড়ে। Impulse ছোট+শক্তিশালী (burst), Momentum লম্বা+মাঝারি (glide),
+  // Elastic মাঝারি (bounce)।
+  const fpw = _FAMILY_PHYSICS[state._waveFamily] || _FAMILY_PHYSICS.momentum;
+  strength = fpw.strMin + Math.random() * (fpw.strMax - fpw.strMin);
+  duration = fpw.durMin + (Math.random() * (fpw.durMax - fpw.durMin) | 0);
+
+  const curvature = 0.5 + Math.random() * 1.2; // 0.5–1.7 বেশি variation
+
+  // [GPT WAVE FAMILY] physics family থেকে আসে — random না। family = personality।
+  // সামান্য random variation রাখি (±15%) যাতে একই family ও একঘেয়ে না হয়।
+  const fp = _FAMILY_PHYSICS[state._waveFamily] || _FAMILY_PHYSICS.momentum;
+  const jit = () => 0.85 + Math.random() * 0.30; // ±15% jitter
+  state._physAccel   = fp.accel   * jit();
+  state._physDamping = Math.min(0.97, fp.damping * jit());
+  state._physMaxVel  = fp.maxVel  * jit();
+  state._physBlend   = Math.max(4, fp.blend * jit() | 0);
+  state._physSkew    = 0.5 + Math.random() * 1.0;
+  // family-specific medium ও noise behavior
+  state._famMedStrength = fp.medStrength;
+  state._famMedPullback = fp.medPullback;
+  state._famNoiseScale  = fp.noiseScale;
+  state._famSigStrength = fp.sigStrength;
+  state._famFriction    = fp.friction || 0.86;
+
+  // [GPT FIX] _newWave শুধু wave তৈরি করে — velocity এখানে modify করি না।
+  // carry-over এর intent সংরক্ষণ করি, প্রয়োগ হয় generateTickV6 এ।
+  state._carryOverSameDir = (dir === prevDir);
+
+  // Wave blending — পুরনো wave এর নিজের progress/envelope সংরক্ষণ
+  state._prevWaveDir       = state._waveDir || dir;
+  state._prevWaveStrength  = state._waveStrength || strength;
+  state._prevWaveCurvature = state._waveCurvature || 1.0;
+  state._prevWaveProgress  = state._waveDuration
+                             ? (state._waveElapsed / state._waveDuration) : 1;
+  state._blendTicks        = state._physBlend || 10;
+  state._justStartedWave   = true; // generateTick এ carry-over প্রয়োগের signal
+
+  state._waveDir       = dir;
+  state._waveStrength  = strength;
+  state._waveDuration  = duration;
+  state._waveElapsed   = 0;
+  state._waveCurvature = curvature;
+}
+
+// ── FAMILY PHYSICS PROFILES — GPT: family = সম্পূর্ণ motion personality ──
+// প্রতি family শুধু envelope না — acceleration, damping, medium behavior,
+// pullback সব আলাদা। এক wave personality পুরো system জুড়ে (macro+medium)।
+const _FAMILY_PHYSICS = {
+  momentum: {
+    accel: 0.10, damping: 0.90, maxVel: 1.8, blend: 12,
+    medStrength: 0.9, medPullback: 0.35, noiseScale: 0.22,
+    durMin: 35, durMax: 70, friction: 0.88,
+    strMin: 0.45, strMax: 0.75,  // মাঝারি
+    sigStrength: 0.10,           // smooth (কম direct signature)
+  },
+  impulse: {
+    accel: 0.26, damping: 0.80, maxVel: 2.6, blend: 5,
+    medStrength: 0.5, medPullback: 0.18, noiseScale: 0.32,
+    durMin: 8, durMax: 20, friction: 0.82,
+    strMin: 0.80, strMax: 1.10,  // শক্তিশালী
+    sigStrength: 0.50,           // strong burst (বেশি direct)
+  },
+  elastic: {
+    accel: 0.16, damping: 0.95, maxVel: 2.0, blend: 8,
+    medStrength: 1.3, medPullback: 0.60, noiseScale: 0.16,
+    durMin: 18, durMax: 42, friction: 0.90,
+    strMin: 0.40, strMax: 0.80,
+    sigStrength: 0.28,           // bounce
+  },
+};
+
+// ── WAVE FAMILY ENVELOPES — প্রতি family এর নিজস্ব motion topology ────────
+// GPT: amplitude না, rhythm/shape ই robotic feel এর কারণ। প্রতি family
+// সম্পূর্ণ আলাদা velocity profile — user আর একই rhythm অনুভব করবে না।
+
+// Momentum — classic bell (accelerate → peak → decelerate)
+function _envMomentum(p, curv) {
+  const bell = Math.sin(Math.PI * p);
+  return 0.3 + Math.pow(bell, 1 / curv) * 0.7;
+}
+// Impulse — শুরুতেই peak, তারপর দ্রুত decay (front-loaded burst)
+function _envImpulse(p) {
+  // দ্রুত rise (প্রথম 15%), তারপর exponential decay
+  const rise = Math.min(1, p / 0.15);
+  const decay = Math.exp(-3 * Math.max(0, p - 0.15));
+  return 0.25 + rise * decay * 0.85;
+}
+// Elastic — যায়, overshoot করে, bounce back (damped oscillation)
+function _envElastic(p) {
+  // মূল push + একটা damped sine oscillation (bounce feel)
+  const base = Math.sin(Math.PI * p);
+  const bounce = Math.sin(Math.PI * p * 3) * Math.exp(-2 * p) * 0.4;
+  return 0.3 + (base * 0.7 + bounce) * 0.7;
+}
+
+// Family অনুযায়ী envelope route করে
+function _familyEnvelope(family, p, curv) {
+  switch (family) {
+    case 'impulse': return _envImpulse(p);
+    case 'elastic': return _envElastic(p);
+    case 'momentum':
+    default:        return _envMomentum(p, curv);
   }
 }
 
-// Regime duration in ticks (500ms per tick)
-function _regimeDuration(s) {
-  switch (s) {
-    case 'accumulation':  return 16 + (Math.random() * 20 | 0); // 8–18s
-    case 'markup':        return 10 + (Math.random() * 16 | 0); // 5–13s
-    case 'distribution':  return 16 + (Math.random() * 20 | 0);
-    case 'markdown':      return 10 + (Math.random() * 16 | 0);
-    case 'expansion':     return  6 + (Math.random() * 10 | 0); // 3–8s
-    case 'compression':   return 10 + (Math.random() * 12 | 0);
-    case 'pullback_up':   return  4 + (Math.random() *  6 | 0); // 2–5s
-    case 'pullback_dn':   return  4 + (Math.random() *  6 | 0);
-    case 'liquidity_grab':return  3 + (Math.random() *  4 | 0); // 1.5–3.5s
-    case 'exhaustion':    return  5 + (Math.random() *  7 | 0);
-    case 'ranging':
-    default:              return 12 + (Math.random() * 16 | 0);
-  }
-}
-
-// Regime → { trendForce, volatilityMul, reversionMul }
-function _regimeParams(s, grabDir) {
-  switch (s) {
-    case 'accumulation':  return { trend:  0.05, vol: 0.4, rev: 0.9 };
-    case 'markup':        return { trend:  0.55, vol: 1.0, rev: 0.2 };
-    case 'distribution':  return { trend: -0.05, vol: 0.4, rev: 0.9 };
-    case 'markdown':      return { trend: -0.55, vol: 1.0, rev: 0.2 };
-    case 'expansion':     return { trend:  0.00, vol: 1.8, rev: 0.3 };
-    case 'compression':   return { trend:  0.00, vol: 0.3, rev: 1.1 };
-    case 'pullback_up':   return { trend: -0.30, vol: 0.7, rev: 0.4 };
-    case 'pullback_dn':   return { trend:  0.30, vol: 0.7, rev: 0.4 };
-    case 'liquidity_grab':return { trend: (grabDir || 1) * 1.1, vol: 1.5, rev: 0.1 };
-    case 'exhaustion':    return { trend:  0.00, vol: 0.6, rev: 0.7 };
-    case 'ranging':
-    default:              return { trend:  0.00, vol: 0.6, rev: 0.6 };
-  }
+// Wave envelope — legacy (medium wave এ ব্যবহৃত)
+function _waveEnvelope(progress, curvature) {
+  const p = Math.min(1, Math.max(0, progress));
+  const bell = Math.sin(Math.PI * p);
+  const shaped = Math.pow(bell, 1 / curvature);
+  return 0.3 + shaped * 0.7;
 }
 
 
 // ─────────────────────────────────────────────────────────────────────────
-// LIQUIDITY MEMORY — multiple support/resistance levels
+// LIQUIDITY — শুধু level memory + touch reaction (magnet না)
 // ─────────────────────────────────────────────────────────────────────────
-// Swing high/low detect করে level হিসেবে store করি (max ~15টা)।
-// Price কোনো level এর কাছে গেলে সেই level এর দিকে টান / bounce।
-
 function _updateLiquidity(state) {
   if (!state._liq) state._liq = [];
   if (!state._swingTick) state._swingTick = 0;
   state._swingTick++;
-
-  // প্রতি ৮ tick এ swing detect
-  if (state._swingTick % 8 !== 0) return;
-
   const p = state.price;
-  // recent high/low track
   if (!state._recentHigh || p > state._recentHigh) state._recentHigh = p;
   if (!state._recentLow  || p < state._recentLow)  state._recentLow  = p;
-
-  // প্রতি ৪০ tick এ swing confirm করে level হিসেবে যোগ করি
-  if (state._swingTick % 40 === 0) {
-    const hi = state._recentHigh, lo = state._recentLow;
-    if (hi) state._liq.push({ price: hi, strength: 1.0 });
-    if (lo) state._liq.push({ price: lo, strength: 1.0 });
-    state._recentHigh = p;
-    state._recentLow  = p;
-    // পুরনো level decay + prune
-    state._liq.forEach(l => l.strength *= 0.9);
-    state._liq = state._liq.filter(l => l.strength > 0.15).slice(-15);
+  if (state._swingTick % 45 === 0) {
+    if (state._recentHigh) state._liq.push({ price: state._recentHigh, s: 1.0 });
+    if (state._recentLow)  state._liq.push({ price: state._recentLow,  s: 1.0 });
+    state._recentHigh = p; state._recentLow = p;
+    state._liq.forEach(l => l.s *= 0.88);
+    state._liq = state._liq.filter(l => l.s > 0.2).slice(-12);
   }
 }
 
-// Liquidity force — কাছের level এর দিকে টান বা bounce
-function _liquidityForce(state, v) {
+// Touch reaction — level এর খুব কাছে এলে ছোট reaction (probabilistic)
+function _liquidityReaction(state, v) {
   if (!state._liq || state._liq.length === 0) return 0;
   const p = state.price;
-  let force = 0;
   for (const l of state._liq) {
-    const dist = (l.price - p) / (v * 20 + 1e-9); // normalized distance
-    if (Math.abs(dist) < 3) {
-      // কাছাকাছি — টান (magnet effect), strength ও distance অনুযায়ী
-      const pull = Math.sign(dist) * Math.exp(-Math.abs(dist)) * l.strength;
-      force += pull;
+    const distPct = Math.abs(l.price - p) / p;
+    if (distPct < 0.0008) { // খুব কাছে (~0.08%)
+      // touch — bounce বা break (probabilistic, একবারই react)
+      if (!state._lastReactLevel || Math.abs(state._lastReactLevel - l.price) > p*0.0005) {
+        state._lastReactLevel = l.price;
+        const roll = Math.random();
+        if (roll < 0.55) {
+          // bounce — level থেকে দূরে ঠেলে
+          return -Math.sign(l.price - p) * v * 0.8 * l.s;
+        }
+        // নাহলে ignore/break — কিছু করি না, wave চলতে থাকে
+      }
     }
   }
-  return force * v * 0.15;
+  return 0;
 }
 
 
-// ─────────────────────────────────────────────────────────────────────────
-// TRADE-BASED BIAS
-// ─────────────────────────────────────────────────────────────────────────
 function _tradeBias(stats) {
-  const up   = parseFloat(stats.upAmount)   || 0;
-  const down = parseFloat(stats.downAmount) || 0;
-  if (up > down * 1.1)  return -1; // majority UP  → push DOWN
-  if (down > up * 1.1)  return  1; // majority DOWN → push UP
+  const up = parseFloat(stats.upAmount)||0, down = parseFloat(stats.downAmount)||0;
+  if (up > down*1.1) return -1;
+  if (down > up*1.1) return 1;
   return 0;
 }
 
 
 // ─────────────────────────────────────────────────────────────────────────
-// MAIN TICK — force-based physics
+// MAIN TICK — wave-driven
 // ─────────────────────────────────────────────────────────────────────────
-function generateTickV4(state, ctrl, stats) {
+function generateTickV6(state, ctrl, stats) {
   if (!state || !state.price) return;
 
-  const volCfg = { low: 0.5, medium: 1.0, high: 1.9 }[ctrl.volatility] || 1.0;
+  const volCfg = { low: 0.5, medium: 1.0, high: 1.8 }[ctrl.volatility] || 1.0;
   const speed  = ctrl.speedMultiplier || 1.0;
   const now    = Date.now();
 
-  // Base unit of movement — v3 এর মতো ০.০২৫%
-  const vBase = state.price * 0.00025 * volCfg;
+  // Base movement unit — price এর ০.০৩%
+  const vBase = state.price * 0.0002 * volCfg;
 
-  // ── Perlin noise position advance ────────────────────────────────────
-  if (state._noiseX === undefined) state._noiseX = Math.random() * 1000;
-  if (state._noiseSeed === undefined) state._noiseSeed = (Math.random() * 1e9) | 0;
-  state._noiseX += 0.08; // slow advance = smooth correlated noise
+  // ── Perlin advance (micro noise) ─────────────────────────────────────
+  if (state._noiseX === undefined) state._noiseX = Math.random()*1000;
+  if (state._noiseSeed === undefined) state._noiseSeed = (Math.random()*1e9)|0;
+  state._noiseX += 0.10;
 
-  // ── Regime state machine ─────────────────────────────────────────────
-  if (!state._regime) {
-    state._regime = 'ranging';
-    state._regimeTick = _regimeDuration('ranging');
-    state._grabDir = 1;
+  // ── WAVE ENGINE — velocity-based (position না) ───────────────────────
+  if (!state._waveDuration || state._waveElapsed >= state._waveDuration) {
+    _newWave(state);
   }
-  state._regimeTick--;
-  if (state._regimeTick <= 0) {
-    const next = _nextRegime(state._regime);
-    if (next === 'liquidity_grab') state._grabDir = Math.random() < 0.5 ? 1 : -1;
-    state._regime = next;
-    state._regimeTick = _regimeDuration(next);
-  }
+  state._waveElapsed++;
+  const progress = state._waveElapsed / state._waveDuration;
+  // [GPT] skew দিয়ে envelope এর peak সরাই — কোনো wave শুরুতে fast
+  // (skew<1), কোনো শেষে fast (skew>1)। প্রতি wave আলাদা acceleration timing।
+  const skewedProg = Math.pow(progress, state._physSkew || 1.0);
+  // [GPT WAVE FAMILY] macro envelope family অনুযায়ী — আলাদা shape।
+  const envelope = _familyEnvelope(state._waveFamily || 'momentum', skewedProg, state._waveCurvature);
 
-  const rp = _regimeParams(state._regime, state._grabDir);
-  const v  = vBase * rp.vol;
-
-  // ── [v4.1] SMART TICK CLUSTERING ────────────────────────────────────
-  // Cluster direction pure random না — regime bias + velocity + আগের
-  // cluster মিলিয়ে ঠিক হয়। Duration ও volatility অনুযায়ী variable।
-  if (state._clusterTick === undefined || state._clusterTick <= 0) {
-    // Direction weights: regime trend + current velocity + previous cluster momentum
-    const regimeBias = rp.trend;                          // -1.2 .. +1.2
-    const velBias    = Math.sign(state._velocity || 0) * 0.5;
-    const prevBias   = (state._clusterDir || 0) * 0.3;    // continuation ঝোঁক
-    const score      = regimeBias + velBias + prevBias;
-    // score কে probability তে রূপান্তর — বেশি score → up cluster বেশি সম্ভব
-    const pUp = 0.5 + Math.max(-0.4, Math.min(0.4, score * 0.35));
-    state._clusterDir = Math.random() < pUp ? 1 : -1;
-
-    // Variable duration — volatility বেশি হলে ছোট cluster, কম হলে বড়
-    const volFactor = rp.vol; // 0.3 .. 1.8
-    const baseDur   = volFactor > 1.2 ? 3 : volFactor < 0.5 ? 8 : 5;
-    state._clusterTick = Math.max(2, baseDur + (Math.random() * 7 - 3 | 0)); // 2–14 range
-    state._clusterStr  = 0.3 + Math.random() * 0.5;
-  }
-  state._clusterTick--;
-  const clusterForce = state._clusterDir * v * state._clusterStr * 0.18;
-
-  // ── FORCE 1: Trend force (regime direction) ─────────────────────────
-  let trendForce = rp.trend * v * 0.5;
-
-  // Manual/trade-based override
+  // Manual override on direction
+  let waveDir = state._waveDir;
   if (ctrl.mode === 'manual') {
-    const dir = ctrl.nextDirection === 'up' ? 1 : ctrl.nextDirection === 'down' ? -1 : 0;
-    trendForce = dir * v * 0.8;
-  } else if (ctrl.mode === 'trade-based') {
-    state._tradeTrend = _tradeBias(stats);
-    // regime চলবে normally, শুধু শেষ ৮s এ subtle push (নিচে যোগ হবে)
+    waveDir = ctrl.nextDirection === 'up' ? 1 : ctrl.nextDirection === 'down' ? -1 : state._waveDir;
   }
 
-  // ── FORCE 2: Noise force (Perlin/FBM, correlated) ───────────────────
-  const noiseForce = _fbm(state._noiseSeed, state._noiseX) * v * 0.7;
+  // ── [MULTI-TIMEFRAME] MEDIUM WAVE — macro wave এর ভেতরে swing/pullback ─
+  // GPT: শুধু একটা wave layer থাকলে user ৪-৫ tick দেখেই trend বোঝে।
+  // Medium wave macro এর ভেতরে ছোট swing দেয় — মাঝে মাঝে বিপরীতে যায়,
+  // trend ভাঙে না কিন্তু short-term unpredictable করে।
+  if (state._medTick === undefined || state._medTick <= 0) {
+    state._medTick = 5 + (Math.random() * 12 | 0);
+    // [GPT] medium pullback probability family থেকে — Elastic এ বেশি
+    // pullback (bounce), Impulse এ কম। এক personality পুরো system জুড়ে।
+    const medAgainst = Math.random() < (state._famMedPullback || 0.35);
+    state._medDir = medAgainst ? -state._waveDir : state._waveDir;
+    // medium strength ও family থেকে
+    const fms = state._famMedStrength || 0.9;
+    state._medStrength = medAgainst
+      ? (0.3 + Math.random() * 0.4) * fms
+      : (0.5 + Math.random() * 0.5) * fms;
+    state._medElapsed = 0;
+    state._medDuration = state._medTick;
+  }
+  state._medTick--;
+  state._medElapsed = (state._medElapsed || 0) + 1;
+  const medProg = state._medElapsed / (state._medDuration || 1);
+  // [GPT] medium envelope ও family অনুযায়ী — আর bell এ আটকে নেই।
+  // এটাই ছিল সবচেয়ে বড় ফাঁক (medium 58% dominant, কিন্তু সবসময় bell)।
+  const medEnv = _familyEnvelope(state._waveFamily || 'momentum', medProg, 1.0);
+  const medComponent = (state._medDir || state._waveDir) * state._medStrength * medEnv;
 
-  // ── FORCE 3: Liquidity force (support/resistance magnet) ────────────
-  _updateLiquidity(state);
-  const liqForce = _liquidityForce(state, v);
-
-  // ── FORCE 4: Mean reversion (v3 simple anchor) ──────────────────────
-  if (state._anchor === undefined) state._anchor = state.price;
-  state._anchor = state._anchor * 0.998 + state.price * 0.002;
-  const reversionForce = (state._anchor - state.price) * 0.05 * rp.rev;
-
-  // ── FORCE 5: Micro hesitation (human behaviour) ─────────────────────
-  // প্রতি কয়েক tick এ ছোট বিপরীত পা — trend এও hesitation
-  if (!state._hesTick) state._hesTick = 0;
-  state._hesTick++;
-  let hesitationForce = 0;
-  const hesPhase = state._hesTick % 6;
-  if (hesPhase === 4) hesitationForce = -Math.sign(state._velocity || 0) * v * 0.3;
-  if (hesPhase === 5) hesitationForce = -(state._velocity || 0) * 0.15; // brief brake
-
-  // ── FORCE 6: Trade-based close push (শেষ ৮s, subtle) ────────────────
-  let closePush = 0;
-  if (ctrl.mode === 'trade-based' && state._tradeTrend) {
-    const timeLeft = state.nextCandle ? (state.nextCandle - now) : 99999;
-    if (timeLeft <= 8000 && timeLeft > 0) {
-      closePush = state._tradeTrend * v * 0.2;
+  // ── MICRO MODULATION — family-specific (GPT: micro ও family follow করবে) ─
+  if (state._microTick === undefined || state._microTick <= 0) {
+    const roll = Math.random();
+    const fam = state._waveFamily || 'momentum';
+    if (fam === 'impulse') {
+      // Impulse — ছোট sharp burst, দ্রুত পরিবর্তন
+      if (roll < 0.10) { state._microTick = 1 + (Math.random()*2|0); state._microScale = -0.15 - Math.random()*0.2; }
+      else if (roll < 0.35) { state._microTick = 1 + (Math.random()*2|0); state._microScale = 1.2 + Math.random()*0.6; } // burst
+      else { state._microTick = 2 + (Math.random()*3|0); state._microScale = 0.7 + Math.random()*0.5; }
+    } else if (fam === 'elastic') {
+      // Elastic — বেশি reverse (bounce), oscillating micro
+      if (roll < 0.20) { state._microTick = 2 + (Math.random()*3|0); state._microScale = -0.2 - Math.random()*0.3; } // strong reverse
+      else if (roll < 0.45) { state._microTick = 2 + (Math.random()*3|0); state._microScale = 0.1 + Math.random()*0.3; }
+      else { state._microTick = 3 + (Math.random()*5|0); state._microScale = 0.7 + Math.random()*0.5; }
+    } else {
+      // Momentum — smooth, কম reverse, দীর্ঘ consistent
+      if (roll < 0.05) { state._microTick = 2 + (Math.random()*2|0); state._microScale = -0.08 - Math.random()*0.1; }
+      else if (roll < 0.35) { state._microTick = 3 + (Math.random()*4|0); state._microScale = 0.3 + Math.random()*0.4; }
+      else { state._microTick = 4 + (Math.random()*7|0); state._microScale = 0.85 + Math.random()*0.4; }
     }
   }
+  state._microTick--;
 
-  // ── PHYSICS: net force → acceleration → velocity → price ────────────
-  const netForce = trendForce + clusterForce + noiseForce + liqForce + reversionForce + hesitationForce + closePush;
+  // ── TARGET FORCES — Macro drives velocity (smooth trend) ─────────────
+  // Macro wave velocity কে push করে (smooth momentum/trend)।
+  const macroComponent = waveDir * state._waveStrength * envelope;
+  let waveForce = macroComponent * (state._microScale || 1);
 
-  if (state._velocity === undefined)     state._velocity = 0;
-  if (state._acceleration === undefined) state._acceleration = 0;
+  // [GPT FIX] WAVE BLENDING — পুরনো wave এর নিজের envelope ব্যবহার হয়
+  // (fake না)। পুরনো wave তার শেষ progress থেকে ধীরে fade হয়।
+  if (state._blendTicks && state._blendTicks > 0) {
+    const blendProg = 1 - (state._blendTicks / 10); // 0→1
+    // পুরনো wave নিজের progress থেকে এগিয়ে যাচ্ছে (fade out)
+    const prevProg = Math.min(1, (state._prevWaveProgress || 1) + (1 - state._blendTicks / 10) * 0.3);
+    const prevEnv  = _waveEnvelope(prevProg, state._prevWaveCurvature || 1.0);
+    const prevForce = (state._prevWaveDir || waveDir) * (state._prevWaveStrength || 0) * prevEnv;
+    waveForce = prevForce * (1 - blendProg) + waveForce * blendProg;
+    state._blendTicks--;
+  }
 
-  // acceleration = force (mass=1)
+  _updateLiquidity(state);
+  const liqForce = _liquidityReaction(state, 1) / (vBase + 1e-9);
+
+  let tradeForce = 0;
+  if (ctrl.mode === 'trade-based') {
+    const tb = _tradeBias(stats);
+    const dur = state._candleDurMs || 60000;
+    const tLeft = state.nextCandle ? (state.nextCandle - now) : dur;
+    if (tb !== 0 && tLeft <= 8000 && tLeft > 0) tradeForce = tb * 0.25;
+  }
+
+  // ── [v6.1] v3-STYLE INTEGRATOR — force → velocity → price ────────────
+  // GPT: v3 এর motion জীবন্ত ছিল কারণ সরল। target-chasing, triple
+  // smoothing, famSignature সব বাদ। শুধু force→velocity→friction→price।
+  // v6 এর সব feature (family, medium, liquidity, noise) থাকছে — শুধু
+  // integration v3 এর মতো সরল।
+  if (state._velocity === undefined) state._velocity = 0;
+
+  // carry-over (wave শুরুতে)
+  if (state._justStartedWave) {
+    state._justStartedWave = false;
+    state._velocity = (state._velocity || 0) * (state._carryOverSameDir ? 0.85 : 0.5);
+  }
+
+  // net force — v6 wave force বড়, তাই scale করি (v3 এর মতো moderate)
+  const netForce = (waveForce + medComponent * 0.9 + liqForce + tradeForce) * vBase * 0.35;
+
+  // v3 physics: acceleration = force (সরাসরি, target-chasing না)
   state._acceleration = netForce;
   state._velocity += state._acceleration;
 
-  // ── [v4.1] DYNAMIC FRICTION — smooth lerp, per-tick random বাদ ──────
-  // Friction regime অনুযায়ী target এর দিকে smoothly move করে।
-  // GPT: per-tick Math.random() বাদ — professional engine এ friction smooth।
+  // ── [v4 LIFE] HESITATION — মাঝে মাঝে ছোট বিপরীত পা / brake ───────────
+  // v4 এর motion জীবন্ত ছিল এই hesitation এর জন্য — price একটানা মসৃণ
+  // একদিকে যায় না, মাঝে মাঝে থামে/পিছায়, তারপর আবার চলে। এটাই animation।
+  if (!state._hesTick) state._hesTick = 0;
+  state._hesTick++;
+  const hesPhase = state._hesTick % 6;
+  if (hesPhase === 4) state._velocity += -Math.sign(state._velocity || 0) * vBase * 0.35;
+  if (hesPhase === 5) state._velocity += -(state._velocity || 0) * 0.18; // brief brake
+
+  // ── [v4.1 DYNAMIC FRICTION] — smooth lerp, wave strength অনুযায়ী ────
+  // v4.1 এ friction regime অনুযায়ী smoothly বদলাত (strong trend এ কম
+  // damping = বেশি glide, weak এ বেশি damping = ধীর)। v6 এ wave strength
+  // দিয়ে সেই effect আনি — এটাই v4.1 এর জীবন্ত motion এর মূল।
   if (state._friction === undefined) state._friction = 0.85;
   let frictionTarget;
-  if (state._regime === 'markup' || state._regime === 'markdown' ||
-      state._regime === 'expansion' || state._regime === 'liquidity_grab') {
-    frictionTarget = 0.90; // কম damping → বেশি glide
-  } else if (state._regime === 'ranging' || state._regime === 'compression' ||
-             state._regime === 'accumulation' || state._regime === 'distribution') {
-    frictionTarget = 0.78; // বেশি damping → ধীর
-  } else {
-    frictionTarget = 0.84;
-  }
-  // smooth transition — কোনো per-tick random নেই
-  state._friction += (frictionTarget - state._friction) * 0.08;
+  const ws = state._waveStrength || 0.5;
+  if (ws > 0.7)      frictionTarget = 0.90; // strong wave — কম damping, বেশি glide
+  else if (ws < 0.45) frictionTarget = 0.78; // weak wave — বেশি damping, ধীর
+  else               frictionTarget = 0.84;
+  state._friction += (frictionTarget - state._friction) * 0.08; // smooth lerp
   state._velocity *= Math.max(0.70, Math.min(0.94, state._friction));
 
-  // velocity clamp — বড় spike রোধ
-  const maxVel = v * 2.2;
+  // velocity clamp
+  const maxVel = vBase * (state._physMaxVel || 2.2);
   state._velocity = Math.max(-maxVel, Math.min(maxVel, state._velocity));
 
-  // ── HARD SAFETY CLAMP — এক tick এ price max ±0.15% এর বেশি নড়বে না ──────
-  const proposedPrice = state.price + state._velocity * speed;
-  const maxStep = state.price * 0.0015; // 0.15% max per tick
-  const clampedDelta = Math.max(-maxStep, Math.min(maxStep, proposedPrice - state.price));
-  state.price = Math.max(state.price + clampedDelta, 0.0001);
+  // noise price এ সরাসরি (tick texture)
+  const noiseTick = _perlin1D(state._noiseSeed, state._noiseX) * vBase * (state._famNoiseScale || 0.22);
+
+  // ── price = velocity + noise (v4.1 এর মতো সরল, imperfection ছাড়া) ────
+  let delta = (state._velocity + noiseTick) * speed;
+  const maxStep = state.price * 0.0015;
+  delta = Math.max(-maxStep, Math.min(maxStep, delta));
+  state.price = Math.max(state.price + delta, 0.0001);
 }
 
 
-// ─────────────────────────────────────────────────────────────────────────
-// STATE INITIALIZER
-// ─────────────────────────────────────────────────────────────────────────
-function initStateV4(price) {
+function initStateV6(price) {
   return {
-    _regime:       'ranging',
-    _regimeTick:   _regimeDuration('ranging'),
-    _grabDir:      1,
-    _velocity:     0,
-    _acceleration: 0,
-    _noiseX:       Math.random() * 1000,
-    _noiseSeed:    (Math.random() * 1e9) | 0,
-    _anchor:       price,
-    _liq:          [],
-    _swingTick:    0,
-    _recentHigh:   price,
-    _recentLow:    price,
-    _hesTick:      0,
-    _tradeTrend:   0,
-    // [v4-stable] tick clustering + dynamic friction
-    _clusterTick:  4 + (Math.random() * 5 | 0),
-    _clusterDir:   Math.random() < 0.5 ? 1 : -1,
-    _clusterStr:   0.3 + Math.random() * 0.5,
-    _friction:     0.85,
+    _waveDir:       0,
+    _waveStrength:  0,
+    _acceleration:  0,
+    _blendTicks:    0,
+    _prevWaveDir:   0,
+    _prevWaveStrength: 0,
+    _prevWaveCurvature: 1.0,
+    _prevWaveProgress: 1,
+    _carryOverSameDir: false,
+    _justStartedWave:  false,
+    _medTick:       0,
+    _medDir:        0,
+    _medStrength:   0.5,
+    _medElapsed:    0,
+    _medDuration:   1,
+    _physAccel:     0.16,
+    _physDamping:   0.9,
+    _physMaxVel:    1.8,
+    _physBlend:     10,
+    _physSkew:      1.0,
+    _waveFamily:    'momentum',
+    _famStreak:     0,
+    _famStreakOf:   'momentum',
+    _famMedStrength: 0.9,
+    _famMedPullback: 0.35,
+    _famNoiseScale:  0.22,
+    _famSigStrength: 0.25,
+    _famFriction:   0.86,
+    _impTick:       0,
+    _impMode:       "normal",
+    _waveDuration:  0,
+    _waveElapsed:   0,
+    _waveCurvature: 1.0,
+    _microTick:     0,
+    _microDir:      0,
+    _microMag:      1.0,
+    _noiseX:        Math.random()*1000,
+    _noiseSeed:     (Math.random()*1e9)|0,
+    _liq:           [],
+    _swingTick:     0,
+    _recentHigh:    price,
+    _recentLow:     price,
+    _lastReactLevel: null,
+    _candleDurMs:   60000,
   };
 }
 
-module.exports = { generateTickV4, initStateV4 };
+module.exports = { generateTickV6, initStateV6 };
