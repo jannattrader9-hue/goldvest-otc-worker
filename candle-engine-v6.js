@@ -396,6 +396,18 @@ function generateTickV6(state, ctrl, stats) {
   state._acceleration = netForce;
   state._velocity += state._acceleration;
 
+  // ── [v4 LIFE] HESITATION — randomized (fixed pattern না, unpredictable) ─
+  // v4 এর জীবন্ত motion এর মূল। GPT: fixed %6 predictable — random করি
+  // যাতে user timing ধরতে না পারে। মাঝে মাঝে ছোট বিপরীত পা / brake।
+  const hesRoll = Math.random();
+  if (hesRoll < 0.10) {
+    // ~10% — ছোট বিপরীত পা (pullback)
+    state._velocity += -Math.sign(state._velocity || 0) * vBase * (0.25 + Math.random() * 0.25);
+  } else if (hesRoll < 0.17) {
+    // ~7% — brief brake (হঠাৎ ধীর)
+    state._velocity += -(state._velocity || 0) * (0.12 + Math.random() * 0.15);
+  }
+
   // ── [v4.1 DYNAMIC FRICTION] — smooth lerp, wave strength অনুযায়ী ────
   // v4.1 এ friction regime অনুযায়ী smoothly বদলাত (strong trend এ কম
   // damping = বেশি glide, weak এ বেশি damping = ধীর)। v6 এ wave strength
