@@ -8,14 +8,6 @@ const admin = require('firebase-admin');
 const pLimit = require('p-limit');
 const Redis  = require('ioredis');
 const crypto = require('crypto');
-const { generateTick, initCandleState } = require('./candle-engine');
-const { generateTickV3, initStateV3 } = require('./candle-engine-v3');
-const { generateTickV4, initStateV4 } = require('./candle-engine-v4');
-const { generateTickV5, initStateV5 } = require('./candle-engine-v5');
-const { generateTickV6, initStateV6 } = require('./candle-engine-v6');
-
-// Engine toggle — Railway এ CANDLE_ENGINE=v5/v4/v3/v2 দিলে সেটায় ফিরবে
-const CANDLE_ENGINE = process.env.CANDLE_ENGINE || 'v6';
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
@@ -83,7 +75,7 @@ const SUB_INTERVALS = [
 // ── Settlement (candle-close triggered, delay-free) ───────
 const SETTLE_FUNCTION_URL       = 'https://us-central1-goldvest-cf73d.cloudfunctions.net/settleTrade';
 const BATCH_SETTLE_FUNCTION_URL = 'https://us-central1-goldvest-cf73d.cloudfunctions.net/batchSettle';
-const SETTLE_TOKEN        = process.env.SETTLE_TOKEN;
+const SETTLE_TOKEN        = process.env.SETTLE_TOKEN || 'gv_settle_secret_2024';
 
 // ── Batch broadcast — settled trades কে per-user group করে RTDB তে
 // একসাথে push করো, যাতে client একটাই event এ সব trades একসাথে process করে
@@ -125,6 +117,8 @@ async function _batchSettleAndBroadcast(symbol, trades, closePrice) {
   if (!trades || trades.length === 0) return;
 
   // ── live_market_stats: settled trades remove করো ──
+  // transaction এর বদলে increment/decrement — পুরো node delete না করে
+  // নতুন trades এ type/amount আছে, তাই সঠিক decrement হবে
   try {
     let upDec = 0, downDec = 0, upAmt = 0, downAmt = 0;
     let hasTypeInfo = false;
@@ -140,22 +134,12 @@ async function _batchSettleAndBroadcast(symbol, trades, closePrice) {
         curr.down       = Math.max(0, (curr.down       || 0) - downDec);
         curr.upAmount   = Math.max(0, (curr.upAmount   || 0) - upAmt);
         curr.downAmount = Math.max(0, (curr.downAmount || 0) - downAmt);
+        // সব 0 হলে node delete করো
         if ((curr.up || 0) <= 0 && (curr.down || 0) <= 0) return null;
         return curr;
       }).catch(() => {});
-
-      // ── otc_trade_stats decrement — trade-based mode এর জন্য ──
-      db.ref(`otc_trade_stats/${symbol}`).transaction(curr => {
-        if (!curr) return curr;
-        curr.upAmount     = Math.max(0, (curr.upAmount     || 0) - upAmt);
-        curr.downAmount   = Math.max(0, (curr.downAmount   || 0) - downAmt);
-        curr.upCount      = Math.max(0, (curr.upCount      || 0) - upDec);
-        curr.downCount    = Math.max(0, (curr.downCount    || 0) - downDec);
-        curr.totalExposure = Math.max(0, (curr.totalExposure || 0) - upAmt - downAmt);
-        curr.updatedAt    = Date.now();
-        return curr;
-      }).catch(() => {});
     } else {
+      // পুরানো trades (type নেই) — node clear করো
       db.ref('live_market_stats/' + symbol).remove().catch(() => {});
     }
   } catch (e) {}
@@ -300,12 +284,6 @@ const _controls      = {};
 const _activeMarkets = new Set();
 const _forexPrices   = {};
 const _tradeStats    = {};
-
-// ── Exposure Protection — cache ──────────────────────────
-let _exposureConfig         = { enabled: false, threshold: 6 };
-let _exposureConfigLoadTime = 0;
-const _userDepositCache     = new Map(); // userId → { totalDeposits, loadTime }
-const _userTradeDir         = new Map(); // userId → 'up' | 'down' (last trade)
 
 // ── [SHADOW TRACKING - ধাপ ১] In-memory active trades map ──
 // এটি শুধুমাত্র observation/verification এর জন্য — settlement logic এখনও বদলায়নি।
@@ -580,52 +558,6 @@ function saveLiveSubCandle(id, label, candle) {
 // ══════════════════════════════════════════════════════════
 // OTC ENGINE
 // ══════════════════════════════════════════════════════════
-// ── Exposure Protection — bias calculator ────────────────
-// Firestore exposure_config ৬০s cache করে পড়ে।
-// Active trades এর user দের balance/deposit ratio check করে।
-// threshold x+ হলে সেই user এর direction এর বিপরীতে subtle bias return করে।
-// tickOTC() এ price calculation এ যোগ হয় — settlement logic ছোঁয় না।
-async function _loadExposureConfig() {
-  const now = Date.now();
-  if (now - _exposureConfigLoadTime < 60000) return; // 60s cache
-  try {
-    const snap = await firestore.collection('settings').doc('exposure_config').get();
-    if (snap.exists) {
-      const d = snap.data();
-      _exposureConfig = {
-        enabled:   d.enabled   ?? false,
-        threshold: d.threshold ?? 6,
-      };
-    }
-    _exposureConfigLoadTime = now;
-  } catch(e) {}
-}
-
-async function _getUserTotalDeposits(userId) {
-  const cached = _userDepositCache.get(userId);
-  if (cached && Date.now() - cached.loadTime < 300000) return cached.totalDeposits; // 5m cache
-  try {
-    const snap = await firestore.collection('users').doc(userId).get();
-    const totalDeposits = snap.exists ? (snap.data().totalDeposits || 0) : 0;
-    _userDepositCache.set(userId, { totalDeposits, loadTime: Date.now() });
-    return totalDeposits;
-  } catch(e) {
-    return 0;
-  }
-}
-
-async function _getExposureBias(userId, currentBalFloat) {
-  if (!_exposureConfig.enabled) return 0;
-  const totalDeposits = await _getUserTotalDeposits(userId);
-  if (!totalDeposits || totalDeposits <= 0) return 0;
-  const ratio = currentBalFloat / totalDeposits;
-  if (ratio < _exposureConfig.threshold) return 0;
-  // threshold পার করেছে — user এর last trade direction এর বিপরীতে bias
-  const dir = _userTradeDir.get(userId);
-  if (!dir) return 0;
-  return dir === 'up' ? -1 : 1; // -1 = price down bias, +1 = price up bias
-}
-
 function randomTrend() {
   const r = Math.random();
   return r < 0.38 ? 1 : r < 0.76 ? -1 : 0;
@@ -665,7 +597,7 @@ async function initOTC(market) {
     if (!price || price <= 0) price = fixedStart || 1.0;
   }
 
-  _controls[id] = { mode:'trade-based', nextDirection:'auto', volatility:'medium', trendStrength:0.6, speedMultiplier:1.0 };
+  _controls[id] = { mode:'auto', nextDirection:'auto', volatility:'medium', trendStrength:0.6, speedMultiplier:1.0 };
   db.ref(`otc_controls/${id}`).on('value', snap => {
     if (snap.exists()) _controls[id] = { ..._controls[id], ...snap.val() };
   });
@@ -691,13 +623,7 @@ async function initOTC(market) {
     type:'otc', price, candleOpen:price, candleHigh:price, candleLow:price,
     candleTime:start/1000, nextCandle:start+CANDLE_MS,
     trend:0, trendSteps:0,
-    momentum: 0,
     subStates,
-    ...(CANDLE_ENGINE === 'v6' ? initStateV6(price)
-      : CANDLE_ENGINE === 'v5' ? initStateV5(price)
-      : CANDLE_ENGINE === 'v4' ? initStateV4(price)
-      : CANDLE_ENGINE === 'v3' ? initStateV3(price)
-      : initCandleState(price)),
   };
   _activeMarkets.add(id);
 
@@ -707,86 +633,35 @@ async function initOTC(market) {
   console.log(`[${id}] OTC started @ ${price.toFixed(4)}`);
 }
 
-// ── Smooth noise (Perlin-like) — pure Math, no library ──────────────────────
-function _smoothNoise(t) {
-  const i = Math.floor(t);
-  const f = t - i;
-  const u = f * f * (3 - 2 * f); // smoothstep
-  const a = Math.sin(i * 127.1 + 311.7) * 43758.5453;
-  const b = Math.sin((i+1) * 127.1 + 311.7) * 43758.5453;
-  return (a - Math.floor(a)) * (1 - u) + (b - Math.floor(b)) * u;
-}
-
-// ── Market State Machine ─────────────────────────────────────────────────────
-// State গুলো: ranging, uptrend, downtrend, pullback_up, pullback_down, breakout_up, breakout_down
-const MARKET_STATES = ['ranging', 'uptrend', 'downtrend', 'pullback_up', 'pullback_down', 'breakout_up', 'breakout_down'];
-
-function _nextMarketState(current) {
-  const r = Math.random();
-  switch (current) {
-    case 'ranging':       return r < 0.35 ? 'breakout_up' : r < 0.70 ? 'breakout_down' : r < 0.85 ? 'uptrend' : 'downtrend';
-    case 'uptrend':       return r < 0.45 ? 'uptrend' : r < 0.75 ? 'pullback_up' : r < 0.90 ? 'ranging' : 'downtrend';
-    case 'downtrend':     return r < 0.45 ? 'downtrend' : r < 0.75 ? 'pullback_down' : r < 0.90 ? 'ranging' : 'uptrend';
-    case 'pullback_up':   return r < 0.60 ? 'uptrend' : r < 0.85 ? 'ranging' : 'downtrend';
-    case 'pullback_down': return r < 0.60 ? 'downtrend' : r < 0.85 ? 'ranging' : 'uptrend';
-    case 'breakout_up':   return r < 0.65 ? 'uptrend' : r < 0.85 ? 'pullback_up' : 'ranging';
-    case 'breakout_down': return r < 0.65 ? 'downtrend' : r < 0.85 ? 'pullback_down' : 'ranging';
-    default:              return 'ranging';
-  }
-}
-
-function _stateDuration(s) {
-  // tick count (200ms each)
-  switch (s) {
-    case 'ranging':       return 20 + Math.floor(Math.random() * 40); // 4–12s
-    case 'uptrend':       return 15 + Math.floor(Math.random() * 35); // 3–10s
-    case 'downtrend':     return 15 + Math.floor(Math.random() * 35);
-    case 'pullback_up':   return  8 + Math.floor(Math.random() * 12); // 1.6–4s
-    case 'pullback_down': return  8 + Math.floor(Math.random() * 12);
-    case 'breakout_up':   return  5 + Math.floor(Math.random() * 10); // 1–3s
-    case 'breakout_down': return  5 + Math.floor(Math.random() * 10);
-    default:              return 20;
-  }
-}
-
-function _stateBias(s) {
-  switch (s) {
-    case 'uptrend':       return  0.3;
-    case 'downtrend':     return -0.3;
-    case 'pullback_up':   return -0.15;
-    case 'pullback_down': return  0.15;
-    case 'breakout_up':   return  0.4;
-    case 'breakout_down': return -0.4;
-    default:              return  0.0;
-  }
-}
-
 function tickOTC(id) {
   const state = _states[id];
   if (!state || state.type !== 'otc') return;
-  const ctrl  = _controls[id] || {};
-  const stats = _tradeStats[id] || {};
-  const now   = Date.now();
+  const ctrl = _controls[id] || {};
+  const volMul = { low:0.4, medium:1.0, high:2.2 }[ctrl.volatility] || 1.0;
+  const speed = ctrl.speedMultiplier || 1.0;
+  const now = Date.now();
 
-  // ── Candle Engine — price update ─────────────────────────────────────────
-  const _priceBefore = state.price;
-  if (CANDLE_ENGINE === 'v6')      generateTickV6(state, ctrl, stats);
-  else if (CANDLE_ENGINE === 'v5') generateTickV5(state, ctrl, stats);
-  else if (CANDLE_ENGINE === 'v4') generateTickV4(state, ctrl, stats);
-  else if (CANDLE_ENGINE === 'v3') generateTickV3(state, ctrl, stats);
-  else                             generateTick(state, ctrl, stats);
-
-  // DEBUG — বড় jump ধরো (এক tick এ ১% এর বেশি)
-  if (Math.abs(state.price - _priceBefore) > _priceBefore * 0.01) {
-    console.error(`[SPIKE] ${id}: ${_priceBefore.toFixed(5)} → ${state.price.toFixed(5)} | vel=${(state._velocity||0).toFixed(6)} regime=${state._regime}`);
+  if (!ctrl.mode || ctrl.mode === 'auto') {
+    if (state.trendSteps <= 0) { state.trend = randomTrend(); state.trendSteps = Math.round((8+Math.floor(Math.random()*12))/speed); }
+    state.trendSteps--;
+  } else if (ctrl.mode === 'manual') {
+    state.trend = ctrl.nextDirection === 'up' ? 1 : ctrl.nextDirection === 'down' ? -1 : 0;
+    state.trendSteps = 99;
+  } else if (ctrl.mode === 'trade-based') {
+    // Forex engine এর same pattern — majority pool এর দিকে subtle nudge (guaranteed outcome না)
+    const stats = _tradeStats[id] || {};
+    const up    = parseFloat(stats.upAmount)   || 0;
+    const down  = parseFloat(stats.downAmount) || 0;
+    if (up > down * 1.2)        state.trend = -1;
+    else if (down > up * 1.2)   state.trend = 1;
+    else                        state.trend = 0;
+    state.trendSteps = 99;
   }
-  // NaN/Infinity guard
-  if (!isFinite(state.price) || state.price <= 0) {
-    console.error(`[BADPRICE] ${id}: ${state.price} — reset to ${_priceBefore}`);
-    state.price = _priceBefore;
-    state._velocity = 0;
-  }
 
+  const v = state.price * 0.0008 * volMul;
+  const trendComponent  = state.trend * v * (ctrl.trendStrength || 0.6) * 0.35;
+  const randomComponent = (Math.random() - 0.5) * v * 3.2;
+  state.price = Math.max(state.price + (trendComponent + randomComponent) * speed, 0.0001);
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
 
@@ -912,7 +787,7 @@ async function initForex(id) {
   }
   const lastClose = history.length > 0 ? history[history.length-1].close : (lastSaved?.close || 1.0);
   _forexPrices[id] = lastClose;
-  _controls[id] = { mode:'trade-based', nextDirection:'auto' };
+  _controls[id] = { mode:'auto', nextDirection:'auto' };
   db.ref(`otc_controls/${id}`).on('value', snap => {
     if (snap.exists()) _controls[id] = { ..._controls[id], ...snap.val() };
   });
@@ -972,8 +847,8 @@ function tickForex(id) {
     const up    = parseFloat(stats.upAmount)   || 0;
     const down  = parseFloat(stats.downAmount) || 0;
     const v     = realPrice * 0.000025;
-    if (up > down*1.1)    price = realPrice - v*(0.5+Math.random()*0.5);
-    else if (down>up*1.1) price = realPrice + v*(0.5+Math.random()*0.5);
+    if (up > down*1.2)    price = realPrice - v*(0.5+Math.random()*0.5);
+    else if (down>up*1.2) price = realPrice + v*(0.5+Math.random()*0.5);
   }
   state.price = price;
   if (price > state.candleHigh) state.candleHigh = price;
@@ -1066,9 +941,7 @@ async function main() {
   console.log('GoldVest Server starting (Admin SDK)...');
   watchFirestoreMarkets();
   await _recoverLiveTradesFromRTDB();
-  await _loadExposureConfig();
   _startActiveTradesShadowListener();
-
   setInterval(() => {
     _activeMarkets.forEach(id => {
       if (_states[id]?.type === 'otc')   tickOTC(id);
@@ -1076,8 +949,7 @@ async function main() {
     });
     _settleDueTradesFromMemory().catch(e => console.error('[tick-settle] error:', e.message));
     _settleDueTradesFromRTDB().catch(e => console.error('[rtdb-tick-settle] error:', e.message));
-  }, 200);
-
+  }, TICK_MS);
   console.log('Server running ✅');
 }
 main().catch(console.error);
@@ -1113,112 +985,7 @@ http.createServer(async (req, res) => {
     return;
   }
 
-  // ── GET /reset-candle-prices — RTDB এ corrupt OTC candle price reset করো ──
-  // SETTLE_TOKEN দিয়ে authenticate
-  if (req.method === 'GET' && req.url?.startsWith('/reset-candle-prices')) {
-    const token = new URL(req.url, 'http://localhost').searchParams.get('token');
-    if (token !== SETTLE_TOKEN) {
-      res.writeHead(403); res.end('Forbidden'); return;
-    }
-
-    // Symbol → real price mapping
-    const PRICE_MAP = {
-      'BTCOTC':     async () => { const r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT'); const d = await r.json(); return parseFloat(d.price); },
-      'ETHOTC':     async () => { const r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT'); const d = await r.json(); return parseFloat(d.price); },
-      'BNBOTC':     async () => { const r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT'); const d = await r.json(); return parseFloat(d.price); },
-      'SOLOTC':     async () => { const r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT'); const d = await r.json(); return parseFloat(d.price); },
-      'EURUSDOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/EUR'); const d = await r.json(); return d.rates?.USD || 1.08; },
-      'GBPUSDOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/GBP'); const d = await r.json(); return d.rates?.USD || 1.27; },
-      'EURGBPOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/EUR'); const d = await r.json(); return d.rates?.GBP || 0.84; },
-      'USDJPYOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.JPY || 150; },
-      'EURJPYOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/EUR'); const d = await r.json(); return d.rates?.JPY || 162; },
-      'GBPJPYOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/GBP'); const d = await r.json(); return d.rates?.JPY || 190; },
-      'AUDUSDOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/AUD'); const d = await r.json(); return d.rates?.USD || 0.65; },
-      'AUDNZDOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/AUD'); const d = await r.json(); return d.rates?.NZD || 1.08; },
-      'EURAUDOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/EUR'); const d = await r.json(); return d.rates?.AUD || 1.65; },
-      'EURNZDOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/EUR'); const d = await r.json(); return d.rates?.NZD || 1.78; },
-      'NZDUSDOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/NZD'); const d = await r.json(); return d.rates?.USD || 0.60; },
-      'NZDJPYOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/NZD'); const d = await r.json(); return d.rates?.JPY || 90; },
-      'USDCADOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.CAD || 1.36; },
-      'CADCHFOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/CAD'); const d = await r.json(); return d.rates?.CHF || 0.65; },
-      'USDCHFOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.CHF || 0.89; },
-      'INRUSDOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/INR'); const d = await r.json(); return d.rates?.USD || 0.012; },
-      'USDARSOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.ARS || 900; },
-      'USDBRLOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.BRL || 5.0; },
-      'USDMXNOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.MXN || 17; },
-      'MXNUSDOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/MXN'); const d = await r.json(); return d.rates?.USD || 0.058; },
-      'CNYJPYOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/CNY'); const d = await r.json(); return d.rates?.JPY || 21; },
-      'USDIDROTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.IDR || 15600; },
-      'USDNGNOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.NGN || 1550; },
-      'USDPKROTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.PKR || 278; },
-      'USDPHPOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.PHP || 56; },
-      'USDEGPOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.EGP || 30; },
-      'USDCOPOTC':  async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.COP || 4000; },
-      'USDTBDT':    async () => { const r = await fetch('https://open.er-api.com/v6/latest/USD'); const d = await r.json(); return d.rates?.BDT || 110; },
-    };
-
-    const results = [];
-    for (const id of _activeMarkets) {
-      const state = _states[id];
-      if (!state || state.type !== 'otc') continue;
-      try {
-        let newPrice = null;
-
-        // Price map থেকে নাও
-        if (PRICE_MAP[id]) {
-          try { newPrice = await PRICE_MAP[id](); } catch(e) {}
-        }
-
-        // Fallback — Firestore initialPrice
-        if (!newPrice) {
-          const mSnap = await firestore.collection('markets').doc(id).get();
-          if (mSnap.exists && mSnap.data().initialPrice) {
-            newPrice = parseFloat(mSnap.data().initialPrice);
-          }
-        }
-
-        if (!newPrice || newPrice <= 0) { results.push(`${id}: skip (no price)`); continue; }
-
-        // ⚠️ RTDB candle history DELETE করা হচ্ছে না — শুধু in-memory state reset
-        // State reset — server এর current price ঠিক করো
-        state.price      = newPrice;
-        state.candleOpen = newPrice;
-        state.candleHigh = newPrice;
-        state.candleLow  = newPrice;
-        state.momentum   = 0;
-        state.trend      = 0;
-        const now = Date.now();
-        state.candleTime = Math.floor(now / 60000) * 60;
-        state.nextCandle = (state.candleTime + 60) * 1000;
-
-        results.push(`${id}: reset to ${newPrice}`);
-        console.log(`[reset] ${id} price reset to ${newPrice}`);
-      } catch(e) {
-        results.push(`${id}: error ${e.message}`);
-      }
-    }
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end(results.join('\n'));
-    return;
-  }
-
-  // ── GET /delete-all-candles — সব RTDB candle history delete করো ──────────
-  if (req.method === 'GET' && req.url?.startsWith('/delete-all-candles')) {
-    const token = new URL(req.url, 'http://localhost').searchParams.get('token');
-    if (token !== SETTLE_TOKEN) {
-      res.writeHead(403); res.end('Forbidden'); return;
-    }
-    try {
-      await db.ref('otc_candles').remove();
-      console.log('[delete-all-candles] All candle history deleted');
-      res.writeHead(200, { 'Content-Type': 'text/plain' });
-      res.end('All candle history deleted ✅');
-    } catch(e) {
-      res.writeHead(500);
-      res.end('Error: ' + e.message);
-    }
-    return;
-  }
+  // ── POST /place-trade ─────────────────────────────────
   if (req.method === 'POST' && req.url === '/place-trade') {
     try {
       // 1. Body parse
@@ -1246,12 +1013,6 @@ http.createServer(async (req, res) => {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid trade data' })); return;
       }
 
-      // Max trade amount — $1000 per trade
-      const MAX_TRADE_AMOUNT = 1000;
-      if (amount > MAX_TRADE_AMOUNT) {
-        res.writeHead(400); res.end(JSON.stringify({ error: `Maximum trade amount is $${MAX_TRADE_AMOUNT}` })); return;
-      }
-
       // 3. Redis balance check + atomic deduct
       const balKey = BAL_KEY_OTC(userId);
       let currentBal = await redisPub.get(balKey);
@@ -1276,43 +1037,6 @@ http.createServer(async (req, res) => {
 
       console.log(`[place-trade] userId=${userId} tradeId=${tradeId} amount=${amount} newBal=${newBal}`);
 
-      // ── Exposure Protection — user এর last trade direction save ──
-      if (trade.type === 'up' || trade.type === 'down') {
-        _userTradeDir.set(userId, trade.type);
-      }
-
-      // ── Trade Stats update — trade-based mode এর জন্য ──
-      const symbol = trade.symbol || '';
-      if (symbol && (trade.type === 'up' || trade.type === 'down')) {
-        const statsRef = db.ref(`otc_trade_stats/${symbol}`);
-        const field = trade.type === 'up' ? 'upAmount' : 'downAmount';
-        const countField = trade.type === 'up' ? 'upCount' : 'downCount';
-        statsRef.transaction(curr => {
-          if (!curr) curr = { upAmount: 0, downAmount: 0, upCount: 0, downCount: 0, totalExposure: 0 };
-          curr[field]       = (curr[field]       || 0) + amount;
-          curr[countField]  = (curr[countField]  || 0) + 1;
-          curr.totalExposure = (curr.totalExposure || 0) + amount;
-          curr.updatedAt    = Date.now();
-          return curr;
-        }).catch(e => console.warn('[trade-stats] update failed:', e.message));
-      }
-
-      // 4a. Firestore থেকে market এর real payout নাও — client value বিশ্বাস করা হচ্ছে না
-      let verifiedPayout = 92; // safe fallback
-      try {
-        const mSnap = await firestore.collection('markets').doc(trade.symbol || '').get();
-        if (mSnap.exists) {
-          const mData = mSnap.data();
-          const duration = parseFloat(trade.duration || 0);
-          // 5 মিনিট (300s) বা তার বেশি হলে payout5, না হলে payout
-          verifiedPayout = (duration >= 300 && mData.payout5)
-            ? mData.payout5
-            : (mData.payout || 92);
-        }
-      } catch(e) {
-        console.warn('[place-trade] market payout fetch failed, using fallback:', e.message);
-      }
-
       // 4. Redis Hash এ trade data save — settler <1ms এ পাবে
       await redisPub.hset(TRADE_KEY_OTC(tradeId),
         'userId',          userId,
@@ -1320,7 +1044,7 @@ http.createServer(async (req, res) => {
         'entryPrice',      String(trade.entryPrice || 0),
         'amount',          String(amount),
         'type',            trade.type || '',
-        'payoutPercent',   String(verifiedPayout), // Firestore verified — client value ignore
+        'payoutPercent',   String(trade.payoutPercent || 92),
         'status',          'live',
         'accountType',     'live',
         'expiryTimestamp', String(trade.expiryTimestamp || 0),
