@@ -395,32 +395,29 @@ function generateTickV6(state, ctrl, stats) {
   // v3 physics: acceleration = force (সরাসরি, target-chasing না)
   state._acceleration = netForce;
   state._velocity += state._acceleration;
-  // একটাই friction (v3 এর 0.86) — family অনুযায়ী সামান্য ভিন্ন
-  state._velocity *= (state._famFriction || 0.86);
+
+  // ── [v4.1 DYNAMIC FRICTION] — smooth lerp, wave strength অনুযায়ী ────
+  // v4.1 এ friction regime অনুযায়ী smoothly বদলাত (strong trend এ কম
+  // damping = বেশি glide, weak এ বেশি damping = ধীর)। v6 এ wave strength
+  // দিয়ে সেই effect আনি — এটাই v4.1 এর জীবন্ত motion এর মূল।
+  if (state._friction === undefined) state._friction = 0.85;
+  let frictionTarget;
+  const ws = state._waveStrength || 0.5;
+  if (ws > 0.7)      frictionTarget = 0.90; // strong wave — কম damping, বেশি glide
+  else if (ws < 0.45) frictionTarget = 0.78; // weak wave — বেশি damping, ধীর
+  else               frictionTarget = 0.84;
+  state._friction += (frictionTarget - state._friction) * 0.08; // smooth lerp
+  state._velocity *= Math.max(0.70, Math.min(0.94, state._friction));
 
   // velocity clamp
   const maxVel = vBase * (state._physMaxVel || 2.2);
   state._velocity = Math.max(-maxVel, Math.min(maxVel, state._velocity));
 
-  // ── [GPT: LIFE] imperfections — jerk / dead-tick / burst ────────────
-  if (state._impTick === undefined || state._impTick <= 0) {
-    const roll = Math.random();
-    if (roll < 0.06)      { state._impMode = 'dead';  state._impTick = 2 + (Math.random()*2|0); }
-    else if (roll < 0.12) { state._impMode = 'burst'; state._impTick = 1 + (Math.random()*2|0); }
-    else if (roll < 0.20) { state._impMode = 'jerk';  state._impTick = 2 + (Math.random()*3|0); }
-    else                  { state._impMode = 'normal';state._impTick = 3 + (Math.random()*8|0); }
-  }
-  state._impTick--;
-  let impMul = 1.0;
-  if (state._impMode === 'dead')       impMul = 0.15 + Math.random()*0.15;
-  else if (state._impMode === 'burst') impMul = 1.4 + Math.random()*0.5;
-  else if (state._impMode === 'jerk')  impMul = 0.5 + Math.random()*0.9;
-
   // noise price এ সরাসরি (tick texture)
   const noiseTick = _perlin1D(state._noiseSeed, state._noiseX) * vBase * (state._famNoiseScale || 0.22);
 
-  // ── price = velocity + noise, imperfection সহ (v3 এর মতো সরল) ────────
-  let delta = (state._velocity + noiseTick) * impMul * speed;
+  // ── price = velocity + noise (v4.1 এর মতো সরল, imperfection ছাড়া) ────
+  let delta = (state._velocity + noiseTick) * speed;
   const maxStep = state.price * 0.0015;
   delta = Math.max(-maxStep, Math.min(maxStep, delta));
   state.price = Math.max(state.price + delta, 0.0001);
