@@ -121,6 +121,7 @@ function _newWave(state) {
   state._famMedPullback = fp.medPullback;
   state._famNoiseScale  = fp.noiseScale;
   state._famSigStrength = fp.sigStrength;
+  state._famFriction    = fp.friction || 0.86;
 
   // [GPT FIX] _newWave শুধু wave তৈরি করে — velocity এখানে modify করি না।
   // carry-over এর intent সংরক্ষণ করি, প্রয়োগ হয় generateTickV6 এ।
@@ -149,21 +150,21 @@ const _FAMILY_PHYSICS = {
   momentum: {
     accel: 0.10, damping: 0.90, maxVel: 1.8, blend: 12,
     medStrength: 0.9, medPullback: 0.35, noiseScale: 0.22,
-    durMin: 35, durMax: 70,      // লম্বা — ধীর দীর্ঘ trend
+    durMin: 35, durMax: 70, friction: 0.88,
     strMin: 0.45, strMax: 0.75,  // মাঝারি
     sigStrength: 0.10,           // smooth (কম direct signature)
   },
   impulse: {
     accel: 0.26, damping: 0.80, maxVel: 2.6, blend: 5,
     medStrength: 0.5, medPullback: 0.18, noiseScale: 0.32,
-    durMin: 8, durMax: 20,       // ছোট — দ্রুত burst
+    durMin: 8, durMax: 20, friction: 0.82,
     strMin: 0.80, strMax: 1.10,  // শক্তিশালী
     sigStrength: 0.50,           // strong burst (বেশি direct)
   },
   elastic: {
     accel: 0.16, damping: 0.95, maxVel: 2.0, blend: 8,
     medStrength: 1.3, medPullback: 0.60, noiseScale: 0.16,
-    durMin: 18, durMax: 42,      // মাঝারি
+    durMin: 18, durMax: 42, friction: 0.90,
     strMin: 0.40, strMax: 0.80,
     sigStrength: 0.28,           // bounce
   },
@@ -273,7 +274,7 @@ function generateTickV6(state, ctrl, stats) {
   const now    = Date.now();
 
   // Base movement unit — price এর ০.০৩%
-  const vBase = state.price * 0.0003 * volCfg;
+  const vBase = state.price * 0.0002 * volCfg;
 
   // ── Perlin advance (micro noise) ─────────────────────────────────────
   if (state._noiseX === undefined) state._noiseX = Math.random()*1000;
@@ -375,65 +376,58 @@ function generateTickV6(state, ctrl, stats) {
     if (tb !== 0 && tLeft <= 8000 && tLeft > 0) tradeForce = tb * 0.25;
   }
 
-  // ── ACCELERATION → VELOCITY → PRICE (proper physics pipeline) ────────
-  if (state._velocity === undefined)     state._velocity = 0;
-  if (state._acceleration === undefined) state._acceleration = 0;
+  // ── [v6.1] v3-STYLE INTEGRATOR — force → velocity → price ────────────
+  // GPT: v3 এর motion জীবন্ত ছিল কারণ সরল। target-chasing, triple
+  // smoothing, famSignature সব বাদ। শুধু force→velocity→friction→price।
+  // v6 এর সব feature (family, medium, liquidity, noise) থাকছে — শুধু
+  // integration v3 এর মতো সরল।
+  if (state._velocity === undefined) state._velocity = 0;
 
-  // [GPT FIX] carry-over এখানে প্রয়োগ (physics generateTick এ, _newWave এ না)।
+  // carry-over (wave শুরুতে)
   if (state._justStartedWave) {
     state._justStartedWave = false;
     state._velocity = (state._velocity || 0) * (state._carryOverSameDir ? 0.85 : 0.5);
   }
 
-  const targetVel = (waveForce + liqForce + tradeForce) * vBase;
+  // net force — v6 wave force বড়, তাই scale করি (v3 এর মতো moderate)
+  const netForce = (waveForce + medComponent * 0.9 + liqForce + tradeForce) * vBase * 0.35;
 
-  // [GPT: physics না, animation] integrator অতিরিক্ত smooth ছিল — এটাই
-  // ৮০% সমস্যা। double-smoothing সরালাম, acceleration সরাসরি প্রয়োগ।
-  const accel = (targetVel - state._velocity) * (state._physAccel || 0.16);
-  state._acceleration = accel; // আর smooth করি না (responsive)
-  state._acceleration *= (state._physDamping || 0.9);
+  // v3 physics: acceleration = force (সরাসরি, target-chasing না)
+  state._acceleration = netForce;
   state._velocity += state._acceleration;
 
-  // ── [GPT: LIFE] imperfections — jerk / dead-tick / burst ────────────
-  // v4 জীবন্ত লাগত কারণ imperfection ছিল। এগুলো ফেরাই।
-  if (state._impTick === undefined || state._impTick <= 0) {
-    const roll = Math.random();
-    if (roll < 0.06) {
-      // dead tick — হঠাৎ প্রায় freeze (২-৩ tick)
-      state._impMode = 'dead'; state._impTick = 2 + (Math.random()*2|0);
-    } else if (roll < 0.12) {
-      // burst — হঠাৎ jump (১-২ tick)
-      state._impMode = 'burst'; state._impTick = 1 + (Math.random()*2|0);
-    } else if (roll < 0.20) {
-      // jerk — uneven acceleration (২-৪ tick)
-      state._impMode = 'jerk'; state._impTick = 2 + (Math.random()*3|0);
-    } else {
-      state._impMode = 'normal'; state._impTick = 3 + (Math.random()*8|0);
-    }
+  // ── [v4 LIFE] HESITATION — randomized, unpredictable ────────────────
+  // v4 এর জীবন্ত motion এর মূল। মাঝে মাঝে ছোট বিপরীত পা বা brake —
+  // price একটানা মসৃণ যায় না, motion/animation আসে। body নষ্ট করে না।
+  const hesRoll = Math.random();
+  if (hesRoll < 0.10) {
+    state._velocity += -Math.sign(state._velocity || 0) * vBase * (0.25 + Math.random() * 0.25);
+  } else if (hesRoll < 0.17) {
+    state._velocity += -(state._velocity || 0) * (0.12 + Math.random() * 0.15);
   }
-  state._impTick--;
-  let impMul = 1.0;
-  if (state._impMode === 'dead')  impMul = 0.15 + Math.random()*0.15;       // প্রায় থেমে
-  else if (state._impMode === 'burst') impMul = 1.4 + Math.random()*0.5;    // হঠাৎ jump
-  else if (state._impMode === 'jerk')  impMul = 0.5 + Math.random()*0.9;    // uneven
 
-  const maxVel = vBase * (state._physMaxVel || 1.8);
+  // ── [v4.1 DYNAMIC FRICTION] — smooth lerp, wave strength অনুযায়ী ────
+  // v4.1 এ friction regime অনুযায়ী smoothly বদলাত (strong trend এ কম
+  // damping = বেশি glide, weak এ বেশি damping = ধীর)। v6 এ wave strength
+  // দিয়ে সেই effect আনি — এটাই v4.1 এর জীবন্ত motion এর মূল।
+  if (state._friction === undefined) state._friction = 0.85;
+  let frictionTarget;
+  const ws = state._waveStrength || 0.5;
+  if (ws > 0.7)      frictionTarget = 0.90; // strong wave — কম damping, বেশি glide
+  else if (ws < 0.45) frictionTarget = 0.78; // weak wave — বেশি damping, ধীর
+  else               frictionTarget = 0.84;
+  state._friction += (frictionTarget - state._friction) * 0.08; // smooth lerp
+  state._velocity *= Math.max(0.70, Math.min(0.94, state._friction));
+
+  // velocity clamp
+  const maxVel = vBase * (state._physMaxVel || 2.2);
   state._velocity = Math.max(-maxVel, Math.min(maxVel, state._velocity));
 
-  // ── price = velocity (macro trend) + medium swing + noise ────────────
-  // GPT multi-timeframe: velocity macro trend দেয় (smooth)। Medium swing
-  // ও noise সরাসরি price এ যোগ হয় (velocity bypass) — short-term up-down
-  // বাঁচে, user পরের tick predict করতে পারে না, কিন্তু trend থাকে।
-  const medMove   = medComponent * vBase * 0.9;
+  // noise price এ সরাসরি (tick texture)
   const noiseTick = _perlin1D(state._noiseSeed, state._noiseX) * vBase * (state._famNoiseScale || 0.22);
 
-  // [GPT] famSignature family অনুযায়ী — impulse burst (0.50), momentum
-  // smooth (0.10), elastic bounce (0.28)। এক signal দুইবার যাওয়ার
-  // overshoot এড়াতে family-tuned।
-  const famSignature = macroComponent * vBase * (state._famSigStrength || 0.25);
-
-  // impMul (dead/burst/jerk) delta তে প্রয়োগ — এটাই "জীবন্ত" feel দেয়।
-  let delta = (state._velocity * 0.6 + famSignature + medMove + noiseTick) * impMul * speed;
+  // ── price = velocity + noise (v4.1 এর মতো সরল, imperfection ছাড়া) ────
+  let delta = (state._velocity + noiseTick) * speed;
   const maxStep = state.price * 0.0015;
   delta = Math.max(-maxStep, Math.min(maxStep, delta));
   state.price = Math.max(state.price + delta, 0.0001);
@@ -469,6 +463,7 @@ function initStateV6(price) {
     _famMedPullback: 0.35,
     _famNoiseScale:  0.22,
     _famSigStrength: 0.25,
+    _famFriction:   0.86,
     _impTick:       0,
     _impMode:       "normal",
     _waveDuration:  0,
