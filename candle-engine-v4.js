@@ -380,3 +380,4 @@ function initStateV4(price) {
 }
 
 module.exports = { generateTickV4, initStateV4 };
+
