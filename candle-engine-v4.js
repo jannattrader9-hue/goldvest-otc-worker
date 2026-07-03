@@ -248,21 +248,6 @@ function generateTickV4(state, ctrl, stats) {
   const rp = _regimeParams(state._regime, state._grabDir);
   const v  = vBase * rp.vol;
 
-  // ── [body fix] DIRECTIONAL CANDLE MEMORY ────────────────────────────
-  // প্রতি নতুন candle এ একটা bias ঠিক হয় (bullish/bearish) এবং পুরো
-  // candle জুড়ে ধরে রাখে — price এক দিকে বেশি যায় → বড় body, ছোট wick।
-  if (state._candleMemOpen !== state.candleOpen) {
-    state._candleMemOpen = state.candleOpen;
-    const lean = rp.trend + (Math.random() - 0.5) * 0.7;
-    state._candlePersonality = lean > 0.1 ? 1 : lean < -0.1 ? -1 : 0;
-    state._candleConviction = 0.4 + Math.random() * 0.5;
-  }
-  // candle bias — শেষ ২০% এ দুর্বল (natural close pullback)
-  let pScale = 1.0;
-  const tLeft = state.nextCandle ? (state.nextCandle - now) : 60000;
-  const cProg = 1 - (tLeft / 60000);
-  if (cProg > 0.9) pScale = 0.5; else if (cProg > 0.7) pScale = 0.8;
-  const candleBiasForce = (state._candlePersonality || 0) * v * (state._candleConviction || 0.4) * 0.35 * pScale;
   // ── [v4.1] SMART TICK CLUSTERING ────────────────────────────────────
   // Cluster direction pure random না — regime bias + velocity + আগের
   // cluster মিলিয়ে ঠিক হয়। Duration ও volatility অনুযায়ী variable।
@@ -283,9 +268,7 @@ function generateTickV4(state, ctrl, stats) {
     state._clusterStr  = 0.3 + Math.random() * 0.5;
   }
   state._clusterTick--;
-  // [body fix] cluster force বাড়ানো 0.18 → 0.35 — price এক দিকে বেশি
-  // যায়, candle এর মধ্যে directional persistence → বড় body।
-  const clusterForce = state._clusterDir * v * state._clusterStr * 0.35;
+  const clusterForce = state._clusterDir * v * state._clusterStr * 0.18;
 
   // ── FORCE 1: Trend force (regime direction) ─────────────────────────
   let trendForce = rp.trend * v * 0.5;
@@ -309,9 +292,7 @@ function generateTickV4(state, ctrl, stats) {
   // ── FORCE 4: Mean reversion (v3 simple anchor) ──────────────────────
   if (state._anchor === undefined) state._anchor = state.price;
   state._anchor = state._anchor * 0.998 + state.price * 0.002;
-  // [body fix] reversion কমানো 0.05 → 0.02 — price open এ ফিরে আসে না,
-  // তাই close open থেকে দূরে থাকে → বড় body, ছোট wick।
-  const reversionForce = (state._anchor - state.price) * 0.02 * rp.rev;
+  const reversionForce = (state._anchor - state.price) * 0.05 * rp.rev;
 
   // ── FORCE 5: Micro hesitation (human behaviour) ─────────────────────
   // প্রতি কয়েক tick এ ছোট বিপরীত পা — trend এও hesitation
@@ -319,8 +300,8 @@ function generateTickV4(state, ctrl, stats) {
   state._hesTick++;
   let hesitationForce = 0;
   const hesPhase = state._hesTick % 6;
-  if (hesPhase === 4) hesitationForce = -Math.sign(state._velocity || 0) * v * 0.12;
-  if (hesPhase === 5) hesitationForce = -(state._velocity || 0) * 0.06; // brief brake
+  if (hesPhase === 4) hesitationForce = -Math.sign(state._velocity || 0) * v * 0.3;
+  if (hesPhase === 5) hesitationForce = -(state._velocity || 0) * 0.15; // brief brake
 
   // ── FORCE 6: Trade-based close push (শেষ ৮s, subtle) ────────────────
   let closePush = 0;
@@ -332,7 +313,7 @@ function generateTickV4(state, ctrl, stats) {
   }
 
   // ── PHYSICS: net force → acceleration → velocity → price ────────────
-  const netForce = trendForce + candleBiasForce + clusterForce + noiseForce + liqForce + reversionForce + hesitationForce + closePush;
+  const netForce = trendForce + clusterForce + noiseForce + liqForce + reversionForce + hesitationForce + closePush;
 
   if (state._velocity === undefined)     state._velocity = 0;
   if (state._acceleration === undefined) state._acceleration = 0;
@@ -384,9 +365,6 @@ function initStateV4(price) {
     _noiseX:       Math.random() * 1000,
     _noiseSeed:    (Math.random() * 1e9) | 0,
     _anchor:       price,
-    _candleMemOpen: null,
-    _candlePersonality: 0,
-    _candleConviction: 0.4,
     _liq:          [],
     _swingTick:    0,
     _recentHigh:   price,
