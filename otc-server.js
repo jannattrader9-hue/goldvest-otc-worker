@@ -15,7 +15,7 @@ const { generateTickV5, initStateV5 } = require('./candle-engine-v5');
 const { generateTickV6, initStateV6 } = require('./candle-engine-v6');
 
 // Engine toggle — Railway এ CANDLE_ENGINE=v5/v4/v3/v2 দিলে সেটায় ফিরবে
-const CANDLE_ENGINE = process.env.CANDLE_ENGINE || 'v6';
+const CANDLE_ENGINE = process.env.CANDLE_ENGINE || 'v4';
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
