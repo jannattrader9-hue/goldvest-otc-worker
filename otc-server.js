@@ -660,8 +660,23 @@ function tickOTC(id) {
 
   const v = state.price * 0.0008 * volMul;
   const trendComponent  = state.trend * v * (ctrl.trendStrength || 0.6) * 0.35;
-  const randomComponent = (Math.random() - 0.5) * v * 3.2;
-  state.price = Math.max(state.price + (trendComponent + randomComponent) * speed, 0.0001);
+  const randomComponent = (Math.random() - 0.5) * v * 1.6; // momentum যোগ হওয়ায় কমানো হলো
+
+  // ── [REALISTIC MOTION] velocity/momentum — force সরাসরি price না বদলে
+  // আগে velocity (গতি) বদলায়, velocity ধীরে price বদলায়। এতে price এক
+  // দিকে গেলে সেই গতি বজায় থাকে (glide), প্রতি tick এলোমেলো কাঁপে না।
+  if (state._velocity === undefined) state._velocity = 0;
+  state._velocity += (trendComponent + randomComponent);
+  state._velocity *= 0.85; // friction — গতি ধীরে কমে
+
+  // safety — velocity সীমাহীন বাড়তে পারবে না (candle অতিরিক্ত বড় রোধ)
+  const maxVel = v * 1.6;
+  state._velocity = Math.max(-maxVel, Math.min(maxVel, state._velocity));
+
+  let delta = state._velocity * speed;
+  const maxStep = state.price * 0.0015; // hard safety — প্রতি tick max ±0.15%
+  delta = Math.max(-maxStep, Math.min(maxStep, delta));
+  state.price = Math.max(state.price + delta, 0.0001);
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
 
