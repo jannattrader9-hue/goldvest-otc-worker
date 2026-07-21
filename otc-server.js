@@ -769,18 +769,20 @@ function tickOTC(id) {
     const cTimeLeft = state.nextCandle - now;
     const cProg = 1 - (cTimeLeft / CANDLE_MS);
     if (cProg > 0.9) pScale = 0.5; else if (cProg > 0.7) pScale = 0.8;
-    const candleBiasForce = (state._candlePersonality || 0) * v * (state._candleConviction || 0.4) * 0.4 * pScale;
+    const candleBiasForce = (state._candlePersonality || 0) * v * (state._candleConviction || 0.4) * 0.28 * pScale;
 
     // Tick clustering — কয়েক tick ধরে এক দিকে থাকার প্রবণতা (body বড় করে)
+    // [UNPREDICTABILITY FIX] duration কমানো (৫s trader window এর সাথে
+    // মিলে predictable হচ্ছিল) + strength কমানো।
     if (state._clusterTick === undefined || state._clusterTick <= 0) {
       const bias = (rp.trend * (state._regimeDir || 1)) + (state._candlePersonality || 0) * 0.5;
       const pUp  = 0.5 + Math.max(-0.4, Math.min(0.4, bias * 0.35));
       state._clusterDir = Math.random() < pUp ? 1 : -1;
-      state._clusterTick = 5 + (Math.random() * 12 | 0);
-      state._clusterStr  = 0.4 + Math.random() * 0.5;
+      state._clusterTick = 3 + (Math.random() * 6 | 0); // 3–9 tick (আগে 5–17)
+      state._clusterStr  = 0.25 + Math.random() * 0.35; // আগে 0.4–0.9
     }
     state._clusterTick--;
-    const clusterForce = state._clusterDir * v * state._clusterStr * 0.3;
+    const clusterForce = state._clusterDir * v * state._clusterStr * 0.22;
 
     // Regime trend force
     const trendForce = rp.trend * (state._regimeDir || 1) * v * 0.3;
@@ -806,8 +808,12 @@ function tickOTC(id) {
     netForce = trendForce + candleBiasForce + clusterForce + noiseForce + levelForce + reversionForce;
 
     // Dynamic friction — regime অনুযায়ী smooth lerp (trending এ বেশি glide)
+    // [UNPREDICTABILITY FIX] friction একটু কমানো হলো — momentum কম সময়
+    // ধরে থাকবে, ৫-১০ সেকেন্ডে trader "এখন উপরে, তাই পরেও উপরে যাবে"
+    // এই ধরনের নিশ্চিত অনুমান করতে পারবে না।
     if (state._friction === undefined) state._friction = 0.85;
-    state._friction += (rp.friction - state._friction) * 0.08;
+    const rpFrictionAdj = Math.max(0.60, rp.friction - 0.15);
+    state._friction += (rpFrictionAdj - state._friction) * 0.08;
   } else {
     // manual / trade-based — আগের মতোই সরল trend+random (override predictable রাখতে)
     v = state.price * 0.0008 * volMul;
@@ -817,10 +823,25 @@ function tickOTC(id) {
     state._friction = 0.85;
   }
 
+  // ── [UNPREDICTABILITY] HESITATION — মাঝে মাঝে randomized ছোট বিপরীত পা ─
+  // GPT/অভিজ্ঞতা: fixed pattern (%N tick) predictable হয়ে যায়, তাই এখানে
+  // প্রতি tick এ random roll — user "পরের tick কী হবে" নিশ্চিত বুঝতে
+  // পারবে না, বিশেষ করে ৫s/১০s trade এ যেটা সবচেয়ে জরুরি।
+  if ((!ctrl.mode || ctrl.mode === 'auto') && state._velocity !== undefined) {
+    const hesRoll = Math.random();
+    if (hesRoll < 0.16) {
+      // ছোট বিপরীত পা — momentum হঠাৎ উল্টো দিকে সামান্য ঠেলে
+      state._velocity += -Math.sign(state._velocity || 0) * v * (0.4 + Math.random() * 0.4);
+    } else if (hesRoll < 0.28) {
+      // হঠাৎ ধীর/থামা — পরের tick এ কী হবে অনুমান কঠিন করে
+      state._velocity *= (0.3 + Math.random() * 0.3);
+    }
+  }
+
   // ── NET FORCE → velocity (momentum) → price, safety clamp সহ ──────────
   if (state._velocity === undefined) state._velocity = 0;
   state._velocity += netForce;
-  state._velocity *= Math.max(0.70, Math.min(0.94, state._friction || 0.85));
+  state._velocity *= Math.max(0.65, Math.min(0.90, state._friction || 0.85));
   const maxVel = v * 1.8;
   state._velocity = Math.max(-maxVel, Math.min(maxVel, state._velocity));
 
@@ -828,6 +849,7 @@ function tickOTC(id) {
   const maxStep = state.price * 0.0015; // hard safety — প্রতি tick max ±0.15%
   delta = Math.max(-maxStep, Math.min(maxStep, delta));
   state.price = Math.max(state.price + delta, 0.0001);
+
 
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
