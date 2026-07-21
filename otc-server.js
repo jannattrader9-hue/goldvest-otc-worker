@@ -556,11 +556,75 @@ function saveLiveSubCandle(id, label, candle) {
 }
 
 // ══════════════════════════════════════════════════════════
-// OTC ENGINE
+// OTC ENGINE — REALISTIC PHYSICS
 // ══════════════════════════════════════════════════════════
 function randomTrend() {
   const r = Math.random();
   return r < 0.38 ? 1 : r < 0.76 ? -1 : 0;
+}
+
+// ── Smooth correlated noise (Perlin-style) — pure random না ──────────────
+// Real market এ প্রতি tick সম্পূর্ণ independent হয় না, একটু আগের সাথে
+// সম্পর্কিত থাকে। এটা সেই "smooth randomness" দেয়।
+function _hash(seed, i) {
+  let h = seed + i * 374761393;
+  h = (h ^ (h >>> 13)) * 1274126177;
+  h = h ^ (h >>> 16);
+  return h >>> 0;
+}
+function _smoothNoise(seed, x) {
+  const x0 = Math.floor(x), x1 = x0 + 1, dx = x - x0;
+  const g0 = ((_hash(seed, x0) & 1) === 0 ? dx : -dx);
+  const g1 = ((_hash(seed, x1) & 1) === 0 ? (dx - 1) : -(dx - 1));
+  const fade = dx * dx * dx * (dx * (dx * 6 - 15) + 10);
+  return (g0 + fade * (g1 - g0)) * 2; // ~-1..1
+}
+
+// ── REGIME — market এর বর্তমান "মেজাজ" ───────────────────────────────────
+// trending: এক দিকে জোরালো চলে (বড় body), ranging: এলোমেলো (ছোট body),
+// calm: শান্ত ধীর, breakout: হঠাৎ শক্তিশালী move।
+const _REGIMES = {
+  trending: { vol: 1.15, trend: 1.0,  friction: 0.90, dur: [35, 80] },
+  ranging:  { vol: 0.75, trend: 0.15, friction: 0.78, dur: [25, 60] },
+  calm:     { vol: 0.5,  trend: 0.25, friction: 0.82, dur: [30, 65] },
+  breakout: { vol: 1.5,  trend: 1.3,  friction: 0.92, dur: [12, 30] },
+};
+function _nextRegime(cur) {
+  const r = Math.random();
+  if (cur === 'trending') return r < 0.40 ? 'ranging' : r < 0.60 ? 'calm' : r < 0.82 ? 'trending' : 'breakout';
+  if (cur === 'ranging')  return r < 0.35 ? 'trending' : r < 0.55 ? 'breakout' : r < 0.80 ? 'calm' : 'ranging';
+  if (cur === 'breakout') return r < 0.60 ? 'trending' : r < 0.82 ? 'ranging' : 'calm';
+  return r < 0.40 ? 'ranging' : r < 0.72 ? 'trending' : 'calm'; // calm
+}
+function _regimeDur(name) {
+  const [lo, hi] = _REGIMES[name].dur;
+  return lo + (Math.random() * (hi - lo) | 0);
+}
+
+// ── SUPPORT / RESISTANCE — swing level মনে রাখা + bounce ────────────────
+function _updateLevels(state) {
+  if (!state._levels) state._levels = [];
+  state._swingTick = (state._swingTick || 0) + 1;
+  const p = state.price;
+  if (!state._recentHigh || p > state._recentHigh) state._recentHigh = p;
+  if (!state._recentLow  || p < state._recentLow)  state._recentLow  = p;
+  if (state._swingTick % 45 === 0) {
+    if (state._recentHigh) state._levels.push({ price: state._recentHigh, s: 1.0 });
+    if (state._recentLow)  state._levels.push({ price: state._recentLow,  s: 1.0 });
+    state._recentHigh = p; state._recentLow = p;
+    state._levels.forEach(l => l.s *= 0.9);
+    state._levels = state._levels.filter(l => l.s > 0.25).slice(-10);
+  }
+}
+function _levelForce(state, v) {
+  if (!state._levels || state._levels.length === 0) return 0;
+  const p = state.price;
+  let force = 0;
+  for (const l of state._levels) {
+    const distPct = Math.abs(l.price - p) / p;
+    if (distPct < 0.0012) force += -Math.sign(l.price - p) * v * 0.5 * l.s; // bounce
+  }
+  return force;
 }
 
 async function backfillOTC(id, lastTime, lastPrice) {
@@ -624,6 +688,25 @@ async function initOTC(market) {
     candleTime:start/1000, nextCandle:start+CANDLE_MS,
     trend:0, trendSteps:0,
     subStates,
+    // ── realistic engine state ──
+    _regime: 'ranging',
+    _regimeTick: _regimeDur('ranging'),
+    _regimeDir: Math.random() < 0.5 ? 1 : -1,
+    _candleMemOpen: null,
+    _candlePersonality: 0,
+    _candleConviction: 0.4,
+    _clusterTick: 5 + (Math.random()*12|0),
+    _clusterDir: Math.random() < 0.5 ? 1 : -1,
+    _clusterStr: 0.4 + Math.random()*0.5,
+    _noiseX: Math.random()*1000,
+    _noiseSeed: (Math.random()*1e9)|0,
+    _levels: [],
+    _swingTick: 0,
+    _recentHigh: price,
+    _recentLow: price,
+    _anchor: price,
+    _velocity: 0,
+    _friction: 0.85,
   };
   _activeMarkets.add(id);
 
@@ -642,8 +725,14 @@ function tickOTC(id) {
   const now = Date.now();
 
   if (!ctrl.mode || ctrl.mode === 'auto') {
-    if (state.trendSteps <= 0) { state.trend = randomTrend(); state.trendSteps = Math.round((8+Math.floor(Math.random()*12))/speed); }
-    state.trendSteps--;
+    // ── [REALISTIC] Regime state machine — market এর মেজাজ বদলায় ────────
+    if (!state._regime) { state._regime = 'ranging'; state._regimeTick = _regimeDur('ranging'); }
+    state._regimeTick--;
+    if (state._regimeTick <= 0) {
+      state._regime = _nextRegime(state._regime);
+      state._regimeTick = _regimeDur(state._regime);
+      state._regimeDir = Math.random() < 0.5 ? 1 : -1;
+    }
   } else if (ctrl.mode === 'manual') {
     state.trend = ctrl.nextDirection === 'up' ? 1 : ctrl.nextDirection === 'down' ? -1 : 0;
     state.trendSteps = 99;
@@ -658,25 +747,88 @@ function tickOTC(id) {
     state.trendSteps = 99;
   }
 
-  const v = state.price * 0.0008 * volMul;
-  const trendComponent  = state.trend * v * (ctrl.trendStrength || 0.6) * 0.35;
-  const randomComponent = (Math.random() - 0.5) * v * 1.6; // momentum যোগ হওয়ায় কমানো হলো
+  // ═══════════════════════════════════════════════════════════════════
+  // [REALISTIC ENGINE] regime + candle memory + cluster + S/R + smooth noise
+  // ═══════════════════════════════════════════════════════════════════
+  let netForce, v;
 
-  // ── [REALISTIC MOTION] velocity/momentum — force সরাসরি price না বদলে
-  // আগে velocity (গতি) বদলায়, velocity ধীরে price বদলায়। এতে price এক
-  // দিকে গেলে সেই গতি বজায় থাকে (glide), প্রতি tick এলোমেলো কাঁপে না।
+  if (!ctrl.mode || ctrl.mode === 'auto') {
+    const rp = _REGIMES[state._regime] || _REGIMES.ranging;
+    v = state.price * 0.00042 * volMul * rp.vol;
+
+    // Directional candle memory — প্রতি candle এর নিজস্ব personality।
+    // এটা body বড় করে (open→close দূরত্ব বাড়ায়), wick কমায়।
+    if (state._candleMemOpen !== state.candleOpen) {
+      state._candleMemOpen = state.candleOpen;
+      const lean = (rp.trend * (state._regimeDir || 1)) + (Math.random() - 0.5) * 0.8;
+      state._candlePersonality = lean > 0.15 ? 1 : lean < -0.15 ? -1 : 0;
+      state._candleConviction  = 0.4 + Math.random() * 0.5;
+    }
+    // candle এর শেষ ২০% এ bias দুর্বল (natural close pullback)
+    let pScale = 1.0;
+    const cTimeLeft = state.nextCandle - now;
+    const cProg = 1 - (cTimeLeft / CANDLE_MS);
+    if (cProg > 0.9) pScale = 0.5; else if (cProg > 0.7) pScale = 0.8;
+    const candleBiasForce = (state._candlePersonality || 0) * v * (state._candleConviction || 0.4) * 0.4 * pScale;
+
+    // Tick clustering — কয়েক tick ধরে এক দিকে থাকার প্রবণতা (body বড় করে)
+    if (state._clusterTick === undefined || state._clusterTick <= 0) {
+      const bias = (rp.trend * (state._regimeDir || 1)) + (state._candlePersonality || 0) * 0.5;
+      const pUp  = 0.5 + Math.max(-0.4, Math.min(0.4, bias * 0.35));
+      state._clusterDir = Math.random() < pUp ? 1 : -1;
+      state._clusterTick = 5 + (Math.random() * 12 | 0);
+      state._clusterStr  = 0.4 + Math.random() * 0.5;
+    }
+    state._clusterTick--;
+    const clusterForce = state._clusterDir * v * state._clusterStr * 0.3;
+
+    // Regime trend force
+    const trendForce = rp.trend * (state._regimeDir || 1) * v * 0.3;
+
+    // Smooth correlated noise (pure random না — real market এর মতো)
+    if (state._noiseX === undefined) { state._noiseX = Math.random()*1000; state._noiseSeed = (Math.random()*1e9)|0; }
+    state._noiseX += 0.1;
+    let noiseForce = _smoothNoise(state._noiseSeed, state._noiseX) * v * 0.6;
+    if (Math.random() < 0.02) { // rare shock (~2%)
+      noiseForce += (Math.random()+Math.random()+Math.random()-1.5) * v * 1.1;
+    }
+
+    // Support/Resistance — swing level এর কাছে bounce
+    _updateLevels(state);
+    const levelForce = _levelForce(state, v);
+
+    // Mean reversion (regime অনুযায়ী — ranging এ বেশি টান)
+    if (state._anchor === undefined) state._anchor = state.price;
+    state._anchor = state._anchor * 0.997 + state.price * 0.003;
+    const revMul = state._regime === 'ranging' ? 1.0 : state._regime === 'calm' ? 0.8 : 0.3;
+    const reversionForce = (state._anchor - state.price) * 0.025 * revMul;
+
+    netForce = trendForce + candleBiasForce + clusterForce + noiseForce + levelForce + reversionForce;
+
+    // Dynamic friction — regime অনুযায়ী smooth lerp (trending এ বেশি glide)
+    if (state._friction === undefined) state._friction = 0.85;
+    state._friction += (rp.friction - state._friction) * 0.08;
+  } else {
+    // manual / trade-based — আগের মতোই সরল trend+random (override predictable রাখতে)
+    v = state.price * 0.0008 * volMul;
+    const trendComponent  = state.trend * v * (ctrl.trendStrength || 0.6) * 0.35;
+    const randomComponent = (Math.random() - 0.5) * v * 3.2;
+    netForce = trendComponent + randomComponent;
+    state._friction = 0.85;
+  }
+
+  // ── NET FORCE → velocity (momentum) → price, safety clamp সহ ──────────
   if (state._velocity === undefined) state._velocity = 0;
-  state._velocity += (trendComponent + randomComponent);
-  state._velocity *= 0.85; // friction — গতি ধীরে কমে
-
-  // safety — velocity সীমাহীন বাড়তে পারবে না (candle অতিরিক্ত বড় রোধ)
-  const maxVel = v * 1.6;
+  state._velocity += netForce;
+  state._velocity *= Math.max(0.70, Math.min(0.94, state._friction || 0.85));
+  const maxVel = v * 1.8;
   state._velocity = Math.max(-maxVel, Math.min(maxVel, state._velocity));
 
   let delta = state._velocity * speed;
   const maxStep = state.price * 0.0015; // hard safety — প্রতি tick max ±0.15%
   delta = Math.max(-maxStep, Math.min(maxStep, delta));
   state.price = Math.max(state.price + delta, 0.0001);
+
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
 
