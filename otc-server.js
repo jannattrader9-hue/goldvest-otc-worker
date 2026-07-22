@@ -23,7 +23,7 @@ const firestore = admin.firestore();
 let _cryptoCurrenciesCache = null;
 let _cryptoCurrenciesCacheTime = 0;
 
-// ── Redis client ──
+// ── Redis client — settler service-এ trade jobs push করে ──
 const REDIS_URL = process.env.REDIS_URL;
 let   redisPub  = null;
 let   redisReady = false;
@@ -52,16 +52,13 @@ if (REDIS_URL) {
     console.warn('[Redis] REDIS_URL not set — falling back to batchSettle HTTP');
 }
 
-// ── Redis safe helper ──
-async function redisSafe(op, ...args) {
-    if (!redisPub || !redisReady) throw new Error('Redis not ready');
-    return redisPub[op](...args);
-}
-
 const TICK_MS   = 500;
 const CANDLE_MS = 60 * 1000;
 const TD_KEY    = '392fa09f669c4cd7843f958e0fbbca36';
 
+// Settlement burst protection — একই candle close এ অনেক trade একসাথে due
+// হলেও, সবগুলো এক মুহূর্তে fetch() না করে এই সংখ্যক concurrent request এ
+// limit করো (Cloud Function concurrency / Firestore transaction storm এড়াতে)
 const SETTLE_CONCURRENCY = 50;
 const settleLimit = pLimit(SETTLE_CONCURRENCY);
 
@@ -75,13 +72,16 @@ const SUB_INTERVALS = [
   { label: '30s', ms: 30 * 1000 },
 ];
 
+// ── Settlement (candle-close triggered, delay-free) ───────
 const SETTLE_FUNCTION_URL       = 'https://us-central1-goldvest-cf73d.cloudfunctions.net/settleTrade';
 const BATCH_SETTLE_FUNCTION_URL = 'https://us-central1-goldvest-cf73d.cloudfunctions.net/batchSettle';
 const SETTLE_TOKEN        = process.env.SETTLE_TOKEN || 'gv_settle_secret_2024';
 
-// ── Batch broadcast ──
-const _userSettleQueue = new Map();
-const _userSettleTimers = new Map();
+// ── Batch broadcast — settled trades কে per-user group করে RTDB তে
+// একসাথে push করো, যাতে client একটাই event এ সব trades একসাথে process করে
+// (Quotex-pattern: single event → instant bulk UI update)
+const _userSettleQueue = new Map(); // userId -> [{tradeId, status, closePrice, profit}, ...]
+const _userSettleTimers = new Map(); // userId -> timeout handle
 
 function _queueSettlementBroadcast(userId, tradeId, settleResult) {
   if (!userId || !settleResult || settleResult.result !== 'ok') return;
@@ -111,10 +111,14 @@ function _flushUserSettleBatch(userId) {
   }).catch(e => console.error(`[batch-broadcast] ${userId} failed:`, e.message));
 }
 
-// ── Batch settle ──
+// ── Batch settle — Redis queue-এ push করো (settler service process করবে)
+// Redis না থাকলে পুরনো batchSettle HTTP endpoint-এ fallback করো
 async function _batchSettleAndBroadcast(symbol, trades, closePrice) {
   if (!trades || trades.length === 0) return;
 
+  // ── live_market_stats: settled trades remove করো ──
+  // transaction এর বদলে increment/decrement — পুরো node delete না করে
+  // নতুন trades এ type/amount আছে, তাই সঠিক decrement হবে
   try {
     let upDec = 0, downDec = 0, upAmt = 0, downAmt = 0;
     let hasTypeInfo = false;
@@ -130,29 +134,28 @@ async function _batchSettleAndBroadcast(symbol, trades, closePrice) {
         curr.down       = Math.max(0, (curr.down       || 0) - downDec);
         curr.upAmount   = Math.max(0, (curr.upAmount   || 0) - upAmt);
         curr.downAmount = Math.max(0, (curr.downAmount || 0) - downAmt);
+        // সব 0 হলে node delete করো
         if ((curr.up || 0) <= 0 && (curr.down || 0) <= 0) return null;
         return curr;
       }).catch(() => {});
     } else {
+      // পুরানো trades (type নেই) — node clear করো
       db.ref('live_market_stats/' + symbol).remove().catch(() => {});
     }
   } catch (e) {}
 
-  // ── Redis path (chunked for safety) ──
+  // ── Redis path (fast, <1ms per trade) ──────────────────
   if (redisPub && redisReady) {
     try {
-      const CHUNK = 100; // LPUSH has arg limit
-      for (let i = 0; i < trades.length; i += CHUNK) {
-        const chunk = trades.slice(i, i + CHUNK);
-        const jobs = chunk.map(t => JSON.stringify({
-          userId:     t.userId,
-          tradeId:    t.tradeId,
-          closePrice: t.closePrice || closePrice,
-          symbol,
-          settledBy:  'redis-settler',
-        }));
-        await redisSafe('lpush', 'gv:settle_queue', ...jobs);
-      }
+      const jobs = trades.map(t => JSON.stringify({
+        userId:     t.userId,
+        tradeId:    t.tradeId,
+        closePrice: t.closePrice || closePrice,
+        symbol,
+        settledBy:  'redis-settler',
+      }));
+      // LPUSH — settler blpop করে instantly process করবে
+      await redisPub.lpush('gv:settle_queue', ...jobs);
       console.log(`[redis-push] ${symbol} pushed=${trades.length} closePrice=${closePrice.toFixed(5)}`);
       return;
     } catch (e) {
@@ -160,7 +163,7 @@ async function _batchSettleAndBroadcast(symbol, trades, closePrice) {
     }
   }
 
-  // ── HTTP fallback ──
+  // ── HTTP fallback (যদি Redis না থাকে) ──────────────────
   const CHUNK = 500;
   for (let i = 0; i < trades.length; i += CHUNK) {
     const chunk = trades.slice(i, i + CHUNK);
@@ -177,52 +180,65 @@ async function _batchSettleAndBroadcast(symbol, trades, closePrice) {
       const data = await res.json().catch(() => ({}));
       const _ms = Date.now() - _t0;
       const results = data.results || [];
-      console.log(`[batch-settle] ${symbol} chunk=${Math.floor(i/CHUNK)+1} trades=${chunk.length} took=${_ms}ms ok=${results.filter(r=>r.result==='ok').length}`);
+      console.log(`[batch-settle] ${symbol} chunk=${i/CHUNK+1} trades=${chunk.length} took=${_ms}ms ok=${results.filter(r=>r.result==='ok').length}`);
       results.forEach(r => {
         _queueSettlementBroadcast(r.userId, r.tradeId, r);
       });
     } catch (e) {
-      console.error(`[batch-settle] ${symbol} chunk=${Math.floor(i/CHUNK)+1} failed:`, e.message);
+      console.error(`[batch-settle] ${symbol} chunk=${i/CHUNK+1} failed:`, e.message);
     }
   }
 }
 
-// ── Candle settlement ──
+// candle close হওয়ার মুহূর্তে — সেই symbol+candleTime এ expire হওয়া সব live trades
+// খুঁজে exact close price দিয়ে settle করো (একই tick, delay-free)
 async function settleTradesForCandle(symbol, candleTime, closePrice) {
+  // Synchronously mark — tick-settle এই symbol skip করবে এখন থেকে
+  // tickOTC/tickForex ইতিমধ্যে synchronously mark করেছে — এটা safety fallback
+  // (direct call হলে যেমন Firestore fallback path এ)
   _candleSettlingSymbols.add(symbol);
 
   try {
+    // settlement_queue RTDB থেকে এই candleTime-এ due trades পড়ো —
+    // collectionGroup Firestore query-এর চেয়ে অনেক lighter (indexed by expiry)
     const queueSnap = await db.ref(`settlement_queue/${candleTime}`).once('value');
 
     if (!queueSnap.exists()) {
+      // Fallback: RTDB queue-এ না থাকলে Firestore collectionGroup query
+      // (পুরনো trades যেগুলো queue-এ লেখা হয়নি, বা Cloud Function miss করেছে)
       const fsSnap = await firestore.collectionGroup('trades')
         .where('symbol', '==', symbol)
         .where('status', '==', 'live')
         .where('accountType', '==', 'live')
         .where('expiryTimestamp', '==', candleTime)
         .get();
-      if (fsSnap.empty) { return; }
+      if (fsSnap.empty) { _candleSettlingSymbols.delete(symbol); return; }
       const trades = fsSnap.docs.map(doc => ({
         userId: doc.data().userId || doc.ref.parent.parent?.id,
         tradeId: doc.id,
         closePrice,
       })).filter(t => t.userId);
+      // tick-settle duplicate এড়াতে pending mark করো
       trades.forEach(t => {
         const key = `${t.userId}/${t.tradeId}`;
         _activeTradesMemory.delete(key);
         _pendingSettle.add(key);
       });
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
+      _candleSettlingSymbols.delete(symbol);
       return;
     }
 
+    // settlement_queue-এ এই symbol-এর trades বের করো
     const trades = [];
     queueSnap.forEach(userNode => {
       const userId = userNode.key;
       userNode.forEach(tradeNode => {
         const t = tradeNode.val();
+        // symbol filter — একই candleTime-এ অনেক symbol-এর trades থাকতে পারে
         if (t.symbol === symbol && t.accountType === 'live') {
           trades.push({ userId, tradeId: tradeNode.key, closePrice, type: t.type || '', amount: t.amount || 0 });
+          // tick-settle duplicate এড়াতে pending mark করো
           const key = `${userId}/${tradeNode.key}`;
           _activeTradesMemory.delete(key);
           _pendingSettle.add(key);
@@ -230,14 +246,20 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
       });
     });
 
-    if (trades.length === 0) { return; }
+    if (trades.length === 0) { _candleSettlingSymbols.delete(symbol); return; }
     console.log(`[settle] ${symbol} candleTime=${candleTime} found ${trades.length} trades in queue`);
 
+    // 30s safety — Firestore confirm না এলেও pending guard clear করো
     const pendingKeys = trades.map(t => `${t.userId}/${t.tradeId}`);
     setTimeout(() => pendingKeys.forEach(k => _pendingSettle.delete(k)), 30000);
 
     await _batchSettleAndBroadcast(symbol, trades, closePrice);
 
+    // Candle settle শেষ — tick-settle আবার চলতে পারবে
+    _candleSettlingSymbols.delete(symbol);
+
+    // settle হয়ে গেলে queue entry গুলো cleanup — এই symbol-এর trades remove
+    // (অন্য symbol-এর trades একই candleTime-এ থাকতে পারে, তাই selective delete)
     const cleanups = [];
     trades.forEach(t => {
       cleanups.push(db.ref(`settlement_queue/${candleTime}/${t.userId}/${t.tradeId}`).remove());
@@ -263,11 +285,21 @@ const _activeMarkets = new Set();
 const _forexPrices   = {};
 const _tradeStats    = {};
 
+// ── [SHADOW TRACKING - ধাপ ১] In-memory active trades map ──
+// এটি শুধুমাত্র observation/verification এর জন্য — settlement logic এখনও বদলায়নি।
+// Key: `${userId}/${tradeId}`, Value: { userId, tradeId, symbol, expiryTimestamp, status }
 const _activeTradesMemory = new Map();
+// Settlement শুরু হয়েছে কিন্তু Firestore onSnapshot এখনো confirm করেনি —
+// এই set-এ থাকা trades পরের tick-এ duplicate settle attempt করবে না।
 const _pendingSettle = new Set();
+// Candle close হলে এই symbol-কে synchronously mark করা হয় —
+// tick-settle এই symbol-এর trades skip করবে যতক্ষণ candle batch শেষ না হয়।
 const _candleSettlingSymbols = new Set();
 
-// ── Recovery ──
+// ── Restart recovery — RTDB settlement_queue থেকে live trades reload ──
+// OTC server restart হলে _activeTradesMemory খালি হয়ে যায়।
+// এই function টা start এ একবার RTDB থেকে pending trades load করে
+// যাতে tick-settle instant কাজ করতে পারে।
 async function _recoverLiveTradesFromRTDB() {
   try {
     const snap = await db.ref('settlement_queue').once('value');
@@ -312,7 +344,7 @@ function _startActiveTradesShadowListener() {
         const key     = `${userId}/${change.doc.id}`;
         if (change.type === 'removed' || data.status !== 'live') {
           _activeTradesMemory.delete(key);
-          _pendingSettle.delete(key);
+          _pendingSettle.delete(key); // confirmed — pending guard clear করো
         } else {
           _activeTradesMemory.set(key, {
             userId, tradeId: change.doc.id,
@@ -324,6 +356,7 @@ function _startActiveTradesShadowListener() {
     }, err => console.error('[shadow-tracking] listener error:', err.message));
 }
 
+// প্রতি tick এ shadow map থেকে কতগুলো trade "due" (expiryTimestamp <= now) তা log করো — observational only
 function _logShadowDueTrades() {
   const nowSec = Math.floor(Date.now() / 1000);
   let due = 0;
@@ -335,17 +368,57 @@ function _logShadowDueTrades() {
   }
 }
 
-// ── Tick settlement from memory (DISABLED — use RTDB only to avoid duplicates) ──
+// ── [ধাপ ২] In-memory map থেকে tick-based settlement ──────
+// প্রতি tick এ — যেসব live trade এর expiryTimestamp <= now, তাদের সেই
+// symbol এর current state.price দিয়ে সাথে সাথে settle করো (candle-close
+// trigger এর পাশাপাশি/parallel — duplicate-safe, কারণ _doSettle এ
+// status !== 'live' guard আছে)
 async function _settleDueTradesFromMemory() {
-  // Disabled: RTDB path is more reliable. 
-  // Candle close path handles symbol-specific settlement.
-  // This prevents race condition with settleTradesForCandle.
-  return;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const due = [];
+  for (const [key, t] of _activeTradesMemory.entries()) {
+    if (t.expiryTimestamp <= nowSec && t.accountType === 'live') {
+      if (_pendingSettle.has(key)) continue; // Firestore confirm আসেনি — skip
+      if (_candleSettlingSymbols.has(t.symbol)) continue; // candle path চলছে — skip
+      due.push([key, t]);
+    }
+  }
+  if (due.length === 0) return;
+
+  // duplicate attempt এড়াতে — settlement শুরুর আগেই pending mark করো
+  // Firestore onSnapshot status change confirm করলে _pendingSettle থেকে সরাবে
+  for (const [key] of due) {
+    _activeTradesMemory.delete(key);
+    _pendingSettle.add(key);
+  }
+
+  // symbol দিয়ে group করো — প্রতিটা symbol-এর জন্য আলাদা close price
+  const bySymbol = new Map();
+  for (const [key, t] of due) {
+    const state = _states[t.symbol];
+    if (!state || typeof state.price !== 'number') continue;
+    if (!bySymbol.has(t.symbol)) bySymbol.set(t.symbol, { closePrice: state.price, trades: [] });
+    bySymbol.get(t.symbol).trades.push({ userId: t.userId, tradeId: t.tradeId, closePrice: state.price, type: t.type || '', amount: t.amount || 0 });
+  }
+
+  // প্রতি symbol-এর trades batchSettle-এ পাঠাও
+  await Promise.allSettled([...bySymbol.entries()].map(async ([symbol, { closePrice, trades }]) => {
+    console.log(`[tick-settle] ${symbol} due=${trades.length} closePrice=${closePrice.toFixed(5)}`);
+    await _batchSettleAndBroadcast(symbol, trades, closePrice);
+  }));
+
+  // Safety cleanup — 30s পরে Firestore confirm না এলেও pending guard clear করো
+  // (যাতে কোনো trade চিরতরে আটকে না যায়)
+  const keys = due.map(([key]) => key);
+  setTimeout(() => {
+    keys.forEach(k => _pendingSettle.delete(k));
+  }, 30000);
 }
 
-// ── RTDB tick settlement ──
-const _rtdbSettledKeys = new Set();
-
+// ── RTDB settlement_queue থেকে directly due trades settle ──
+// Firestore shadow listener slow হলেও এই path কাজ করে।
+// প্রতি tick এ RTDB queue চেক করে — expiryTimestamp <= now হলে settle করো।
+const _rtdbSettledKeys = new Set(); // duplicate guard
 async function _settleDueTradesFromRTDB() {
   try {
     const nowSec = Math.floor(Date.now() / 1000);
@@ -355,7 +428,7 @@ async function _settleDueTradesFromRTDB() {
     const bySymbol = new Map();
     snap.forEach(timeNode => {
       const expiryTimestamp = parseInt(timeNode.key);
-      if (expiryTimestamp > nowSec) return;
+      if (expiryTimestamp > nowSec) return; // এখনো due হয়নি
       timeNode.forEach(userNode => {
         const userId = userNode.key;
         userNode.forEach(tradeNode => {
@@ -367,10 +440,7 @@ async function _settleDueTradesFromRTDB() {
           const state = _states[t.symbol];
           if (!state || typeof state.price !== 'number') return;
           if (!bySymbol.has(t.symbol)) bySymbol.set(t.symbol, { closePrice: state.price, trades: [] });
-          bySymbol.get(t.symbol).trades.push({ 
-            userId, tradeId: tradeNode.key, closePrice: state.price, 
-            expiryTimestamp, type: t.type || '', amount: t.amount || 0 
-          });
+          bySymbol.get(t.symbol).trades.push({ userId, tradeId: tradeNode.key, closePrice: state.price, expiryTimestamp, type: t.type || '', amount: t.amount || 0 });
           _rtdbSettledKeys.add(key);
           _pendingSettle.add(key);
           _activeTradesMemory.delete(key);
@@ -383,11 +453,13 @@ async function _settleDueTradesFromRTDB() {
     await Promise.allSettled([...bySymbol.entries()].map(async ([symbol, { closePrice, trades }]) => {
       console.log(`[rtdb-tick-settle] ${symbol} due=${trades.length} closePrice=${closePrice.toFixed(5)}`);
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
+      // settle হয়ে গেলে RTDB queue থেকে delete করো
       await Promise.allSettled(trades.map(t =>
         db.ref(`settlement_queue/${t.expiryTimestamp}/${t.userId}/${t.tradeId}`).remove()
       ));
     }));
 
+    // 60s পরে guard clear করো
     setTimeout(() => {
       [...bySymbol.values()].forEach(({ trades }) => {
         trades.forEach(t => {
@@ -402,13 +474,16 @@ async function _settleDueTradesFromRTDB() {
   }
 }
 
-// ── 24h change tracking ──
-const _openPrice24h  = {};
+// ── 24h change tracking ───────────────────────────────────
+// প্রতি symbol এর জন্য 24h আগের open price cache করো
+const _openPrice24h  = {}; // { BTCOTC: { price, time } }
 
+// 24h change calculate + RTDB save
 function _save24hChange(id, currentClose) {
   try {
     const ref24 = _openPrice24h[id];
     if (!ref24 || !ref24.price) return;
+
     const change = ((currentClose - ref24.price) / ref24.price) * 100;
     db.ref(`otc_change/${id}`).set({
       change:    Number(change.toFixed(3)),
@@ -417,6 +492,7 @@ function _save24hChange(id, currentClose) {
   } catch (e) {}
 }
 
+// 24h আগের candle load করো — init এর সময় একবার
 async function _load24hOpenPrice(id) {
   try {
     const now24hAgo = Math.floor((Date.now() - 24 * 60 * 60 * 1000) / 1000);
@@ -425,6 +501,7 @@ async function _load24hOpenPrice(id) {
       .startAt(now24hAgo)
       .limitToFirst(1)
       .once('value');
+
     if (snap.exists()) {
       const candle = Object.values(snap.val())[0];
       _openPrice24h[id] = { price: candle.open || candle.close, time: candle.time };
@@ -432,13 +509,14 @@ async function _load24hOpenPrice(id) {
   } catch (e) {}
 }
 
+// প্রতি ঘণ্টায় 24h reference update করো
 setInterval(() => {
   _activeMarkets.forEach(id => {
     _load24hOpenPrice(id);
   });
 }, 60 * 60 * 1000);
 
-// ── Firebase helpers ──
+// ── Firebase helpers ──────────────────────────────────────
 async function fetchBinancePrice(symbol) {
   try {
     const r = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${symbol}`);
@@ -458,6 +536,7 @@ function saveCandle(id, candle) {
   db.ref(`otc_candles/${id}/candles`).push(candle)
     .then(() => {
       console.log(`[${id}] candle close=${candle.close.toFixed(5)}`);
+      // Candle close হলে 24h change update করো
       _save24hChange(id, candle.close);
     })
     .catch(e => console.error(`[${id}] save failed:`, e.message));
@@ -477,7 +556,7 @@ function saveLiveSubCandle(id, label, candle) {
 }
 
 // ══════════════════════════════════════════════════════════
-// OTC ENGINE — IMPROVED
+// OTC ENGINE
 // ══════════════════════════════════════════════════════════
 function randomTrend() {
   const r = Math.random();
@@ -522,6 +601,7 @@ async function initOTC(market) {
   db.ref(`otc_controls/${id}`).on('value', snap => {
     if (snap.exists()) _controls[id] = { ..._controls[id], ...snap.val() };
   });
+  // trade-based mode এর জন্য — Forex engine এ যেভাবে আছে, OTC তেও same pattern
   db.ref(`otc_trade_stats/${id}`).on('value', snap => {
     _tradeStats[id] = snap.exists() ? snap.val() : {};
   });
@@ -542,155 +622,94 @@ async function initOTC(market) {
   _states[id] = {
     type:'otc', price, candleOpen:price, candleHigh:price, candleLow:price,
     candleTime:start/1000, nextCandle:start+CANDLE_MS,
-    trend:0, trendSteps:0, lastMove:0,
+    trend:0, trendSteps:0,
     subStates,
   };
   _activeMarkets.add(id);
 
+  // 24h open price load করো
   await _load24hOpenPrice(id);
+
   console.log(`[${id}] OTC started @ ${price.toFixed(4)}`);
 }
 
-// ══════════════════════════════════════════════════════════
-// IMPROVED tickOTC — Smoother, more natural price movement
-// ══════════════════════════════════════════════════════════
 function tickOTC(id) {
   const state = _states[id];
   if (!state || state.type !== 'otc') return;
   const ctrl = _controls[id] || {};
-  const volMul = { low:0.3, medium:0.8, high:1.8 }[ctrl.volatility] || 0.8;
+  const volMul = { low:0.4, medium:1.0, high:2.2 }[ctrl.volatility] || 1.0;
   const speed = ctrl.speedMultiplier || 1.0;
   const now = Date.now();
 
-  // ── Trend logic ──
   if (!ctrl.mode || ctrl.mode === 'auto') {
-    if (state.trendSteps <= 0) { 
-      state.trend = randomTrend(); 
-      state.trendSteps = Math.round((15 + Math.floor(Math.random()*25)) / speed); 
-    }
+    if (state.trendSteps <= 0) { state.trend = randomTrend(); state.trendSteps = Math.round((8+Math.floor(Math.random()*12))/speed); }
     state.trendSteps--;
   } else if (ctrl.mode === 'manual') {
     state.trend = ctrl.nextDirection === 'up' ? 1 : ctrl.nextDirection === 'down' ? -1 : 0;
     state.trendSteps = 99;
   } else if (ctrl.mode === 'trade-based') {
+    // Forex engine এর same pattern — majority pool এর দিকে subtle nudge (guaranteed outcome না)
     const stats = _tradeStats[id] || {};
     const up    = parseFloat(stats.upAmount)   || 0;
     const down  = parseFloat(stats.downAmount) || 0;
-    const total = up + down;
-    
-    if (total > 0) {
-      const ratio = up / total;
-      state.trend = (0.5 - ratio) * 2;
-    } else {
-      state.trend = 0;
-    }
+    if (up > down * 1.2)        state.trend = -1;
+    else if (down > up * 1.2)   state.trend = 1;
+    else                        state.trend = 0;
     state.trendSteps = 99;
   }
 
-  // ── Smoother price calculation ──
-  const baseVol = state.price * 0.0005 * volMul;
-  const prevMove = state.lastMove || 0;
-  
-  const trendComponent    = state.trend * baseVol * 0.6;
-  const randomComponent   = (Math.random() - 0.5) * baseVol * 1.5;
-  const momentumComponent = prevMove * 0.2;
-  
-  const move = (trendComponent + randomComponent + momentumComponent) * speed;
-  state.lastMove = move;
-  
-  state.price = Math.max(state.price + move, 0.0001);
-  
+  const v = state.price * 0.0008 * volMul;
+  const trendComponent  = state.trend * v * (ctrl.trendStrength || 0.6) * 0.35;
+  const randomComponent = (Math.random() - 0.5) * v * 3.2;
+  state.price = Math.max(state.price + (trendComponent + randomComponent) * speed, 0.0001);
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
 
-  // ── Candle close ──
   if (now >= state.nextCandle) {
+    // trade.expiryTimestamp = candle close time (= next candle's open time), candleTime এ candle open time থাকে
     const closedCandleTime  = state.nextCandle / 1000;
     const closedCandleClose = state.price;
-    
-    saveCandle(id, { 
-      time: state.candleTime, 
-      open: state.candleOpen, 
-      high: state.candleHigh, 
-      low: state.candleLow, 
-      close: state.price 
-    });
-    
-    db.ref(`otc_candles/${id}/live`).set({ 
-      time: state.candleTime, 
-      open: state.candleOpen, 
-      high: state.candleHigh, 
-      low: state.candleLow, 
-      close: state.price, 
-      nextCandle: state.nextCandle 
-    }).catch(()=>{});
+    saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price });
+    // /live কে সাথে সাথে closed candle-এর final value দিয়ে আপডেট করো (null না) — client তাৎক্ষণিকভাবে সঠিক close পাবে
+    db.ref(`otc_candles/${id}/live`).set({ time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle }).catch(()=>{});
 
+    // ── candle just closed — এই মুহূর্তের close price দিয়ে matching live trades settle করো ──
+    // Synchronously mark — একই tick-এ _settleDueTradesFromMemory এই symbol skip করবে
     _candleSettlingSymbols.add(id);
-    settleTradesForCandle(id, closedCandleTime, closedCandleClose)
-      .finally(() => { _candleSettlingSymbols.delete(id); });
-
-    state.candleTime = state.nextCandle / 1000;
-    state.candleOpen = state.price;
-    state.candleHigh = state.price;
-    state.candleLow  = state.price;
-    state.nextCandle += CANDLE_MS;
-    while (state.nextCandle <= now) { 
-      state.candleTime = state.nextCandle / 1000; 
-      state.nextCandle += CANDLE_MS; 
-    }
-  } else {
-    saveLiveCandle(id, { 
-      time: state.candleTime, 
-      open: state.candleOpen, 
-      high: state.candleHigh, 
-      low: state.candleLow, 
-      close: state.price, 
-      nextCandle: state.nextCandle 
+    settleTradesForCandle(id, closedCandleTime, closedCandleClose).catch(() => {
+      _candleSettlingSymbols.delete(id);
     });
+
+    state.candleTime = state.nextCandle/1000; state.candleOpen = state.price;
+    state.candleHigh = state.price; state.candleLow = state.price;
+    state.nextCandle += CANDLE_MS;
+    while (state.nextCandle <= now) { state.candleTime = state.nextCandle/1000; state.nextCandle += CANDLE_MS; }
+  } else {
+    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle });
   }
 
-  // ── Sub-intervals ──
   for (const { label } of SUB_INTERVALS) {
     const ss = state.subStates[label];
     if (!ss) continue;
     if (state.price > ss.candleHigh) ss.candleHigh = state.price;
     if (state.price < ss.candleLow)  ss.candleLow  = state.price;
-    
     if (now >= ss.nextCandle) {
-      saveSubCandle(id, label, { 
-        time: ss.candleTime, 
-        open: ss.candleOpen, 
-        high: ss.candleHigh, 
-        low: ss.candleLow, 
-        close: state.price 
-      });
+      saveSubCandle(id, label, { time:ss.candleTime, open:ss.candleOpen, high:ss.candleHigh, low:ss.candleLow, close:state.price });
       db.ref(`subcandles_${label}/${id}/live`).set(null).catch(() => {});
-      
       ss.candleTime = ss.nextCandle / 1000;
       ss.candleOpen = state.price;
       ss.candleHigh = state.price;
       ss.candleLow  = state.price;
       ss.nextCandle += ss.ms;
-      
-      while (ss.nextCandle <= now) { 
-        ss.candleTime = ss.nextCandle / 1000; 
-        ss.nextCandle += ss.ms; 
-      }
+      while (ss.nextCandle <= now) { ss.candleTime = ss.nextCandle / 1000; ss.nextCandle += ss.ms; }
     } else {
-      saveLiveSubCandle(id, label, { 
-        time: ss.candleTime, 
-        open: ss.candleOpen, 
-        high: ss.candleHigh, 
-        low: ss.candleLow, 
-        close: state.price, 
-        nextCandle: ss.nextCandle 
-      });
+      saveLiveSubCandle(id, label, { time:ss.candleTime, open:ss.candleOpen, high:ss.candleHigh, low:ss.candleLow, close:state.price, nextCandle:ss.nextCandle });
     }
   }
 }
 
 // ══════════════════════════════════════════════════════════
-// FOREX ENGINE — IMPROVED (Real price only)
+// FOREX ENGINE
 // ══════════════════════════════════════════════════════════
 let _tdWS    = null;
 let _tdReady = false;
@@ -768,10 +787,13 @@ async function initForex(id) {
   }
   const lastClose = history.length > 0 ? history[history.length-1].close : (lastSaved?.close || 1.0);
   _forexPrices[id] = lastClose;
-  
-  // Forex controls — mode ignored, always auto/real price
   _controls[id] = { mode:'auto', nextDirection:'auto' };
-  
+  db.ref(`otc_controls/${id}`).on('value', snap => {
+    if (snap.exists()) _controls[id] = { ..._controls[id], ...snap.val() };
+  });
+  db.ref(`otc_trade_stats/${id}`).on('value', snap => {
+    _tradeStats[id] = snap.exists() ? snap.val() : {};
+  });
   const now = Date.now(), start = Math.floor(now/CANDLE_MS)*CANDLE_MS;
   const subStates = {};
   for (const { label, ms } of SUB_INTERVALS) {
@@ -791,7 +813,9 @@ async function initForex(id) {
   };
   _activeMarkets.add(id);
 
+  // 24h open price load করো
   await _load24hOpenPrice(id);
+
   console.log(`[${id}] Forex started @ ${lastClose}`);
   if (_tdWS && _tdWS.readyState === 1 && _tdReady) {
     _tdWS.send(JSON.stringify({ action:'subscribe', params:{ symbols: TD_MAP[id] } }));
@@ -800,9 +824,6 @@ async function initForex(id) {
   }
 }
 
-// ══════════════════════════════════════════════════════════
-// IMPROVED tickForex — Real price ONLY, no manipulation
-// ══════════════════════════════════════════════════════════
 function tickForex(id) {
   const state = _states[id];
   if (!state || state.type !== 'forex') return;
@@ -811,97 +832,65 @@ function tickForex(id) {
     db.ref(`otc_status/${id}`).set({ enabled:false, reason:'market_closed' }).catch(()=>{});
     return;
   }
-  const now = Date.now();
-  const realPrice = _forexPrices[id];
-  
+  const now       = Date.now();
+  const ctrl      = _controls[id] || {};
+  const realPrice = _forexPrices[id] || state.price;
   if (!realPrice || realPrice <= 0) return;
-  
-  // ALWAYS use real price — no manual/trade-based override for forex
-  state.price = realPrice;
-  
-  if (realPrice > state.candleHigh) state.candleHigh = realPrice;
-  if (realPrice < state.candleLow)  state.candleLow  = realPrice;
-  
-  if (now >= state.nextCandle) {
-    const closedCandleTime  = state.nextCandle / 1000;
-    const closedCandleClose = realPrice;
-    
-    saveCandle(id, { 
-      time: state.candleTime, 
-      open: state.candleOpen, 
-      high: state.candleHigh, 
-      low: state.candleLow, 
-      close: realPrice 
-    });
-    
-    db.ref(`otc_candles/${id}/live`).set({ 
-      time: state.candleTime, 
-      open: state.candleOpen, 
-      high: state.candleHigh, 
-      low: state.candleLow, 
-      close: realPrice, 
-      nextCandle: state.nextCandle 
-    }).catch(()=>{});
-
-    _candleSettlingSymbols.add(id);
-    settleTradesForCandle(id, closedCandleTime, closedCandleClose)
-      .finally(() => { _candleSettlingSymbols.delete(id); });
-
-    state.candleTime = state.nextCandle/1000;
-    state.candleOpen = realPrice;
-    state.candleHigh = realPrice;
-    state.candleLow  = realPrice;
-    state.nextCandle += CANDLE_MS;
-    while (state.nextCandle <= now) { 
-      state.candleTime = state.nextCandle/1000; 
-      state.nextCandle += CANDLE_MS; 
-    }
-  } else {
-    saveLiveCandle(id, { 
-      time: state.candleTime, 
-      open: state.candleOpen, 
-      high: state.candleHigh, 
-      low: state.candleLow, 
-      close: realPrice, 
-      nextCandle: state.nextCandle 
-    });
+  let price = realPrice;
+  if (ctrl.mode === 'manual') {
+    const dir = ctrl.nextDirection;
+    const v   = realPrice * 0.000025;
+    if (dir === 'up')        price = realPrice + v*(0.5+Math.random()*0.5);
+    else if (dir === 'down') price = realPrice - v*(0.5+Math.random()*0.5);
+  } else if (ctrl.mode === 'trade-based') {
+    const stats = _tradeStats[id] || {};
+    const up    = parseFloat(stats.upAmount)   || 0;
+    const down  = parseFloat(stats.downAmount) || 0;
+    const v     = realPrice * 0.000025;
+    if (up > down*1.2)    price = realPrice - v*(0.5+Math.random()*0.5);
+    else if (down>up*1.2) price = realPrice + v*(0.5+Math.random()*0.5);
   }
-  
+  state.price = price;
+  if (price > state.candleHigh) state.candleHigh = price;
+  if (price < state.candleLow)  state.candleLow  = price;
+  if (now >= state.nextCandle) {
+    // trade.expiryTimestamp = candle close time (= next candle's open time), candleTime এ candle open time থাকে
+    const closedCandleTime  = state.nextCandle / 1000;
+    const closedCandleClose = price;
+    saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price });
+    // /live কে সাথে সাথে closed candle-এর final value দিয়ে আপডেট করো (null না) — client তাৎক্ষণিকভাবে সঠিক close পাবে
+    db.ref(`otc_candles/${id}/live`).set({ time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle }).catch(()=>{});
+
+    // ── candle just closed — এই মুহূর্তের close price দিয়ে matching live trades settle করো ──
+    // Synchronously mark — একই tick-এ _settleDueTradesFromMemory এই symbol skip করবে
+    _candleSettlingSymbols.add(id);
+    settleTradesForCandle(id, closedCandleTime, closedCandleClose).catch(() => {
+      _candleSettlingSymbols.delete(id);
+    });
+
+    state.candleTime = state.nextCandle/1000; state.candleOpen = price;
+    state.candleHigh = price; state.candleLow = price;
+    state.nextCandle += CANDLE_MS;
+    while (state.nextCandle <= now) { state.candleTime = state.nextCandle/1000; state.nextCandle += CANDLE_MS; }
+  } else {
+    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle });
+  }
   for (const { label } of SUB_INTERVALS) {
     const ss = state.subStates[label];
     if (!ss) continue;
-    if (realPrice > ss.candleHigh) ss.candleHigh = realPrice;
-    if (realPrice < ss.candleLow)  ss.candleLow  = realPrice;
-    
+    if (price > ss.candleHigh) ss.candleHigh = price;
+    if (price < ss.candleLow)  ss.candleLow  = price;
     if (now >= ss.nextCandle) {
-      saveSubCandle(id, label, { 
-        time: ss.candleTime, 
-        open: ss.candleOpen, 
-        high: ss.candleHigh, 
-        low: ss.candleLow, 
-        close: realPrice 
-      });
+      saveSubCandle(id, label, { time:ss.candleTime, open:ss.candleOpen, high:ss.candleHigh, low:ss.candleLow, close:price });
       db.ref(`subcandles_${label}/${id}/live`).set(null).catch(() => {});
-      
       ss.candleTime = ss.nextCandle / 1000;
-      ss.candleOpen = realPrice;
-      ss.candleHigh = realPrice;
-      ss.candleLow  = realPrice;
+      ss.candleOpen = price;
+      ss.candleHigh = price;
+      ss.candleLow  = price;
       ss.nextCandle += ss.ms;
-      
-      while (ss.nextCandle <= now) { 
-        ss.candleTime = ss.nextCandle / 1000; 
-        ss.nextCandle += ss.ms; 
-      }
+      while (ss.nextCandle <= now) { ss.candleTime = ss.nextCandle / 1000; ss.nextCandle += ss.ms; }
     } else {
-      saveLiveSubCandle(id, label, { 
-        time: ss.candleTime, 
-        open: ss.candleOpen, 
-        high: ss.candleHigh, 
-        low: ss.candleLow, 
-        close: realPrice, 
-        nextCandle: ss.nextCandle 
-      });
+      saveLiveSubCandle(id, label, { time:ss.candleTime, open:ss.candleOpen, high:ss.candleHigh, low:ss.candleLow, close:price, nextCandle:ss.nextCandle });
     }
   }
 }
@@ -958,6 +947,7 @@ async function main() {
       if (_states[id]?.type === 'otc')   tickOTC(id);
       if (_states[id]?.type === 'forex') tickForex(id);
     });
+    _settleDueTradesFromMemory().catch(e => console.error('[tick-settle] error:', e.message));
     _settleDueTradesFromRTDB().catch(e => console.error('[rtdb-tick-settle] error:', e.message));
   }, TICK_MS);
   console.log('Server running ✅');
@@ -966,6 +956,7 @@ main().catch(console.error);
 
 const http = require('http');
 
+// ── /place-trade helper — body parse ──────────────────────
 function _readBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -979,11 +970,13 @@ const BAL_KEY_OTC   = (uid) => `gv:bal:${uid}`;
 const TRADE_KEY_OTC = (tid) => `gv:trade:${tid}`;
 
 http.createServer(async (req, res) => {
+  // CORS — client fetch করতে পারবে
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
+  // ── GET / — health check ──────────────────────────────
   if (req.method === 'GET' && req.url === '/') {
     const otc   = [..._activeMarkets].filter(id => _states[id]?.type === 'otc');
     const forex = [..._activeMarkets].filter(id => _states[id]?.type === 'forex');
@@ -992,9 +985,10 @@ http.createServer(async (req, res) => {
     return;
   }
 
-  // ── POST /place-trade ──
+  // ── POST /place-trade ─────────────────────────────────
   if (req.method === 'POST' && req.url === '/place-trade') {
     try {
+      // 1. Body parse
       let body;
       try { body = await _readBody(req); }
       catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid body' })); return; }
@@ -1004,6 +998,7 @@ http.createServer(async (req, res) => {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Missing idToken or trade' })); return;
       }
 
+      // 2. Firebase Auth token verify — server side security
       let decoded;
       try { decoded = await admin.auth().verifyIdToken(idToken); }
       catch(e) {
@@ -1018,12 +1013,12 @@ http.createServer(async (req, res) => {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid trade data' })); return;
       }
 
+      // 3. Redis balance check + atomic deduct
       const balKey = BAL_KEY_OTC(userId);
-      let currentBal;
-      
-      try {
-        currentBal = await redisSafe('get', balKey);
-      } catch (e) {
+      let currentBal = await redisPub.get(balKey);
+
+      if (currentBal === null) {
+        // Redis miss — Firestore থেকে load করে cache করো
         const snap = await firestore.collection('users').doc(userId).get();
         const bal  = snap.exists ? (snap.data().liveBalance || 0) : 0;
         await redisPub.set(balKey, bal.toString(), 'EX', 3600);
@@ -1035,13 +1030,15 @@ http.createServer(async (req, res) => {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Insufficient balance', balance: balFloat })); return;
       }
 
-      const newBal = await redisSafe('incrbyfloat', balKey, -amount);
-      await redisSafe('expire', balKey, 3600);
-      await redisSafe('set', `gv:bal:dirty:${userId}`, '1', 'EX', 3600);
+      // Atomic deduct — race condition safe
+      const newBal = await redisPub.incrbyfloat(balKey, -amount);
+      await redisPub.expire(balKey, 3600);
+      await redisPub.set(`gv:bal:dirty:${userId}`, '1', 'EX', 3600);
 
       console.log(`[place-trade] userId=${userId} tradeId=${tradeId} amount=${amount} newBal=${newBal}`);
 
-      await redisSafe('hset', TRADE_KEY_OTC(tradeId),
+      // 4. Redis Hash এ trade data save — settler <1ms এ পাবে
+      await redisPub.hset(TRADE_KEY_OTC(tradeId),
         'userId',          userId,
         'symbol',          trade.symbol || '',
         'entryPrice',      String(trade.entryPrice || 0),
@@ -1053,8 +1050,9 @@ http.createServer(async (req, res) => {
         'expiryTimestamp', String(trade.expiryTimestamp || 0),
         'currency',        trade.currency || 'USD',
       );
-      await redisSafe('expire', TRADE_KEY_OTC(tradeId), 7200);
+      await redisPub.expire(TRADE_KEY_OTC(tradeId), 7200); // 2h TTL
 
+      // 5. RTDB settlement_queue write — otc-server candle close এ এখান থেকে পাবে
       db.ref(`settlement_queue/${trade.expiryTimestamp}/${userId}/${tradeId}`).set({
         userId, tradeId,
         symbol:      trade.symbol || '',
@@ -1065,6 +1063,7 @@ http.createServer(async (req, res) => {
         entryPrice:  trade.entryPrice || 0,
       }).catch(e => console.error('[place-trade] RTDB queue failed:', e.message));
 
+      // 6. Firestore trade save — background, non-blocking
       firestore.collection('users').doc(userId).collection('trades').doc(tradeId).set({
         ...trade,
         userId,
@@ -1082,7 +1081,10 @@ http.createServer(async (req, res) => {
     return;
   }
 
-  // ── POST /withdraw-deduct ──
+  // ── POST /withdraw-deduct ─────────────────────────────────
+  // User নিজের withdraw request submit করলে এই endpoint call হয়।
+  // adminSecret নেই — Firebase idToken দিয়ে user authenticate করা হয়।
+  // uid client থেকে আসে না — token থেকে নেওয়া হয় (tamper-proof)।
   if (req.method === 'POST' && req.url === '/withdraw-deduct') {
     try {
       let body;
@@ -1090,10 +1092,12 @@ http.createServer(async (req, res) => {
       catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid body' })); return; }
 
       const { idToken, amount } = body;
+
       if (!idToken || !amount || parseFloat(amount) <= 0) {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Missing fields' })); return;
       }
 
+      // idToken verify — uid token থেকে নেওয়া হচ্ছে, client-এর uid বিশ্বাস করা হচ্ছে না
       let decoded;
       try { decoded = await admin.auth().verifyIdToken(idToken); }
       catch(e) {
@@ -1104,10 +1108,9 @@ http.createServer(async (req, res) => {
       const deductAmt = parseFloat(amount);
       const balKey = BAL_KEY_OTC(uid);
 
-      let currentBal;
-      try {
-        currentBal = await redisSafe('get', balKey);
-      } catch (e) {
+      // Redis miss হলে Firestore থেকে load
+      let currentBal = await redisPub.get(balKey);
+      if (currentBal === null) {
         const snap = await firestore.collection('users').doc(uid).get();
         const bal  = snap.exists ? (snap.data().liveBalance || 0) : 0;
         await redisPub.set(balKey, bal.toString(), 'EX', 3600);
@@ -1119,9 +1122,10 @@ http.createServer(async (req, res) => {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Insufficient balance', balance: balFloat })); return;
       }
 
-      const newBal = await redisSafe('incrbyfloat', balKey, -deductAmt);
-      await redisSafe('expire', balKey, 3600);
-      await redisSafe('set', `gv:bal:dirty:${uid}`, '1', 'EX', 3600);
+      // Atomic deduct
+      const newBal = await redisPub.incrbyfloat(balKey, -deductAmt);
+      await redisPub.expire(balKey, 3600);
+      await redisPub.set(`gv:bal:dirty:${uid}`, '1', 'EX', 3600);
 
       console.log(`[withdraw-deduct] uid=${uid} amount=${deductAmt} newBal=${newBal}`);
 
@@ -1135,7 +1139,7 @@ http.createServer(async (req, res) => {
     return;
   }
 
-  // ── POST /admin-deduct ──
+  // ── POST /admin-deduct ────────────────────────────────────
   if (req.method === 'POST' && req.url === '/admin-deduct') {
     try {
       let body;
@@ -1143,9 +1147,12 @@ http.createServer(async (req, res) => {
       catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid body' })); return; }
 
       const { uid, amount, adminSecret } = body;
+
+      // Admin secret check
       if (!adminSecret || adminSecret !== process.env.ADMIN_SECRET) {
         res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
       }
+
       if (!uid || !amount || parseFloat(amount) <= 0) {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid uid or amount' })); return;
       }
@@ -1153,10 +1160,9 @@ http.createServer(async (req, res) => {
       const deductAmt = parseFloat(amount);
       const balKey = BAL_KEY_OTC(uid);
 
-      let currentBal;
-      try {
-        currentBal = await redisSafe('get', balKey);
-      } catch (e) {
+      // Redis miss হলে Firestore থেকে load
+      let currentBal = await redisPub.get(balKey);
+      if (currentBal === null) {
         const snap = await firestore.collection('users').doc(uid).get();
         const bal  = snap.exists ? (snap.data().liveBalance || 0) : 0;
         await redisPub.set(balKey, bal.toString(), 'EX', 3600);
@@ -1168,9 +1174,10 @@ http.createServer(async (req, res) => {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Insufficient balance', balance: balFloat })); return;
       }
 
-      const newBal = await redisSafe('incrbyfloat', balKey, -deductAmt);
-      await redisSafe('expire', balKey, 3600);
-      await redisSafe('set', `gv:bal:dirty:${uid}`, '1', 'EX', 3600);
+      // Atomic deduct
+      const newBal = await redisPub.incrbyfloat(balKey, -deductAmt);
+      await redisPub.expire(balKey, 3600);
+      await redisPub.set(`gv:bal:dirty:${uid}`, '1', 'EX', 3600);
 
       console.log(`[admin-deduct] uid=${uid} amount=${deductAmt} newBal=${newBal}`);
 
@@ -1184,7 +1191,9 @@ http.createServer(async (req, res) => {
     return;
   }
 
-  // ── POST /admin-credit ──
+  // ── POST /admin-credit ───────────────────────────────────
+  // Admin panel থেকে deposit approve বা withdrawal reject করলে call হয়।
+  // adminSecret নেই — Firebase idToken + admin custom claim verify করা হয়।
   if (req.method === 'POST' && req.url === '/admin-credit') {
     try {
       let body;
@@ -1192,6 +1201,8 @@ http.createServer(async (req, res) => {
       catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid body' })); return; }
 
       const { idToken, uid, amount } = body;
+
+      // idToken verify — caller কে authenticate করো
       if (!idToken) {
         res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
       }
@@ -1201,9 +1212,11 @@ http.createServer(async (req, res) => {
         res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
       }
 
+      // Admin custom claim check — token.admin === true হলেই allow
       if (!decoded.admin) {
         res.writeHead(403); res.end(JSON.stringify({ error: 'Forbidden — admin only' })); return;
       }
+
       if (!uid || !amount || parseFloat(amount) <= 0) {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid uid or amount' })); return;
       }
@@ -1211,18 +1224,18 @@ http.createServer(async (req, res) => {
       const creditAmt = parseFloat(amount);
       const balKey = BAL_KEY_OTC(uid);
 
-      let currentBal;
-      try {
-        currentBal = await redisSafe('get', balKey);
-      } catch (e) {
+      // Redis miss হলে Firestore থেকে load
+      let currentBal = await redisPub.get(balKey);
+      if (currentBal === null) {
         const snap = await firestore.collection('users').doc(uid).get();
         const bal  = snap.exists ? (snap.data().liveBalance || 0) : 0;
         await redisPub.set(balKey, bal.toString(), 'EX', 3600);
       }
 
-      const newBal = await redisSafe('incrbyfloat', balKey, creditAmt);
-      await redisSafe('expire', balKey, 3600);
-      await redisSafe('set', `gv:bal:dirty:${uid}`, '1', 'EX', 3600);
+      // Atomic credit
+      const newBal = await redisPub.incrbyfloat(balKey, creditAmt);
+      await redisPub.expire(balKey, 3600);
+      await redisPub.set(`gv:bal:dirty:${uid}`, '1', 'EX', 3600);
 
       console.log(`[admin-credit] uid=${uid} amount=${creditAmt} newBal=${newBal}`);
 
@@ -1236,7 +1249,7 @@ http.createServer(async (req, res) => {
     return;
   }
 
-  // ── POST /sell-trade ──
+  // ── POST /sell-trade ─────────────────────────────────────
   if (req.method === 'POST' && req.url === '/sell-trade') {
     try {
       let body;
@@ -1244,37 +1257,38 @@ http.createServer(async (req, res) => {
       catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid body' })); return; }
 
       const { idToken, tradeId, userId, sellPrice: claimedSellPrice } = body;
+
       if (!idToken || !tradeId || !userId || !claimedSellPrice) {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Missing fields' })); return;
       }
 
+      // idToken verify — user authenticate
       let decoded;
       try { decoded = await admin.auth().verifyIdToken(idToken); }
       catch(e) {
         res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
       }
+
       if (decoded.uid !== userId) {
         res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
       }
 
+      // Redis Hash থেকে trade data নাও — দ্রুত validate (Firestore এর বদলে)
       const TRADE_KEY = `gv:trade:${tradeId}`;
-      let hash;
-      try {
-        hash = await redisSafe('hgetall', TRADE_KEY);
-      } catch (e) {
-        res.writeHead(503); res.end(JSON.stringify({ error: 'Service temporarily unavailable' })); return;
-      }
-      
+      const hash = await redisPub.hgetall(TRADE_KEY);
       if (!hash || !hash.userId) {
         res.writeHead(404); res.end(JSON.stringify({ error: 'Trade not found' })); return;
       }
+
       if (hash.userId !== userId) {
         res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
       }
+
       if (hash.status === 'sold' || hash.status === 'won' || hash.status === 'lost' || hash.status === 'refunded') {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Trade already settled' })); return;
       }
 
+      // sellPrice sanity check — max payout এর বেশি হতে পারবে না
       const tradeAmount = parseFloat(hash.amount || 0);
       const payoutPercent = parseFloat(hash.payoutPercent || 92);
       const maxPossible = tradeAmount + (tradeAmount * payoutPercent / 100);
@@ -1284,20 +1298,20 @@ http.createServer(async (req, res) => {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid sell price' })); return;
       }
 
+      // Redis এ atomic credit
       const balKey = BAL_KEY_OTC(userId);
-      let currentBal;
-      try {
-        currentBal = await redisSafe('get', balKey);
-      } catch (e) {
+      let currentBal = await redisPub.get(balKey);
+      if (currentBal === null) {
         const snap = await firestore.collection('users').doc(userId).get();
         const bal = snap.exists ? (snap.data().liveBalance || 0) : 0;
         await redisPub.set(balKey, bal.toString(), 'EX', 3600);
       }
 
-      const newBal = await redisSafe('incrbyfloat', balKey, sellPrice);
-      await redisSafe('expire', balKey, 3600);
-      await redisSafe('set', `gv:bal:dirty:${userId}`, '1', 'EX', 3600);
-      await redisSafe('hset', `gv:trade:${tradeId}`, 'status', 'sold');
+      const newBal = await redisPub.incrbyfloat(balKey, sellPrice);
+      await redisPub.expire(balKey, 3600);
+      await redisPub.set(`gv:bal:dirty:${userId}`, '1', 'EX', 3600);
+      // Redis Hash এ status 'sold' set করো — settler আর credit করবে না
+      await redisPub.hset(`gv:trade:${tradeId}`, 'status', 'sold');
 
       console.log(`[sell-trade] userId=${userId} tradeId=${tradeId} sellPrice=${sellPrice} newBal=${newBal}`);
 
@@ -1311,7 +1325,8 @@ http.createServer(async (req, res) => {
     return;
   }
 
-  // ── GET /crypto-currencies ──
+  // ── GET /crypto-currencies ───────────────────────────────
+  // NOWPayments থেকে available crypto currencies list — 1 ঘণ্টা cache করা হয়
   if (req.method === 'GET' && req.url === '/crypto-currencies') {
     try {
       const now = Date.now();
@@ -1330,6 +1345,7 @@ http.createServer(async (req, res) => {
         res.writeHead(502); res.end(JSON.stringify({ error: 'NOWPayments currencies fetch failed' })); return;
       }
 
+      // শুধু enabled currency গুলো রাখো, frontend এর জন্য simplify করো
       const list = npData.currencies
         .filter(c => c.enable)
         .map(c => ({ code: c.code, name: c.name, logo: c.logo_url || null, network: c.network }));
@@ -1347,7 +1363,7 @@ http.createServer(async (req, res) => {
     return;
   }
 
-  // ── POST /create-crypto-payment ──
+  // ── POST /create-crypto-payment ──────────────────────────
   if (req.method === 'POST' && req.url === '/create-crypto-payment') {
     try {
       let body;
@@ -1355,6 +1371,7 @@ http.createServer(async (req, res) => {
       catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid body' })); return; }
 
       const { idToken, amountUSD, payCurrency } = body;
+
       if (!idToken || !amountUSD || !payCurrency) {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Missing fields' })); return;
       }
@@ -1364,6 +1381,7 @@ http.createServer(async (req, res) => {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid amount' })); return;
       }
 
+      // idToken verify — user authenticate
       let decoded;
       try { decoded = await admin.auth().verifyIdToken(idToken); }
       catch(e) {
@@ -1371,6 +1389,7 @@ http.createServer(async (req, res) => {
       }
       const userId = decoded.uid;
 
+      // NOWPayments — Create Payment
       const npRes = await fetch('https://api.nowpayments.io/v1/payment', {
         method: 'POST',
         headers: {
@@ -1393,6 +1412,7 @@ http.createServer(async (req, res) => {
         res.writeHead(502); res.end(JSON.stringify({ error: 'Payment creation failed', detail: npData.message || npData })); return;
       }
 
+      // Firestore এ track করার জন্য record রাখো
       await firestore.collection('cryptoPayments').doc(String(npData.payment_id)).set({
         uid:           userId,
         amountUSD:     amt,
@@ -1423,13 +1443,15 @@ http.createServer(async (req, res) => {
     return;
   }
 
-  // ── POST /nowpayments-webhook ──
+  // ── POST /nowpayments-webhook ────────────────────────────
+  // NOWPayments IPN callback — payment status update পাঠায়
   if (req.method === 'POST' && req.url === '/nowpayments-webhook') {
     try {
       let body;
       try { body = await _readBody(req); }
       catch(e) { res.writeHead(400); res.end('Invalid body'); return; }
 
+      // ── Signature verify — HMAC-SHA512, sorted keys ──
       const receivedSig = req.headers['x-nowpayments-sig'];
       if (!receivedSig) {
         console.warn('[nowpayments-webhook] missing signature header');
@@ -1449,37 +1471,48 @@ http.createServer(async (req, res) => {
       const expectedSig = hmac.digest('hex');
 
       if (expectedSig !== receivedSig) {
-        console.warn('[nowpayments-webhook] signature mismatch');
+        console.warn('[nowpayments-webhook] signature mismatch — possible forged request');
         res.writeHead(401); res.end('Invalid signature'); return;
       }
 
+      // ── Signature OK — payment process করো ──
       const { payment_id, payment_status, price_amount } = body;
+
       if (!payment_id) {
         res.writeHead(400); res.end('Missing payment_id'); return;
       }
 
       console.log(`[nowpayments-webhook] paymentId=${payment_id} status=${payment_status}`);
 
+      // শুধু 'finished' status এ balance credit করো
       if (payment_status === 'finished') {
         const payDocRef = firestore.collection('cryptoPayments').doc(String(payment_id));
+
+        // Transaction দিয়ে atomic check-and-mark — duplicate webhook race condition প্রতিরোধ করে
         let shouldCredit = false;
         let uid = null;
         let creditAmt = 0;
 
         await firestore.runTransaction(async (tx) => {
           const payDoc = await tx.get(payDocRef);
+
           if (!payDoc.exists) {
-            console.warn(`[nowpayments-webhook] paymentId=${payment_id} — no matching record`);
+            console.warn(`[nowpayments-webhook] paymentId=${payment_id} — no matching record found`);
             return;
           }
+
           const payData = payDoc.data();
+
           if (payData.status === 'finished') {
             console.log(`[nowpayments-webhook] paymentId=${payment_id} already processed — skip`);
             return;
           }
+
           uid = payData.uid;
           creditAmt = parseFloat(price_amount) || payData.amountUSD;
           shouldCredit = true;
+
+          // এখনই status 'finished' মার্ক করো — পরবর্তী duplicate webhook এই check এ আটকে যাবে
           tx.update(payDocRef, {
             status:         'finished',
             creditedAmount: creditAmt,
@@ -1488,24 +1521,24 @@ http.createServer(async (req, res) => {
         });
 
         if (shouldCredit && uid) {
+          // Redis এ USD credit (transaction এর বাইরে — Redis Firestore transaction এ অংশ নেয় না)
           const balKey = BAL_KEY_OTC(uid);
-          let currentBal;
-          try {
-            currentBal = await redisSafe('get', balKey);
-          } catch (e) {
+          let currentBal = await redisPub.get(balKey);
+          if (currentBal === null) {
             const userSnap = await firestore.collection('users').doc(uid).get();
             const bal = userSnap.exists ? (userSnap.data().liveBalance || 0) : 0;
             await redisPub.set(balKey, bal.toString(), 'EX', 3600);
           }
 
-          const newBal = await redisSafe('incrbyfloat', balKey, creditAmt);
-          await redisSafe('expire', balKey, 3600);
-          await redisSafe('set', `gv:bal:dirty:${uid}`, '1', 'EX', 3600);
+          const newBal = await redisPub.incrbyfloat(balKey, creditAmt);
+          await redisPub.expire(balKey, 3600);
+          await redisPub.set(`gv:bal:dirty:${uid}`, '1', 'EX', 3600);
 
           console.log(`[nowpayments-webhook] uid=${uid} paymentId=${payment_id} credited=${creditAmt} newBal=${newBal}`);
         }
 
       } else {
+        // অন্য status (waiting, confirming, partially_paid, failed, expired) — শুধু log/track করো
         const payDocRef = firestore.collection('cryptoPayments').doc(String(payment_id));
         await payDocRef.update({ status: payment_status || 'unknown' }).catch(() => {});
       }
@@ -1528,3 +1561,11 @@ setInterval(() => {
     .then(() => console.log('[ping] OK'))
     .catch(() => {});
 }, 8*60*1000);
+
+
+
+
+
+
+
+
