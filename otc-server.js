@@ -1071,6 +1071,17 @@ function tickOTC(id) {
   state._velocity = Math.max(-maxVel, Math.min(maxVel, state._velocity));
 
   let delta = state._velocity * speed;
+
+  // ── [RANDOM SPIKE TICK] মাঝে মাঝে হঠাৎ বড় tick — real market এ হঠাৎ
+  // বড় order এলে price ঝট করে সরে যায়। বেশিরভাগ tick স্বাভাবিক, কিন্তু
+  // ~3% tick এ হঠাৎ একটা বড় লাফ (safety clamp এর মধ্যেই)।
+  if ((!ctrl.mode || ctrl.mode === 'auto') && Math.random() < 0.03) {
+    // spike direction — বেশিরভাগ সময় current velocity দিকে, কখনো random
+    const spikeDir = Math.random() < 0.7 ? Math.sign(delta || (Math.random()-0.5)) : (Math.random() < 0.5 ? 1 : -1);
+    const spikeMag = v * (0.8 + Math.random() * 1.4); // বড় movement (clamp এর নিচে varied)
+    delta += spikeDir * spikeMag;
+  }
+
   const maxStep = state.price * 0.0015; // hard safety — প্রতি tick max ±0.15%
   delta = Math.max(-maxStep, Math.min(maxStep, delta));
   state.price = Math.max(state.price + delta, 0.0001);
