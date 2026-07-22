@@ -925,7 +925,7 @@ function tickOTC(id) {
       if (cProg < 0.4) charBias = (state._cRejectDir || -1);       // প্রথমে rejection দিকে
       else if (cProg < 0.55) charBias = (state._candlePersonality || 0) * 1.3; // তারপর জোরে ফিরে
     }
-    const candleBiasForce = charBias * v * (state._candleConviction || 0.4) * 0.34 * pScale;
+    const candleBiasForce = charBias * v * (state._candleConviction || 0.4) * 0.32 * pScale;
 
     // Tick clustering — কয়েক tick ধরে এক দিকে থাকার প্রবণতা (body বড় করে)
     // [UNPREDICTABILITY FIX] duration কমানো (৫s trader window এর সাথে
@@ -941,7 +941,7 @@ function tickOTC(id) {
     const clusterForce = state._clusterDir * v * state._clusterStr * 0.22;
 
     // Regime trend force
-    const trendForce = rp.trend * (state._regimeDir || 1) * v * 0.3;
+    const trendForce = rp.trend * (state._regimeDir || 1) * v * 0.12;
 
     // Smooth correlated noise (pure random না — real market এর মতো)
     // [CHARACTER] noise এর মাত্রা candle character অনুযায়ী — doji/spinning
@@ -949,7 +949,9 @@ function tickOTC(id) {
     if (state._noiseX === undefined) { state._noiseX = Math.random()*1000; state._noiseSeed = (Math.random()*1e9)|0; }
     state._noiseX += 0.1;
     const wickTend = state._cWickTend || 0.6;
-    let noiseForce = _smoothNoise(state._noiseSeed, state._noiseX) * v * 0.6 * wickTend;
+    // pure random-dominant noise (smooth অংশ কমিয়ে unpredictability সর্বোচ্চ)
+    let noiseForce = _smoothNoise(state._noiseSeed, state._noiseX) * v * 0.15 * wickTend;
+    noiseForce += (Math.random() - 0.5) * v * 3.8 * wickTend;
     // indecision — doji/spinning এ মাঝে মাঝে হঠাৎ দিক বদল (দোদুল্যমান wick)
     const indec = state._cIndecision || 0.4;
     if (Math.random() < 0.10 * indec) {
@@ -1066,7 +1068,10 @@ function tickOTC(id) {
   // ── NET FORCE → velocity (momentum) → price, safety clamp সহ ──────────
   if (state._velocity === undefined) state._velocity = 0;
   state._velocity += netForce;
-  state._velocity *= Math.max(0.65, Math.min(0.90, state._friction || 0.85));
+  // [UNPREDICTABILITY] velocity persistence কমানো — আগে 0.65-0.90 ছিল,
+  // এতে momentum অনেকক্ষণ এক দিকে টানত (৮৮% predictable)। এখন কম রাখি
+  // যাতে প্রতি tick এ direction বেশি স্বাধীন হয়, কিন্তু সামান্য glide থাকে।
+  state._velocity *= Math.max(0.25, Math.min(0.45, (state._friction || 0.85) - 0.45));
   const maxVel = v * 1.8;
   state._velocity = Math.max(-maxVel, Math.min(maxVel, state._velocity));
 
