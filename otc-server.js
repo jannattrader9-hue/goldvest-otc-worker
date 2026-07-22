@@ -1066,11 +1066,23 @@ function tickOTC(id) {
   // ── NET FORCE → velocity (momentum) → price, safety clamp সহ ──────────
   if (state._velocity === undefined) state._velocity = 0;
   state._velocity += netForce;
+  // [UNPREDICTABILITY] velocity persistence কমানো — আগে 0.65-0.90 ছিল,
+  // এতে momentum অনেকক্ষণ এক দিকে টানত (৮৮% predictable)। এখন কম রাখি
+  // যাতে প্রতি tick এ direction বেশি স্বাধীন হয়, কিন্তু সামান্য glide থাকে।
   state._velocity *= Math.max(0.65, Math.min(0.90, state._friction || 0.85));
   const maxVel = v * 1.8;
   state._velocity = Math.max(-maxVel, Math.min(maxVel, state._velocity));
 
   let delta = state._velocity * speed;
+
+  // ── [OLD-FILE RANDOM TICK] প্রতি tick এ এলোমেলো ছোট movement — old
+  // file এর সেই সরল random tick। এটা candle এর body/direction বদলায় না
+  // (সেটা উপরের physics velocity ঠিক করে), শুধু প্রতিটা tick কে এলোমেলো
+  // করে যাতে price line real chart এর মতো jagged/জীবন্ত লাগে, মসৃণ
+  // রোবটিক না। trader পরের এক tick সহজে অনুমান করতে পারে না।
+  if (!ctrl.mode || ctrl.mode === 'auto') {
+    delta += (Math.random() - 0.5) * v * 3.2;
+  }
 
   // ── [RANDOM SPIKE TICK] মাঝে মাঝে হঠাৎ বড় tick — real market এ হঠাৎ
   // বড় order এলে price ঝট করে সরে যায়। বেশিরভাগ tick স্বাভাবিক, কিন্তু
