@@ -601,6 +601,39 @@ function _regimeDur(name) {
   return lo + (Math.random() * (hi - lo) | 0);
 }
 
+// ── SYNTHETIC VOLUME — market কে সবসময় জীবন্ত রাখে (real user না থাকলেও) ─
+// হাজার হাজার virtual trader trade করছে এমন ভাব দেয়। activity cycle
+// (busy/quiet period) + random spike (news event এর মতো) তৈরি করে।
+function _syntheticVolume(state) {
+  // slow activity cycle — market এর "ব্যস্ততা" ধীরে ওঠানামা করে
+  if (state._synCycle === undefined) {
+    state._synCycle = Math.random() * Math.PI * 2;
+    state._synBase = 30 + Math.random() * 40;   // base activity level
+    state._synSpikeTicks = 0;
+  }
+  state._synCycle += 0.008; // ধীর cycle (কয়েক মিনিটে একবার busy/quiet)
+  // sine wave দিয়ে busy/quiet — 0.4x থেকে 1.6x পর্যন্ত ওঠানামা
+  const cycleMul = 1.0 + Math.sin(state._synCycle) * 0.6;
+
+  // random spike — মাঝে মাঝে হঠাৎ অনেক "order" (volatility burst)
+  if (state._synSpikeTicks > 0) {
+    state._synSpikeTicks--;
+  } else if (Math.random() < 0.015) {
+    // ~1.5% chance এ একটা spike শুরু হয় (কয়েক tick ধরে থাকে)
+    state._synSpikeTicks = 8 + (Math.random() * 20 | 0);
+    state._synSpikeMag = 1.5 + Math.random() * 2.5;
+  }
+  const spikeMul = state._synSpikeTicks > 0 ? (state._synSpikeMag || 1) : 1;
+
+  // base drift — মাঝে মাঝে base level ধীরে বদলায় (market এর mood)
+  if (Math.random() < 0.005) state._synBase = 25 + Math.random() * 55;
+
+  // ছোট random noise প্রতি tick এ (একঘেয়ে না)
+  const noise = 0.7 + Math.random() * 0.6;
+
+  return state._synBase * cycleMul * spikeMul * noise;
+}
+
 // ── SUPPORT / RESISTANCE — swing level মনে রাখা + bounce ────────────────
 function _updateLevels(state) {
   if (!state._levels) state._levels = [];
@@ -754,6 +787,10 @@ async function initOTC(market) {
     _actScale: 1.0,
     _actScaleCur: 1.0,
     _volSmooth: 0.3,
+    _synCycle: undefined,
+    _synBase: 50,
+    _synSpikeTicks: 0,
+    _synSpikeMag: 1,
     _recentHigh: price,
     _recentLow: price,
     _anchor: price,
@@ -934,16 +971,17 @@ function tickOTC(id) {
 
     netForce = trendForce + candleBiasForce + clusterForce + noiseForce + levelForce + reversionForce;
 
-    // ── [VOLUME-DRIVEN ACTIVITY] real user দের buy/sell order volume থেকে
-    // movement ঠিক হয়। বেশি order (up+down) → বেশি movement (active/burst),
-    // কম order → শান্ত (freeze/crawl)। Real market এর মূল নিয়ম।
+    // ── [VOLUME-DRIVEN ACTIVITY] real user + synthetic volume থেকে
+    // movement ঠিক হয়। synthetic volume market কে সবসময় জীবন্ত রাখে
+    // (real user না থাকলেও), আর real order থাকলে সেটা extra যোগ হয়।
     const vStats = _tradeStats[id] || {};
     const upVol   = parseFloat(vStats.upAmount)   || 0;
     const downVol = parseFloat(vStats.downAmount) || 0;
-    const totalVol = upVol + downVol;
-    // volume কে 0-1 এ map করি (একটা reference scale দিয়ে, smooth)
-    // volFactor: 0 (কোনো order নেই) → 1+ (অনেক order)
-    const volFactor = Math.min(2.0, totalVol / 50); // $50 order = normal activity
+    const realVol = upVol + downVol;
+    const synVol  = _syntheticVolume(state);   // engine-তৈরি "virtual" volume
+    const totalVol = synVol + realVol * 1.5;    // real order একটু বেশি weight পায়
+    // volume কে 0-1+ এ map করি
+    const volFactor = Math.min(2.0, totalVol / 70);
     // smooth — volume হঠাৎ বদলালেও movement ধীরে adjust হয়
     if (state._volSmooth === undefined) state._volSmooth = 0.3;
     state._volSmooth += (volFactor - state._volSmooth) * 0.05;
