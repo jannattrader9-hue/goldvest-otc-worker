@@ -741,6 +741,7 @@ async function initOTC(market) {
     _lastLevelHit: null,
     _fakeBreakTicks: 0,
     _fakeBreakDir: 0,
+    _trendAge: 0,
     _recentHigh: price,
     _recentLow: price,
     _anchor: price,
@@ -768,9 +769,24 @@ function tickOTC(id) {
     if (!state._regime) { state._regime = 'ranging'; state._regimeTick = _regimeDur('ranging'); }
     state._regimeTick--;
     if (state._regimeTick <= 0) {
+      // [MARKET HISTORY] দীর্ঘ trend এর পর exhaustion — টানা এক দিকে
+      // গেলে পরের regime বিপরীত দিকে যাওয়ার সম্ভাবনা বেশি (trend চিরকাল
+      // চলে না, ক্লান্ত হয়ে ঘুরে যায়)।
+      const prevDir = state._regimeDir || 1;
+      const wasTrending = (state._regime === 'trending' || state._regime === 'breakout');
       state._regime = _nextRegime(state._regime);
       state._regimeTick = _regimeDur(state._regime);
-      state._regimeDir = Math.random() < 0.5 ? 1 : -1;
+      // trend age বাড়ছে → reversal সম্ভাবনা বাড়ে
+      if (wasTrending) {
+        state._trendAge = (state._trendAge || 0) + 1;
+        // যত বেশি টানা trend, তত বেশি বিপরীত দিকে যাওয়ার chance
+        const reverseChance = Math.min(0.75, 0.4 + state._trendAge * 0.15);
+        state._regimeDir = Math.random() < reverseChance ? -prevDir : prevDir;
+        if (state._regimeDir !== prevDir) state._trendAge = 0; // ঘুরে গেলে age reset
+      } else {
+        state._trendAge = 0;
+        state._regimeDir = Math.random() < 0.5 ? 1 : -1;
+      }
     }
   } else if (ctrl.mode === 'manual') {
     state.trend = ctrl.nextDirection === 'up' ? 1 : ctrl.nextDirection === 'down' ? -1 : 0;
