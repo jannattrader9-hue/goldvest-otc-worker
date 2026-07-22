@@ -609,8 +609,9 @@ function _updateLevels(state) {
   if (!state._recentHigh || p > state._recentHigh) state._recentHigh = p;
   if (!state._recentLow  || p < state._recentLow)  state._recentLow  = p;
   if (state._swingTick % 45 === 0) {
-    if (state._recentHigh) state._levels.push({ price: state._recentHigh, s: 1.0 });
-    if (state._recentLow)  state._levels.push({ price: state._recentLow,  s: 1.0 });
+    // swing high = resistance (উপরে বাধা), swing low = support (নিচে ভিত্তি)
+    if (state._recentHigh) state._levels.push({ price: state._recentHigh, s: 1.0, type: 'r' });
+    if (state._recentLow)  state._levels.push({ price: state._recentLow,  s: 1.0, type: 's' });
     state._recentHigh = p; state._recentLow = p;
     state._levels.forEach(l => l.s *= 0.9);
     state._levels = state._levels.filter(l => l.s > 0.25).slice(-10);
@@ -646,6 +647,12 @@ function _levelForce(state, v) {
           // REAL BREAKOUT (২০%) — level ভেঙে ওপারে চলে যায়
           force += towardLevel * v * 1.1;
           l.s *= 0.4; // ভাঙা level দুর্বল হয়
+          // [S/R FLIP] support ভাঙলে resistance হয়, resistance ভাঙলে
+          // support — real market এর মূল নিয়ম। ভাঙার পর price ফিরে এলে
+          // এই level এখন উল্টো ভূমিকায় বাধা দেবে।
+          l.type = (l.type === 's') ? 'r' : 's';
+          l.s = Math.max(l.s, 0.6); // flip হওয়া level নতুন ভূমিকায় কার্যকর
+          l.flipped = true;
         } else {
           // FAKE BREAKOUT (২৫%) — সামান্য ভেঙে ঢোকে, পরে ফিরে আসে (stop hunt)
           state._fakeBreakTicks = 3 + (Math.random() * 4 | 0); // কয়েক tick পরে reverse
