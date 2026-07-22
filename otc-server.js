@@ -620,9 +620,40 @@ function _levelForce(state, v) {
   if (!state._levels || state._levels.length === 0) return 0;
   const p = state.price;
   let force = 0;
+
+  // ── fake breakout চলমান থাকলে — level এর ওপারে গিয়ে ফিরে আসা ──────────
+  if (state._fakeBreakTicks > 0) {
+    state._fakeBreakTicks--;
+    // ফিরে আসার দিকে জোরালো push (যে level ভেঙেছিল তার উল্টো দিকে)
+    force += state._fakeBreakDir * v * 1.2;
+    return force;
+  }
+
   for (const l of state._levels) {
     const distPct = Math.abs(l.price - p) / p;
-    if (distPct < 0.0012) force += -Math.sign(l.price - p) * v * 0.5 * l.s; // bounce
+    if (distPct < 0.0012) {
+      // level এর খুব কাছে — এখন সিদ্ধান্ত: bounce / real break / fake break
+      if (!state._lastLevelHit || Math.abs(state._lastLevelHit - l.price) > p * 0.0006) {
+        state._lastLevelHit = l.price;
+        const roll = Math.random();
+        const towardLevel = Math.sign(l.price - p); // price level এর দিকে যাচ্ছে
+
+        if (roll < 0.55) {
+          // BOUNCE (৫৫%) — level থেকে ফিরে আসে (support/resistance ধরে রাখে)
+          force += -towardLevel * v * 0.9 * l.s;
+          l.s = Math.min(1.2, l.s + 0.1); // bounce করলে level শক্তিশালী হয়
+        } else if (roll < 0.75) {
+          // REAL BREAKOUT (২০%) — level ভেঙে ওপারে চলে যায়
+          force += towardLevel * v * 1.1;
+          l.s *= 0.4; // ভাঙা level দুর্বল হয়
+        } else {
+          // FAKE BREAKOUT (২৫%) — সামান্য ভেঙে ঢোকে, পরে ফিরে আসে (stop hunt)
+          state._fakeBreakTicks = 3 + (Math.random() * 4 | 0); // কয়েক tick পরে reverse
+          state._fakeBreakDir = -towardLevel; // ফিরে আসার দিক
+          force += towardLevel * v * 0.9; // প্রথমে সামান্য ভেঙে ঢোকে (trap)
+        }
+      }
+    }
   }
   return force;
 }
@@ -707,6 +738,9 @@ async function initOTC(market) {
     _noiseSeed: (Math.random()*1e9)|0,
     _levels: [],
     _swingTick: 0,
+    _lastLevelHit: null,
+    _fakeBreakTicks: 0,
+    _fakeBreakDir: 0,
     _recentHigh: price,
     _recentLow: price,
     _anchor: price,
