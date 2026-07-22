@@ -749,6 +749,10 @@ async function initOTC(market) {
     _fakeBreakTicks: 0,
     _fakeBreakDir: 0,
     _trendAge: 0,
+    _actTick: 0,
+    _actState: 'active',
+    _actScale: 1.0,
+    _actScaleCur: 1.0,
     _recentHigh: price,
     _recentLow: price,
     _anchor: price,
@@ -929,13 +933,46 @@ function tickOTC(id) {
 
     netForce = trendForce + candleBiasForce + clusterForce + noiseForce + levelForce + reversionForce;
 
+    // ── [ACTIVITY STATE] price এর "মুড" — কখনো দ্রুত, কখনো freeze, কখনো
+    // ছোট tick (crawl)। Real market এর মতো — সবসময় সমান গতিতে নড়ে না,
+    // মাঝে মাঝে থমকে দাঁড়ায়, তারপর আবার চলে।
+    if (state._actTick === undefined || state._actTick <= 0) {
+      const ar = Math.random();
+      if (ar < 0.30) {
+        // FREEZE — প্রায় থেমে (৩-৪ সেকেন্ড = ৬-৮ tick)
+        state._actState = 'freeze';
+        state._actTick = 6 + (Math.random() * 3 | 0); // ৬-৮ tick = ৩-৪ সেকেন্ড
+        state._actScale = 0.05 + Math.random() * 0.07; // খুব সামান্য নড়ে
+      } else if (ar < 0.55) {
+        // CRAWL — ছোট ছোট tick (৪-৮ tick)
+        state._actState = 'crawl';
+        state._actTick = 4 + (Math.random() * 5 | 0);
+        state._actScale = 0.3 + Math.random() * 0.25;
+      } else if (ar < 0.80) {
+        // ACTIVE — স্বাভাবিক গতি
+        state._actState = 'active';
+        state._actTick = 5 + (Math.random() * 8 | 0);
+        state._actScale = 0.9 + Math.random() * 0.3;
+      } else {
+        // BURST — দ্রুত move (২-৫ tick)
+        state._actState = 'burst';
+        state._actTick = 2 + (Math.random() * 4 | 0);
+        state._actScale = 1.4 + Math.random() * 0.5;
+      }
+    }
+    state._actTick--;
+    // smooth transition — হঠাৎ না, ধীরে scale বদলায়
+    if (state._actScaleCur === undefined) state._actScaleCur = 1.0;
+    state._actScaleCur += ((state._actScale || 1.0) - state._actScaleCur) * 0.25;
+    netForce *= state._actScaleCur;
+
     // Dynamic friction — regime অনুযায়ী smooth lerp (trending এ বেশি glide)
-    // [UNPREDICTABILITY FIX] friction একটু কমানো হলো — momentum কম সময়
-    // ধরে থাকবে, ৫-১০ সেকেন্ডে trader "এখন উপরে, তাই পরেও উপরে যাবে"
-    // এই ধরনের নিশ্চিত অনুমান করতে পারবে না।
+    // freeze অবস্থায় friction বেশি (দ্রুত থামে), burst এ কম (গড়িয়ে যায়)
     if (state._friction === undefined) state._friction = 0.85;
-    const rpFrictionAdj = Math.max(0.60, rp.friction - 0.15);
-    state._friction += (rpFrictionAdj - state._friction) * 0.08;
+    let rpFrictionAdj = Math.max(0.60, rp.friction - 0.15);
+    if (state._actState === 'freeze') rpFrictionAdj = 0.5;   // দ্রুত থামে
+    else if (state._actState === 'burst') rpFrictionAdj = Math.min(0.9, rpFrictionAdj + 0.1);
+    state._friction += (rpFrictionAdj - state._friction) * 0.15;
   } else {
     // manual / trade-based — আগের মতোই সরল trend+random (override predictable রাখতে)
     v = state.price * 0.0008 * volMul;
