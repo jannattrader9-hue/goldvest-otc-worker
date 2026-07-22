@@ -753,6 +753,7 @@ async function initOTC(market) {
     _actState: 'active',
     _actScale: 1.0,
     _actScaleCur: 1.0,
+    _volSmooth: 0.3,
     _recentHigh: price,
     _recentLow: price,
     _anchor: price,
@@ -933,28 +934,42 @@ function tickOTC(id) {
 
     netForce = trendForce + candleBiasForce + clusterForce + noiseForce + levelForce + reversionForce;
 
-    // ── [ACTIVITY STATE] price এর "মুড" — কখনো দ্রুত, কখনো freeze, কখনো
-    // ছোট tick (crawl)। Real market এর মতো — সবসময় সমান গতিতে নড়ে না,
-    // মাঝে মাঝে থমকে দাঁড়ায়, তারপর আবার চলে।
+    // ── [VOLUME-DRIVEN ACTIVITY] real user দের buy/sell order volume থেকে
+    // movement ঠিক হয়। বেশি order (up+down) → বেশি movement (active/burst),
+    // কম order → শান্ত (freeze/crawl)। Real market এর মূল নিয়ম।
+    const vStats = _tradeStats[id] || {};
+    const upVol   = parseFloat(vStats.upAmount)   || 0;
+    const downVol = parseFloat(vStats.downAmount) || 0;
+    const totalVol = upVol + downVol;
+    // volume কে 0-1 এ map করি (একটা reference scale দিয়ে, smooth)
+    // volFactor: 0 (কোনো order নেই) → 1+ (অনেক order)
+    const volFactor = Math.min(2.0, totalVol / 50); // $50 order = normal activity
+    // smooth — volume হঠাৎ বদলালেও movement ধীরে adjust হয়
+    if (state._volSmooth === undefined) state._volSmooth = 0.3;
+    state._volSmooth += (volFactor - state._volSmooth) * 0.05;
+    const vf = state._volSmooth; // 0 = শান্ত, 1 = normal, 2 = খুব active
+
+    // activity state — volume অনুযায়ী probability বদলায়
     if (state._actTick === undefined || state._actTick <= 0) {
       const ar = Math.random();
-      if (ar < 0.30) {
-        // FREEZE — প্রায় থেমে (৩-৪ সেকেন্ড = ৬-৮ tick)
+      // volume বেশি হলে freeze কম, burst বেশি; volume কম হলে উল্টো
+      const freezeP = Math.max(0.05, 0.40 - vf * 0.20);   // কম volume → বেশি freeze
+      const crawlP  = freezeP + Math.max(0.10, 0.30 - vf * 0.08);
+      const activeP = crawlP + 0.30;
+      // বাকিটা burst (volume বেশি হলে বড় অংশ)
+      if (ar < freezeP) {
         state._actState = 'freeze';
-        state._actTick = 6 + (Math.random() * 3 | 0); // ৬-৮ tick = ৩-৪ সেকেন্ড
-        state._actScale = 0.05 + Math.random() * 0.07; // খুব সামান্য নড়ে
-      } else if (ar < 0.55) {
-        // CRAWL — ছোট ছোট tick (৪-৮ tick)
+        state._actTick = 6 + (Math.random() * 3 | 0);
+        state._actScale = 0.05 + Math.random() * 0.07;
+      } else if (ar < crawlP) {
         state._actState = 'crawl';
         state._actTick = 4 + (Math.random() * 5 | 0);
         state._actScale = 0.3 + Math.random() * 0.25;
-      } else if (ar < 0.80) {
-        // ACTIVE — স্বাভাবিক গতি
+      } else if (ar < activeP) {
         state._actState = 'active';
         state._actTick = 5 + (Math.random() * 8 | 0);
         state._actScale = 0.9 + Math.random() * 0.3;
       } else {
-        // BURST — দ্রুত move (২-৫ tick)
         state._actState = 'burst';
         state._actTick = 2 + (Math.random() * 4 | 0);
         state._actScale = 1.4 + Math.random() * 0.5;
@@ -964,7 +979,13 @@ function tickOTC(id) {
     // smooth transition — হঠাৎ না, ধীরে scale বদলায়
     if (state._actScaleCur === undefined) state._actScaleCur = 1.0;
     state._actScaleCur += ((state._actScale || 1.0) - state._actScaleCur) * 0.25;
-    netForce *= state._actScaleCur;
+
+    // ── movement = activity scale × volume factor × random tick ──────────
+    // random tick — প্রতি tick এ এলোমেলো ছোট variation (একঘেয়ে না)
+    const randomTick = 0.6 + Math.random() * 0.8; // 0.6–1.4 এলোমেলো
+    // volume factor সরাসরি movement এ — বেশি order = বড় move
+    const volMove = 0.35 + vf * 0.65; // কম volume এও base movement থাকে
+    netForce *= state._actScaleCur * volMove * randomTick;
 
     // Dynamic friction — regime অনুযায়ী smooth lerp (trending এ বেশি glide)
     // freeze অবস্থায় friction বেশি (দ্রুত থামে), burst এ কম (গড়িয়ে যায়)
