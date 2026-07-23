@@ -1105,13 +1105,48 @@ function tickOTC(id) {
 
   let delta = state._velocity * speed;
 
+  // ── [SEA STATE] প্রতি candle-এর ভেতরে tick texture বদলায় — কখনো শান্ত,
+  // কখনো সামান্য ঢেউ, কখনো অস্থির। duration ও state সম্পূর্ণ random
+  // (heavy-tail), আর প্রতি candle-এ probability weights নিজেই re-roll হয় —
+  // তাই লম্বা observation-এও কোনো statistical pattern বের করা যায় না।
+  // এটা শুধু tick-level random components-এ গুণ হয় — physics velocity
+  // (candle body/direction) untouched থাকে।
+  if (!ctrl.mode || ctrl.mode === 'auto') {
+    // প্রতি নতুন candle-এ weights re-roll — এই candle শান্ত-ঘেঁষা নাকি
+    // ঝাঁকুনি-ঘেঁষা হবে, সেটাও random
+    if (state._seaWeightCandle !== state.candleOpen) {
+      state._seaWeightCandle = state.candleOpen;
+      const w = [Math.random(), Math.random(), Math.random(), Math.random()];
+      const sum = w[0] + w[1] + w[2] + w[3];
+      state._seaWeights = w.map(x => x / sum);
+    }
+    if (state._seaTick === undefined || state._seaTick <= 0) {
+      // heavy-tail duration — বেশিরভাগ ২–১০ tick (১–৫s), মাঝে মাঝে ২০–৪০
+      state._seaTick = Math.random() < 0.15
+        ? 20 + (Math.random() * 20 | 0)
+        : 2 + (Math.random() * 8 | 0);
+      // weighted random state — কোনো fixed sequence নেই, শান্ত থেকে
+      // সরাসরি অস্থিরেও লাফ দিতে পারে
+      const r = Math.random(), sw = state._seaWeights || [0.25, 0.25, 0.25, 0.25];
+      if (r < sw[0])                      state._seaTarget = 0.15 + Math.random() * 0.20; // শান্ত সমুদ্র
+      else if (r < sw[0] + sw[1])         state._seaTarget = 0.50 + Math.random() * 0.30; // সামান্য ঢেউ
+      else if (r < sw[0] + sw[1] + sw[2]) state._seaTarget = 0.90 + Math.random() * 0.30; // ছোট ছোট ঢেউ
+      else                                state._seaTarget = 1.40 + Math.random() * 0.60; // অস্থির সমুদ্র
+    }
+    state._seaTick--;
+    // smooth কিন্তু দ্রুত transition (~২-৩ tick এ পৌঁছে যায়)
+    if (state._seaMulCur === undefined) state._seaMulCur = 1.0;
+    state._seaMulCur += ((state._seaTarget || 1.0) - state._seaMulCur) * 0.4;
+  }
+  const seaMul = (!ctrl.mode || ctrl.mode === 'auto') ? state._seaMulCur : 1.0;
+
   // ── [OLD-FILE RANDOM TICK] প্রতি tick এ এলোমেলো ছোট movement — old
   // file এর সেই সরল random tick। এটা candle এর body/direction বদলায় না
   // (সেটা উপরের physics velocity ঠিক করে), শুধু প্রতিটা tick কে এলোমেলো
   // করে যাতে price line real chart এর মতো jagged/জীবন্ত লাগে, মসৃণ
   // রোবটিক না। trader পরের এক tick সহজে অনুমান করতে পারে না।
   if (!ctrl.mode || ctrl.mode === 'auto') {
-    delta += (Math.random() - 0.5) * v * 3.2;
+    delta += (Math.random() - 0.5) * v * 3.2 * seaMul;
   }
 
   // ── [RANDOM SPIKE TICK] মাঝে মাঝে হঠাৎ বড় tick — real market এ হঠাৎ
@@ -1121,7 +1156,7 @@ function tickOTC(id) {
     // spike direction — বেশিরভাগ সময় current velocity দিকে, কখনো random
     const spikeDir = Math.random() < 0.7 ? Math.sign(delta || (Math.random()-0.5)) : (Math.random() < 0.5 ? 1 : -1);
     const spikeMag = v * (0.8 + Math.random() * 1.4); // বড় movement (clamp এর নিচে varied)
-    delta += spikeDir * spikeMag;
+    delta += spikeDir * spikeMag * seaMul;
   }
 
   const maxStep = state.price * 0.0015; // hard safety — প্রতি tick max ±0.15%
@@ -2028,11 +2063,3 @@ setInterval(() => {
     .then(() => console.log('[ping] OK'))
     .catch(() => {});
 }, 8*60*1000);
-
-
-
-
-
-
-
-
