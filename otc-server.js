@@ -422,7 +422,15 @@ const _rtdbSettledKeys = new Set(); // duplicate guard
 async function _settleDueTradesFromRTDB() {
   try {
     const nowSec = Math.floor(Date.now() / 1000);
-    const snap = await db.ref('settlement_queue').once('value');
+    // [SCALE] আগে পুরো settlement_queue নামানো হতো প্রতি tick এ। queue এর key
+    // হলো expiryTimestamp, অর্থাৎ তাক টা সময় দিয়ে সাজানো — তাই orderByKey()
+    // + endAt(now) দিয়ে শুধু "সময় হয়ে গেছে" এমন অংশটুকুই আনি। ভবিষ্যতের
+    // trade (৪ ঘণ্টা পর্যন্ত, লক্ষ user) আর ছোঁয়াই হয় না — user বাড়লেও
+    // এই কাজের ভার বাড়ে না।
+    const snap = await db.ref('settlement_queue')
+                         .orderByKey()
+                         .endAt(String(nowSec))
+                         .once('value');
     if (!snap.exists()) return;
 
     const bySymbol = new Map();
@@ -1515,6 +1523,25 @@ http.createServer(async (req, res) => {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid trade data' })); return;
       }
 
+      // ── [SECURITY] entry price server এর engine থেকে ─────────────────
+      // আগে client এর পাঠানো entryPrice সরাসরি বসত — browser এর কোড বদলে
+      // যেকেউ নিজের পছন্দমতো দাম পাঠিয়ে প্রায় নিশ্চিত জেতা trade বানাতে
+      // পারত। এখন এই server এ চলা market এর জন্য নিজের engine এর দামই
+      // ব্যবহার হয়। যে market এখানে চলে না (যেমন real crypto), সেখানে
+      // client এর মানই থাকে — trade কখনো বাতিল করা হয় না, শুধু দাম সংশোধন
+      // (ধীর নেটওয়ার্কে আসল user এর trade যেন আটকে না যায়)।
+      const _clientEntry = parseFloat(trade.entryPrice) || 0;
+      const _serverState = _states[trade.symbol];
+      const _serverPrice = (_serverState && typeof _serverState.price === 'number')
+                           ? _serverState.price : 0;
+      const entryPrice = _serverPrice > 0 ? _serverPrice : _clientEntry;
+      if (_serverPrice > 0 && _clientEntry > 0) {
+        const _diffPct = Math.abs(_serverPrice - _clientEntry) / _serverPrice * 100;
+        if (_diffPct > 0.5) {
+          console.warn(`[place-trade] entryPrice mismatch userId=${userId} symbol=${trade.symbol} client=${_clientEntry} server=${_serverPrice} diff=${_diffPct.toFixed(3)}%`);
+        }
+      }
+
       // 3. Redis balance check + atomic deduct
       const balKey = BAL_KEY_OTC(userId);
       let currentBal = await redisPub.get(balKey);
@@ -1543,7 +1570,7 @@ http.createServer(async (req, res) => {
       await redisPub.hset(TRADE_KEY_OTC(tradeId),
         'userId',          userId,
         'symbol',          trade.symbol || '',
-        'entryPrice',      String(trade.entryPrice || 0),
+        'entryPrice',      String(entryPrice),   // [SECURITY] server এর দাম
         'amount',          String(amount),
         'type',            trade.type || '',
         'payoutPercent',   String(trade.payoutPercent || 92),
@@ -1552,7 +1579,10 @@ http.createServer(async (req, res) => {
         'expiryTimestamp', String(trade.expiryTimestamp || 0),
         'currency',        trade.currency || 'USD',
       );
-      await redisPub.expire(TRADE_KEY_OTC(tradeId), 7200); // 2h TTL
+      // [MAX DURATION] সর্বোচ্চ ৪ ঘণ্টার trade + ১ ঘণ্টা নিরাপত্তা মার্জিন।
+      // আগে ২ ঘণ্টা ছিল — ২ ঘণ্টার বেশি trade এ Redis থেকে তথ্য মুছে গিয়ে
+      // settlement ভেঙে পড়ত।
+      await redisPub.expire(TRADE_KEY_OTC(tradeId), 18000); // 5h TTL
 
       // 5. RTDB settlement_queue write — otc-server candle close এ এখান থেকে পাবে
       db.ref(`settlement_queue/${trade.expiryTimestamp}/${userId}/${tradeId}`).set({
@@ -1562,12 +1592,13 @@ http.createServer(async (req, res) => {
         type:        trade.type || '',
         amount:      amount,
         feedType:    trade.feedType || '',
-        entryPrice:  trade.entryPrice || 0,
+        entryPrice,   // [SECURITY] server এর দাম
       }).catch(e => console.error('[place-trade] RTDB queue failed:', e.message));
 
       // 6. Firestore trade save — background, non-blocking
       firestore.collection('users').doc(userId).collection('trades').doc(tradeId).set({
         ...trade,
+        entryPrice,   // [SECURITY] client এর মান override — server এর দামই নথিতে
         userId,
         tradeLine:  null,
         createdAt:  admin.firestore.FieldValue.serverTimestamp(),
