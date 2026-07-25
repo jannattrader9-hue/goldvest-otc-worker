@@ -334,27 +334,17 @@ async function _recoverLiveTradesFromRTDB() {
   }
 }
 
-function _startActiveTradesShadowListener() {
-  firestore.collectionGroup('trades')
-    .where('status', '==', 'live')
-    .onSnapshot(snap => {
-      snap.docChanges().forEach(change => {
-        const data   = change.doc.data();
-        const userId = change.doc.ref.parent.parent.id;
-        const key     = `${userId}/${change.doc.id}`;
-        if (change.type === 'removed' || data.status !== 'live') {
-          _activeTradesMemory.delete(key);
-          _pendingSettle.delete(key); // confirmed — pending guard clear করো
-        } else {
-          _activeTradesMemory.set(key, {
-            userId, tradeId: change.doc.id,
-            symbol: data.symbol, expiryTimestamp: data.expiryTimestamp,
-            accountType: data.accountType, status: data.status
-          });
-        }
-      });
-    }, err => console.error('[shadow-tracking] listener error:', err.message));
-}
+// [SCALE ২.১] Firestore shadow listener সরানো হয়েছে।
+// আগে collectionGroup('trades').where('status','==','live').onSnapshot() দিয়ে
+// সব user এর সব live trade পড়া হতো — ১ লাখ live trade মানে বিপুল Firestore
+// read, প্রতিদিন কয়েকশো ডলার। অথচ একই তথ্য RTDB settlement_queue তেই আছে।
+//
+// এখন _activeTradesMemory ভরে দুই উৎস থেকে (Firestore ছাড়াই):
+//   ১. server চালু হওয়ার সময় — _recoverLiveTradesFromRTDB()
+//   ২. নতুন trade বসার সময় — /place-trade নিজেই memory তে যোগ করে
+// আর _pendingSettle guard এর ৩০/৬০ সেকেন্ডের safety timeout আগে থেকেই আছে,
+// তাই listener এর "confirm" এর দরকার নেই। RTDB path (_settleDueTradesFromRTDB)
+// সব ক্ষেত্রেই catch-all হিসেবে কাজ করে।
 
 // প্রতি tick এ shadow map থেকে কতগুলো trade "due" (expiryTimestamp <= now) তা log করো — observational only
 function _logShadowDueTrades() {
@@ -1451,7 +1441,6 @@ async function main() {
   console.log('GoldVest Server starting (Admin SDK)...');
   watchFirestoreMarkets();
   await _recoverLiveTradesFromRTDB();
-  _startActiveTradesShadowListener();
   setInterval(() => {
     _activeMarkets.forEach(id => {
       if (_states[id]?.type === 'otc')   tickOTC(id);
@@ -1594,6 +1583,18 @@ http.createServer(async (req, res) => {
         feedType:    trade.feedType || '',
         entryPrice,   // [SECURITY] server এর দাম
       }).catch(e => console.error('[place-trade] RTDB queue failed:', e.message));
+
+      // [SCALE ২.১] in-memory map এ যোগ — আগে Firestore listener এটা করত।
+      // এতে tick-settle (সবচেয়ে দ্রুত পথ) Firestore ছাড়াই কাজ করে।
+      _activeTradesMemory.set(`${userId}/${tradeId}`, {
+        userId, tradeId,
+        symbol:          trade.symbol || '',
+        expiryTimestamp: parseInt(trade.expiryTimestamp) || 0,
+        accountType:     'live',
+        status:          'live',
+        type:            trade.type || '',
+        amount:          amount,
+      });
 
       // 6. Firestore trade save — background, non-blocking
       firestore.collection('users').doc(userId).collection('trades').doc(tradeId).set({
