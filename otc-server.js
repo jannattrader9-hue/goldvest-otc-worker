@@ -38,6 +38,39 @@ if (REDIS_URL) {
         redisReady = true;
         console.log('[Redis] connected ✅');
     });
+
+    // [SECURITY ১.২] balance যাচাই + কাটা — একটাই অবিভাজ্য (atomic) কাজ।
+    // আগে get() তারপর incrbyfloat() — দুই ধাপ। ১ লাখ user এ কেউ দ্রুত দুবার
+    // চাপলে দুটো trade ই পাস করতে পারত (টাকা একটার)। Lua পুরো যুক্তি Redis এর
+    // ভেতরে একবারে চালায়, তাই মাঝখানে অন্য request ঢুকতে পারে না।
+    // ফেরত: [ok(1/0), newBalance] — টাকা কম হলে ok=0, balance অপরিবর্তিত।
+    redisPub.defineCommand('gvDeductBalance', {
+        numberOfKeys: 1,
+        lua: `
+            local bal = redis.call('GET', KEYS[1])
+            if bal == false then return {-1, '0'} end   -- key নেই: caller Firestore থেকে load করবে
+            local b = tonumber(bal)
+            local amt = tonumber(ARGV[1])
+            if b < amt then return {0, bal} end          -- টাকা কম
+            local nb = redis.call('INCRBYFLOAT', KEYS[1], -amt)
+            redis.call('EXPIRE', KEYS[1], 3600)
+            return {1, nb}
+        `,
+    });
+
+    // [SECURITY ১.২] sell এর জন্য — status live → sold atomically।
+    // settler এর gvClaimTrade এর হুবহু জমজ। sell আর settle একসাথে চললে
+    // যে আগে দখল নেবে সে ই credit করবে, অন্যজন 0 পেয়ে থামবে — double-credit নেই।
+    redisPub.defineCommand('gvClaimTrade', {
+        numberOfKeys: 1,
+        lua: `
+            local st = redis.call('HGET', KEYS[1], 'status')
+            if st == false then return 0 end         -- hash নেই — sell করা যাবে না
+            if st ~= 'live' then return 0 end          -- আগেই settled/sold
+            redis.call('HSET', KEYS[1], 'status', ARGV[1])
+            return 1
+        `,
+    });
     redisPub.on('error', (e) => {
         redisReady = false;
         console.error('[Redis] error:', e.message);
@@ -1531,26 +1564,28 @@ http.createServer(async (req, res) => {
         }
       }
 
-      // 3. Redis balance check + atomic deduct
+      // 3. Redis balance — atomic check + deduct (Lua, race-safe)
       const balKey = BAL_KEY_OTC(userId);
-      let currentBal = await redisPub.get(balKey);
 
-      if (currentBal === null) {
-        // Redis miss — Firestore থেকে load করে cache করো
+      // প্রথম চেষ্টা — key না থাকলে Lua -1 ফেরত দেয়, তখন Firestore থেকে load
+      let [ok, newBalRaw] = await redisPub.gvDeductBalance(balKey, String(amount));
+
+      if (ok === -1) {
+        // Redis miss — Firestore থেকে load করে cache, তারপর আবার atomic deduct
         const snap = await firestore.collection('users').doc(userId).get();
         const bal  = snap.exists ? (snap.data().liveBalance || 0) : 0;
-        await redisPub.set(balKey, bal.toString(), 'EX', 3600);
-        currentBal = bal.toString();
+        // NX: এই ফাঁকে অন্য request already set করে থাকলে সেটাই থাকবে (double-load এড়ানো)
+        await redisPub.set(balKey, bal.toString(), 'EX', 3600, 'NX');
+        [ok, newBalRaw] = await redisPub.gvDeductBalance(balKey, String(amount));
       }
 
-      const balFloat = parseFloat(currentBal);
-      if (balFloat < amount) {
-        res.writeHead(400); res.end(JSON.stringify({ error: 'Insufficient balance', balance: balFloat })); return;
+      if (ok !== 1) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'Insufficient balance', balance: parseFloat(newBalRaw) || 0 }));
+        return;
       }
 
-      // Atomic deduct — race condition safe
-      const newBal = await redisPub.incrbyfloat(balKey, -amount);
-      await redisPub.expire(balKey, 3600);
+      const newBal = newBalRaw;
       await redisPub.set(`gv:bal:dirty:${userId}`, '1', 'EX', 3600);
 
       console.log(`[place-trade] userId=${userId} tradeId=${tradeId} amount=${amount} newBal=${newBal}`);
@@ -1600,6 +1635,8 @@ http.createServer(async (req, res) => {
       firestore.collection('users').doc(userId).collection('trades').doc(tradeId).set({
         ...trade,
         entryPrice,   // [SECURITY] client এর মান override — server এর দামই নথিতে
+        redisDeducted: true,   // [১.৩] Redis এ balance কাটা হয়েছে — settler TTL miss
+                               // এ এটা দেখেই বুঝবে জিতলে credit দেওয়া নিরাপদ
         userId,
         tradeLine:  null,
         createdAt:  admin.firestore.FieldValue.serverTimestamp(),
@@ -1832,6 +1869,14 @@ http.createServer(async (req, res) => {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid sell price' })); return;
       }
 
+      // [SECURITY ১.২] atomic claim — status live → sold একবারে।
+      // credit করার আগেই দখল নিই; settler ইতিমধ্যে settle করে থাকলে claim=0,
+      // তখন sell বাতিল (দুবার credit হবে না)।
+      const _claimed = await redisPub.gvClaimTrade(TRADE_KEY, 'sold');
+      if (_claimed !== 1) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Trade already settled' })); return;
+      }
+
       // Redis এ atomic credit
       const balKey = BAL_KEY_OTC(userId);
       let currentBal = await redisPub.get(balKey);
@@ -1844,8 +1889,7 @@ http.createServer(async (req, res) => {
       const newBal = await redisPub.incrbyfloat(balKey, sellPrice);
       await redisPub.expire(balKey, 3600);
       await redisPub.set(`gv:bal:dirty:${userId}`, '1', 'EX', 3600);
-      // Redis Hash এ status 'sold' set করো — settler আর credit করবে না
-      await redisPub.hset(`gv:trade:${tradeId}`, 'status', 'sold');
+      // status 'sold' ইতিমধ্যে atomic claim এ লেখা হয়েছে — আলাদা hset লাগে না
 
       console.log(`[sell-trade] userId=${userId} tradeId=${tradeId} sellPrice=${sellPrice} newBal=${newBal}`);
 
