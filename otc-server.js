@@ -574,7 +574,27 @@ function saveCandle(id, candle) {
 }
 
 function saveLiveCandle(id, candle) {
+  // RTDB — client এখনো এখান থেকেই দাম পড়ে (অক্ষত, fallback হিসেবে থাকবে)
   db.ref(`otc_candles/${id}/live`).set(candle).catch(() => {});
+
+  // [SCALE ২.৪ — ধাপ ১] Redis Pub/Sub এ একই দাম publish।
+  // ভবিষ্যতের ws-service এটা subscribe করে লক্ষ client কে WebSocket এ পাঠাবে
+  // (Firebase egress এর বদলে সস্তা Railway egress)। এখন শুধু publish হচ্ছে —
+  // কেউ subscribe না করলেও Redis publish প্রায় শূন্য খরচ, তাই নিরাপদ।
+  // payload ছোট: শুধু দরকারি field, JSON string।
+  if (redisReady && redisPub) {
+    const msg = JSON.stringify({
+      s: id,                 // symbol
+      t: candle.time,        // candle time
+      o: candle.open,
+      h: candle.high,
+      l: candle.low,
+      c: candle.close,       // current price
+      n: candle.nextCandle,  // next candle boundary
+    });
+    // fire-and-forget — publish ব্যর্থ হলেও RTDB path অক্ষত, দাম বন্ধ হয় না
+    redisPub.publish(`px:${id}`, msg).catch(() => {});
+  }
 }
 
 function saveSubCandle(id, label, candle) {
