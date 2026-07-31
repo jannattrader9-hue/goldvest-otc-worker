@@ -1490,15 +1490,56 @@ setInterval(() => {
   }
 }, 60_000);
 
+// ══════════════════════════════════════════════════════════════════════
+// [TICK RHYTHM] দামের tick এর ছন্দ — আগে প্রতি ঠিক ৫০০ms এ একবার যেত,
+// তাই দাম এলোমেলো হলেও ছন্দটা যান্ত্রিক লাগত। এখন প্রতিটা market নিজের
+// গতি অনুযায়ী অসম ব্যবধানে tick পাঠায় — শান্ত থাকলে ধীরে, গতি এলে ঝাঁকে।
+//
+// গুরুত্বপূর্ণ: গড় ব্যবধান ~৫০০ms ই রাখা হয়েছে, তাই দামের ওঠানামার
+// মাত্রা (volatility) আগের মতোই থাকে — শুধু ছন্দ জীবন্ত হয়।
+// settlement এর সময়-নির্ভর কাজ আগের স্থির ছন্দেই চলে (নিচে দেখো)।
+// ══════════════════════════════════════════════════════════════════════
+const _tickTimers = {};
+
+function _tickDelay(id) {
+  const st = _states[id];
+  let lo = 350, hi = 700;                       // default
+  switch (st && st._actState) {
+    case 'burst':
+    case 'release': lo = 180; hi = 380;  break; // ঝাঁক — দ্রুত পরপর
+    case 'active':  lo = 300; hi = 600;  break;
+    case 'crawl':   lo = 450; hi = 800;  break;
+    case 'coil':    lo = 550; hi = 1000; break; // থমথমে — ধীরে
+  }
+  return lo + Math.random() * (hi - lo);
+}
+
+function _scheduleTick(id) {
+  _tickTimers[id] = setTimeout(() => {
+    if (!_activeMarkets.has(id)) { delete _tickTimers[id]; return; }
+    try {
+      const st = _states[id];
+      if (st?.type === 'otc')   tickOTC(id);
+      if (st?.type === 'forex') tickForex(id);
+    } catch (e) {
+      console.error(`[tick] ${id}:`, e.message);
+    }
+    _scheduleTick(id);                          // পরেরটা নতুন ব্যবধানে
+  }, _tickDelay(id));
+}
+
 async function main() {
   console.log('GoldVest Server starting (Admin SDK)...');
   watchFirestoreMarkets();
   await _recoverLiveTradesFromRTDB();
   setInterval(() => {
-    _activeMarkets.forEach(id => {
-      if (_states[id]?.type === 'otc')   tickOTC(id);
-      if (_states[id]?.type === 'forex') tickForex(id);
+    // প্রতিটা সক্রিয় market এর নিজস্ব ছন্দ চালু আছে কিনা দেখি
+    _activeMarkets.forEach(id => { if (!_tickTimers[id]) _scheduleTick(id); });
+    // যে market আর সক্রিয় নয়, তার timer বন্ধ করি
+    Object.keys(_tickTimers).forEach(id => {
+      if (!_activeMarkets.has(id)) { clearTimeout(_tickTimers[id]); delete _tickTimers[id]; }
     });
+    // settlement — আগের মতোই স্থির ছন্দে, কোনো পরিবর্তন নেই
     _settleDueTradesFromMemory().catch(e => console.error('[tick-settle] error:', e.message));
     _settleDueTradesFromRTDB().catch(e => console.error('[rtdb-tick-settle] error:', e.message));
   }, TICK_MS);
