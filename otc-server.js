@@ -644,13 +644,6 @@ const _REGIMES = {
   calm:     { vol: 0.5,  trend: 0.25, friction: 0.82, dur: [30, 65] },
   breakout: { vol: 1.5,  trend: 1.3,  friction: 0.92, dur: [12, 30] },
 };
-function _nextRegime(cur) {
-  const r = Math.random();
-  if (cur === 'trending') return r < 0.40 ? 'ranging' : r < 0.60 ? 'calm' : r < 0.82 ? 'trending' : 'breakout';
-  if (cur === 'ranging')  return r < 0.35 ? 'trending' : r < 0.55 ? 'breakout' : r < 0.80 ? 'calm' : 'ranging';
-  if (cur === 'breakout') return r < 0.60 ? 'trending' : r < 0.82 ? 'ranging' : 'calm';
-  return r < 0.40 ? 'ranging' : r < 0.72 ? 'trending' : 'calm'; // calm
-}
 function _regimeDur(name) {
   const [lo, hi] = _REGIMES[name].dur;
   return lo + (Math.random() * (hi - lo) | 0);
@@ -659,37 +652,7 @@ function _regimeDur(name) {
 // ── SYNTHETIC VOLUME — market কে সবসময় জীবন্ত রাখে (real user না থাকলেও) ─
 // হাজার হাজার virtual trader trade করছে এমন ভাব দেয়। activity cycle
 // (busy/quiet period) + random spike (news event এর মতো) তৈরি করে।
-function _syntheticVolume(state) {
-  // slow activity cycle — market এর "ব্যস্ততা" ধীরে ওঠানামা করে
-  if (state._synCycle === undefined) {
-    state._synCycle = Math.random() * Math.PI * 2;
-    state._synBase = 30 + Math.random() * 40;   // base activity level
-    state._synSpikeTicks = 0;
-  }
-  state._synCycle += 0.008; // ধীর cycle (কয়েক মিনিটে একবার busy/quiet)
-  // sine wave দিয়ে busy/quiet — 0.4x থেকে 1.6x পর্যন্ত ওঠানামা
-  const cycleMul = 1.0 + Math.sin(state._synCycle) * 0.6;
 
-  // random spike — মাঝে মাঝে হঠাৎ অনেক "order" (volatility burst)
-  if (state._synSpikeTicks > 0) {
-    state._synSpikeTicks--;
-  } else if (Math.random() < 0.015) {
-    // ~1.5% chance এ একটা spike শুরু হয় (কয়েক tick ধরে থাকে)
-    state._synSpikeTicks = 8 + (Math.random() * 20 | 0);
-    state._synSpikeMag = 1.5 + Math.random() * 2.5;
-  }
-  const spikeMul = state._synSpikeTicks > 0 ? (state._synSpikeMag || 1) : 1;
-
-  // base drift — মাঝে মাঝে base level ধীরে বদলায় (market এর mood)
-  if (Math.random() < 0.005) state._synBase = 25 + Math.random() * 55;
-
-  // ছোট random noise প্রতি tick এ (একঘেয়ে না)
-  const noise = 0.7 + Math.random() * 0.6;
-
-  return state._synBase * cycleMul * spikeMul * noise;
-}
-
-// ── SUPPORT / RESISTANCE — swing level মনে রাখা + bounce ────────────────
 function _updateLevels(state) {
   if (!state._levels) state._levels = [];
   state._swingTick = (state._swingTick || 0) + 1;
@@ -818,8 +781,6 @@ async function initOTC(market) {
     _regime: 'ranging',
     _regimeTick: _regimeDur('ranging'),
     _regimeDir: Math.random() < 0.5 ? 1 : -1,
-    _candleMemOpen: null,
-    _candlePersonality: 0,
     _candleConviction: 0.4,
     _cChar: 'normal',
     _cWickTend: 0.6,
@@ -869,386 +830,39 @@ function tickOTC(id) {
   const ctrl = _controls[id] || {};
 
   // ══════════════════════════════════════════════════════════════════
-  // [ENGINE] নতুন tick engine — দাম engine.js ঠিক করে।
-  // candle গঠন, settlement, RTDB/Redis লেখা — সব নিচের পুরনো কোডেই।
-  // admin manual mode (ctrl.mode) হলে engine বাইপাস হয়, আগের মতোই।
+  // [ENGINE] দামের সব physics engine.js এ। পুরনো inline physics
+  // (regime, S/R, candle character, activity states) মুছে ফেলা হয়েছে —
+  // engine চালু হওয়ার পর সেগুলো আর চলত না, শুধু ফাইল বড় করছিল।
+  //
+  // admin এর চারটা নিয়ন্ত্রণই এখানে মানা হয়:
+  //   mode           — auto / manual
+  //   nextDirection  — manual এ up / down (auto হলে engine নিজে ঠিক করে)
+  //   trendStrength  — manual এ দিকের জোর
+  //   volatility     — low / medium / high (পায়ের আকার)
+  //   speedMultiplier— সব নড়াচড়ার গুণক
   // ══════════════════════════════════════════════════════════════════
-  if (ENGINE_MODE && (!ctrl.mode || ctrl.mode === 'auto')) {
-    if (!state._eng) {
-      const dec = (String(state.price).split('.')[1] || '').length || 5;
-      state._eng = engine.createState(state.price, Math.min(6, Math.max(2, dec)));
-      console.log(`[engine] ${id} — চালু (decimals: ${state._eng.decimals})`);
-    }
-    state._eng.price = state.price;                 // বাইরে থেকে দাম বদলালে মেনে নেয়
-    const volMul2 = { low: 0.4, medium: 1.0, high: 2.2 }[ctrl.volatility] || 1.0;
-    const spd     = ctrl.speedMultiplier || 1.0;
-    state.price = engine.nextPrice(state._eng, Date.now(),
-                    { unit: engine.CFG.unit * volMul2 * spd });
-
-    _tickTail(id, state);                            // candle + settlement অংশ
-    return;
+  if (!state._eng) {
+    const dec = (String(state.price).split('.')[1] || '').length || 5;
+    state._eng = engine.createState(state.price, Math.min(6, Math.max(2, dec)));
+    console.log(`[engine] ${id} — চালু (decimals: ${state._eng.decimals})`);
   }
-  // engine এ যায়নি — কেন, একবার জানিয়ে রাখি (ঠিক করতে সুবিধা হয়)
-  if (!state._engSkipLogged) {
-    state._engSkipLogged = true;
-    console.log(`[engine] ${id} — বাইপাস (ENGINE_MODE=${ENGINE_MODE}, ctrl.mode=${ctrl.mode || 'auto'})`);
-  }
+  state._eng.price = state.price;          // বাইরে থেকে দাম বদলালে মেনে নেয়
 
-  const volMul = { low:0.4, medium:1.0, high:2.2 }[ctrl.volatility] || 1.0;
-  const speed = ctrl.speedMultiplier || 1.0;
-  const now = Date.now();
+  const volMul = { low: 0.4, medium: 1.0, high: 2.2 }[ctrl.volatility] || 1.0;
+  const speed  = ctrl.speedMultiplier || 1.0;
+  const manual = ctrl.mode === 'manual';
+  const dir    = ctrl.nextDirection;
 
-  if (!ctrl.mode || ctrl.mode === 'auto') {
-    // ── [REALISTIC] Regime state machine — market এর মেজাজ বদলায় ────────
-    if (!state._regime) { state._regime = 'ranging'; state._regimeTick = _regimeDur('ranging'); }
-    state._regimeTick--;
-    if (state._regimeTick <= 0) {
-      // [MARKET HISTORY] দীর্ঘ trend এর পর exhaustion — টানা এক দিকে
-      // গেলে পরের regime বিপরীত দিকে যাওয়ার সম্ভাবনা বেশি (trend চিরকাল
-      // চলে না, ক্লান্ত হয়ে ঘুরে যায়)।
-      const prevDir = state._regimeDir || 1;
-      const wasTrending = (state._regime === 'trending' || state._regime === 'breakout');
-      state._regime = _nextRegime(state._regime);
-      state._regimeTick = _regimeDur(state._regime);
-      // trend age বাড়ছে → reversal সম্ভাবনা বাড়ে
-      if (wasTrending) {
-        state._trendAge = (state._trendAge || 0) + 1;
-        // যত বেশি টানা trend, তত বেশি বিপরীত দিকে যাওয়ার chance
-        const reverseChance = Math.min(0.75, 0.4 + state._trendAge * 0.15);
-        state._regimeDir = Math.random() < reverseChance ? -prevDir : prevDir;
-        if (state._regimeDir !== prevDir) state._trendAge = 0; // ঘুরে গেলে age reset
-      } else {
-        state._trendAge = 0;
-        state._regimeDir = Math.random() < 0.5 ? 1 : -1;
-      }
-    }
-  } else if (ctrl.mode === 'manual') {
-    state.trend = ctrl.nextDirection === 'up' ? 1 : ctrl.nextDirection === 'down' ? -1 : 0;
-    state.trendSteps = 99;
-  } else if (ctrl.mode === 'trade-based') {
-    // Forex engine এর same pattern — majority pool এর দিকে subtle nudge (guaranteed outcome না)
-    const stats = _tradeStats[id] || {};
-    const up    = parseFloat(stats.upAmount)   || 0;
-    const down  = parseFloat(stats.downAmount) || 0;
-    if (up > down * 1.2)        state.trend = -1;
-    else if (down > up * 1.2)   state.trend = 1;
-    else                        state.trend = 0;
-    state.trendSteps = 99;
-  }
-
-  // ═══════════════════════════════════════════════════════════════════
-  // [REALISTIC ENGINE] regime + candle memory + cluster + S/R + smooth noise
-  // ═══════════════════════════════════════════════════════════════════
-  let netForce, v;
-
-  if (!ctrl.mode || ctrl.mode === 'auto') {
-    const rp = _REGIMES[state._regime] || _REGIMES.ranging;
-    v = state.price * 0.00042 * volMul * rp.vol;
-
-    // ── [CANDLE CHARACTER] প্রতি candle এর নিজস্ব চরিত্র — এটাই doji,
-    // marubozu, hammer, spinning top ইত্যাদি প্রাকৃতিকভাবে তৈরি করে।
-    // প্রতি নতুন candle এ random ভাবে একটা "type" বেছে নিই, সেই type
-    // অনুযায়ী conviction/bias/wick আচরণ ঠিক হয়।
-    if (state._candleMemOpen !== state.candleOpen) {
-      state._candleMemOpen = state.candleOpen;
-      const roll = Math.random();
-      // candle direction — regime bias সহ, কিন্তু যথেষ্ট random (predictable না)
-      const dirLean = (rp.trend * (state._regimeDir || 1)) * 0.25 + (Math.random() - 0.5);
-      const cDir = dirLean > 0 ? 1 : -1;
-
-      // candle type বণ্টন (real market এর মতো frequency)
-      if (roll < 0.20) {
-        // MARUBOZU — strong conviction, প্রায় wick নেই, বড় body।
-        // conviction কমানো + indecision যোগ — ভেতরের path unpredictable
-        // থাকবে (৫s trader ধরতে পারবে না), কিন্তু শেষে body বড় হবে।
-        state._cChar = 'marubozu';
-        state._candlePersonality = cDir;
-        state._candleConviction  = 0.5 + Math.random() * 0.3;
-        state._cWickTend = 0.25;
-        state._cIndecision = 0.4;
-      } else if (roll < 0.37) {
-        // DOJI — দ্বিধা, open≈close, ছোট body, দুই দিকে wick
-        state._cChar = 'doji';
-        state._candlePersonality = 0;
-        state._candleConviction  = 0.15;
-        state._cWickTend = 1.3;    // বড় wick
-        state._cIndecision = 1.4;  // বেশি দোদুল্যমান
-      } else if (roll < 0.50) {
-        // SPINNING TOP — ছোট body, মাঝারি wick দুই দিকে
-        state._cChar = 'spinning';
-        state._candlePersonality = cDir;
-        state._candleConviction  = 0.3 + Math.random() * 0.2;
-        state._cWickTend = 1.0;
-        state._cIndecision = 0.9;
-      } else if (roll < 0.62) {
-        // HAMMER / INVERTED — এক দিকে rejection (বড় wick এক পাশে)
-        state._cChar = Math.random() < 0.5 ? 'hammer' : 'invhammer';
-        state._candlePersonality = cDir;
-        state._candleConviction  = 0.5 + Math.random() * 0.3;
-        state._cWickTend = 1.1;
-        state._cIndecision = 0.6;
-        state._cRejectDir = state._cChar === 'hammer' ? -1 : 1; // কোন দিকে rejection
-      } else {
-        // NORMAL — সাধারণ candle, মাঝারি body ও wick
-        state._cChar = 'normal';
-        state._candlePersonality = cDir;
-        state._candleConviction  = 0.45 + Math.random() * 0.45;
-        state._cWickTend = 0.6;
-        state._cIndecision = 0.4;
-      }
-      state._cRejectDone = false;
-    }
-    // candle এর শেষ ২০% এ bias দুর্বল (natural close pullback → wick তৈরি)
-    let pScale = 1.0;
-    const cTimeLeft = state.nextCandle - now;
-    const cProg = 1 - (cTimeLeft / CANDLE_MS);
-    if (cProg > 0.9) pScale = 0.45; else if (cProg > 0.7) pScale = 0.75;
-
-    // hammer/inverted — candle এর প্রথমার্ধে rejection দিকে যায়, পরে ফিরে আসে
-    let charBias = state._candlePersonality || 0;
-    if ((state._cChar === 'hammer' || state._cChar === 'invhammer')) {
-      if (cProg < 0.4) charBias = (state._cRejectDir || -1);       // প্রথমে rejection দিকে
-      else if (cProg < 0.55) charBias = (state._candlePersonality || 0) * 1.3; // তারপর জোরে ফিরে
-    }
-    const candleBiasForce = charBias * v * (state._candleConviction || 0.4) * 0.34 * pScale;
-
-    // Tick clustering — কয়েক tick ধরে এক দিকে থাকার প্রবণতা (body বড় করে)
-    // [UNPREDICTABILITY FIX] duration কমানো (৫s trader window এর সাথে
-    // মিলে predictable হচ্ছিল) + strength কমানো।
-    if (state._clusterTick === undefined || state._clusterTick <= 0) {
-      const bias = (rp.trend * (state._regimeDir || 1)) + (state._candlePersonality || 0) * 0.5;
-      const pUp  = 0.5 + Math.max(-0.4, Math.min(0.4, bias * 0.35));
-      state._clusterDir = Math.random() < pUp ? 1 : -1;
-      state._clusterTick = 3 + (Math.random() * 6 | 0); // 3–9 tick (আগে 5–17)
-      state._clusterStr  = 0.25 + Math.random() * 0.35; // আগে 0.4–0.9
-    }
-    state._clusterTick--;
-    const clusterForce = state._clusterDir * v * state._clusterStr * 0.22;
-
-    // Regime trend force
-    const trendForce = rp.trend * (state._regimeDir || 1) * v * 0.3;
-
-    // Smooth correlated noise (pure random না — real market এর মতো)
-    // [CHARACTER] noise এর মাত্রা candle character অনুযায়ী — doji/spinning
-    // এ বেশি noise (বড় wick, indecision), marubozu তে কম (পরিষ্কার body)।
-    if (state._noiseX === undefined) { state._noiseX = Math.random()*1000; state._noiseSeed = (Math.random()*1e9)|0; }
-    state._noiseX += 0.1;
-    const wickTend = state._cWickTend || 0.6;
-    let noiseForce = _smoothNoise(state._noiseSeed, state._noiseX) * v * 0.6 * wickTend;
-    // indecision — doji/spinning এ মাঝে মাঝে হঠাৎ দিক বদল (দোদুল্যমান wick)
-    const indec = state._cIndecision || 0.4;
-    if (Math.random() < 0.10 * indec) {
-      noiseForce += -Math.sign(state._velocity || 0) * v * (0.5 + Math.random() * 0.6);
-    }
-    if (Math.random() < 0.02) { // rare shock (~2%)
-      noiseForce += (Math.random()+Math.random()+Math.random()-1.5) * v * 1.1;
-    }
-
-    // Support/Resistance — swing level এর কাছে bounce
-    _updateLevels(state);
-    const levelForce = _levelForce(state, v);
-
-    // Mean reversion (regime অনুযায়ী — ranging এ বেশি টান)
-    if (state._anchor === undefined) state._anchor = state.price;
-    state._anchor = state._anchor * 0.997 + state.price * 0.003;
-    const revMul = state._regime === 'ranging' ? 1.0 : state._regime === 'calm' ? 0.8 : 0.3;
-    const reversionForce = (state._anchor - state.price) * 0.025 * revMul;
-
-    netForce = trendForce + candleBiasForce + clusterForce + noiseForce + levelForce + reversionForce;
-
-    // ── [VOLUME-DRIVEN ACTIVITY] real user + synthetic volume থেকে
-    // movement ঠিক হয়। synthetic volume market কে সবসময় জীবন্ত রাখে
-    // (real user না থাকলেও), আর real order থাকলে সেটা extra যোগ হয়।
-    const vStats = _tradeStats[id] || {};
-    const upVol   = parseFloat(vStats.upAmount)   || 0;
-    const downVol = parseFloat(vStats.downAmount) || 0;
-    const realVol = upVol + downVol;
-    const synVol  = _syntheticVolume(state);   // engine-তৈরি "virtual" volume
-    const totalVol = synVol + realVol * 1.5;    // real order একটু বেশি weight পায়
-    // volume কে 0-1+ এ map করি
-    const volFactor = Math.min(2.0, totalVol / 70);
-    // smooth — volume হঠাৎ বদলালেও movement ধীরে adjust হয়
-    if (state._volSmooth === undefined) state._volSmooth = 0.3;
-    state._volSmooth += (volFactor - state._volSmooth) * 0.05;
-    const vf = state._volSmooth; // 0 = শান্ত, 1 = normal, 2 = খুব active
-
-    // activity state — volume অনুযায়ী probability বদলায়
-    // [QUOTEX-STYLE] freeze = "coil" (স্প্রিং চাপা): price স্থির থাকে কিন্তু
-    // ভেতরে গোপনে একটা pending direction ঠিক হয় ও চাপ জমে। freeze ভাঙলে
-    // সেই জমা চাপ গোপন direction এ জোরালো burst হয়ে ছাড়া পায় — তাই
-    // price ২-৩s স্থির, তারপর হঠাৎ দ্রুত সঠিক দিকে ছোটে। trader freeze
-    // এর সময় দেখতে পায় না পরের burst কোন দিকে যাবে → predict অসম্ভব।
-    if (state._actTick === undefined || state._actTick <= 0) {
-      const prevState = state._actState;
-      const ar = Math.random();
-      const freezeP = Math.max(0.05, 0.40 - vf * 0.20);
-      const crawlP  = freezeP + Math.max(0.10, 0.30 - vf * 0.08);
-      const activeP = crawlP + 0.30;
-
-      // coil (freeze) এর পরেই release burst — জমা চাপ ছাড়া পায়
-      if (prevState === 'coil' && state._coilPressure > 0) {
-        state._actState = 'release';
-        state._actTick = 3 + (Math.random() * 4 | 0); // দ্রুত burst (২-৩s)
-        state._actScale = 1.6 + Math.random() * 0.9 + state._coilPressure * 0.5;
-        // release direction = freeze এ ঠিক হওয়া গোপন direction
-        state._releaseDir = state._pendingDir || (Math.random() < 0.5 ? 1 : -1);
-      } else if (ar < freezeP) {
-        // COIL — price প্রায় স্থির, গোপন direction ঠিক হয়, চাপ জমে
-        state._actState = 'coil';
-        state._actTick = 5 + (Math.random() * 4 | 0); // ২-৩s স্থির
-        state._actScale = 0.04 + Math.random() * 0.06; // প্রায় নড়ে না
-        state._pendingDir = Math.random() < 0.5 ? 1 : -1; // গোপন direction
-        state._coilPressure = 0.6 + Math.random() * 0.9; // জমা চাপের পরিমাণ
-      } else if (ar < crawlP) {
-        state._actState = 'crawl';
-        state._actTick = 4 + (Math.random() * 5 | 0);
-        state._actScale = 0.3 + Math.random() * 0.25;
-        state._coilPressure = 0;
-      } else if (ar < activeP) {
-        state._actState = 'active';
-        state._actTick = 5 + (Math.random() * 8 | 0);
-        state._actScale = 0.9 + Math.random() * 0.3;
-        state._coilPressure = 0;
-      } else {
-        state._actState = 'burst';
-        state._actTick = 2 + (Math.random() * 4 | 0);
-        state._actScale = 1.4 + Math.random() * 0.5;
-        state._coilPressure = 0;
-      }
-    }
-    state._actTick--;
-    // smooth transition — হঠাৎ না, ধীরে scale বদলায় (release এ দ্রুত)
-    if (state._actScaleCur === undefined) state._actScaleCur = 1.0;
-    const scaleSpeed = state._actState === 'release' ? 0.45 : 0.25; // release দ্রুত ছাড়ে
-    state._actScaleCur += ((state._actScale || 1.0) - state._actScaleCur) * scaleSpeed;
-
-    // ── movement = activity scale × volume factor × random tick ──────────
-    // random tick — প্রতি tick এ এলোমেলো ছোট variation (একঘেয়ে না)
-    // coil এর সময় random প্রায় বন্ধ (price স্থির থাকে), release এ স্বাভাবিক
-    let randomTick = 0.6 + Math.random() * 0.8;
-    if (state._actState === 'coil') randomTick *= 0.15; // coil এ প্রায় স্থির
-    const volMove = 0.35 + vf * 0.65;
-    netForce *= state._actScaleCur * volMove * randomTick;
-
-    // [QUOTEX-STYLE] release এর সময় গোপন direction এ জোরালো push — জমা
-    // চাপ একসাথে ছাড়া পায়, তাই price দ্রুত সঠিক দিকে ছোটে।
-    if (state._actState === 'release') {
-      netForce += (state._releaseDir || 1) * v * (state._coilPressure || 1) * 1.4;
-    }
-
-    // Dynamic friction — regime অনুযায়ী smooth lerp (trending এ বেশি glide)
-    // coil এ friction বেশি (স্থির থাকে), release/burst এ কম (গড়িয়ে যায়)
-    if (state._friction === undefined) state._friction = 0.85;
-    let rpFrictionAdj = Math.max(0.60, rp.friction - 0.15);
-    if (state._actState === 'coil') rpFrictionAdj = 0.45;      // স্থির থাকে
-    else if (state._actState === 'release') rpFrictionAdj = 0.92; // দ্রুত গড়িয়ে যায়
-    else if (state._actState === 'burst') rpFrictionAdj = Math.min(0.9, rpFrictionAdj + 0.1);
-    state._friction += (rpFrictionAdj - state._friction) * 0.15;
-  } else {
-    // manual / trade-based — আগের মতোই সরল trend+random (override predictable রাখতে)
-    v = state.price * 0.0008 * volMul;
-    const trendComponent  = state.trend * v * (ctrl.trendStrength || 0.6) * 0.35;
-    const randomComponent = (Math.random() - 0.5) * v * 3.2;
-    netForce = trendComponent + randomComponent;
-    state._friction = 0.85;
-  }
-
-  // ── [UNPREDICTABILITY] HESITATION — মাঝে মাঝে randomized ছোট বিপরীত পা ─
-  // GPT/অভিজ্ঞতা: fixed pattern (%N tick) predictable হয়ে যায়, তাই এখানে
-  // প্রতি tick এ random roll — user "পরের tick কী হবে" নিশ্চিত বুঝতে
-  // পারবে না, বিশেষ করে ৫s/১০s trade এ যেটা সবচেয়ে জরুরি।
-  if ((!ctrl.mode || ctrl.mode === 'auto') && state._velocity !== undefined) {
-    const hesRoll = Math.random();
-    if (hesRoll < 0.24) {
-      // ছোট বিপরীত পা — momentum হঠাৎ উল্টো দিকে ঠেলে (predictability ভাঙে)
-      state._velocity += -Math.sign(state._velocity || 0) * v * (0.5 + Math.random() * 0.6);
-    } else if (hesRoll < 0.40) {
-      // হঠাৎ ধীর/থামা — পরের tick এ কী হবে অনুমান কঠিন করে
-      state._velocity *= (0.2 + Math.random() * 0.3);
-    }
-    // velocity-proportional reversal — যত বেশি momentum জমে, তত বেশি
-    // সম্ভাবনা হঠাৎ উল্টো যাওয়ার। এটা সব timeframe এ trend predictable
-    // হওয়া রোধ করে (trader "চলছেই তো, চলবে" ধরে নিতে পারে না)।
-    const velRatio = Math.abs(state._velocity) / (v * 1.8 + 1e-9);
-    if (velRatio > 0.5 && Math.random() < velRatio * 0.25) {
-      state._velocity *= -(0.3 + Math.random() * 0.4); // দিক উল্টে দেয়
-    }
-  }
-
-  // ── NET FORCE → velocity (momentum) → price, safety clamp সহ ──────────
-  if (state._velocity === undefined) state._velocity = 0;
-  state._velocity += netForce;
-  // [UNPREDICTABILITY] velocity persistence কমানো — আগে 0.65-0.90 ছিল,
-  // এতে momentum অনেকক্ষণ এক দিকে টানত (৮৮% predictable)। এখন কম রাখি
-  // যাতে প্রতি tick এ direction বেশি স্বাধীন হয়, কিন্তু সামান্য glide থাকে।
-  state._velocity *= Math.max(0.65, Math.min(0.90, state._friction || 0.85));
-  const maxVel = v * 1.8;
-  state._velocity = Math.max(-maxVel, Math.min(maxVel, state._velocity));
-
-  let delta = state._velocity * speed;
-
-  // ── [SEA STATE] প্রতি candle-এর ভেতরে tick texture বদলায় — কখনো শান্ত,
-  // কখনো সামান্য ঢেউ, কখনো অস্থির। duration ও state সম্পূর্ণ random
-  // (heavy-tail), আর প্রতি candle-এ probability weights নিজেই re-roll হয় —
-  // তাই লম্বা observation-এও কোনো statistical pattern বের করা যায় না।
-  // এটা শুধু tick-level random components-এ গুণ হয় — physics velocity
-  // (candle body/direction) untouched থাকে।
-  if (!ctrl.mode || ctrl.mode === 'auto') {
-    // প্রতি নতুন candle-এ weights re-roll — এই candle শান্ত-ঘেঁষা নাকি
-    // ঝাঁকুনি-ঘেঁষা হবে, সেটাও random
-    if (state._seaWeightCandle !== state.candleOpen) {
-      state._seaWeightCandle = state.candleOpen;
-      const w = [Math.random(), Math.random(), Math.random(), Math.random()];
-      const sum = w[0] + w[1] + w[2] + w[3];
-      state._seaWeights = w.map(x => x / sum);
-    }
-    if (state._seaTick === undefined || state._seaTick <= 0) {
-      // heavy-tail duration — বেশিরভাগ ২–১০ tick (১–৫s), মাঝে মাঝে ২০–৪০
-      state._seaTick = Math.random() < 0.15
-        ? 20 + (Math.random() * 20 | 0)
-        : 2 + (Math.random() * 8 | 0);
-      // weighted random state — কোনো fixed sequence নেই, শান্ত থেকে
-      // সরাসরি অস্থিরেও লাফ দিতে পারে
-      const r = Math.random(), sw = state._seaWeights || [0.25, 0.25, 0.25, 0.25];
-      if (r < sw[0])                      state._seaTarget = 0.15 + Math.random() * 0.20; // শান্ত সমুদ্র
-      else if (r < sw[0] + sw[1])         state._seaTarget = 0.50 + Math.random() * 0.30; // সামান্য ঢেউ
-      else if (r < sw[0] + sw[1] + sw[2]) state._seaTarget = 0.90 + Math.random() * 0.30; // ছোট ছোট ঢেউ
-      else                                state._seaTarget = 1.40 + Math.random() * 0.60; // অস্থির সমুদ্র
-    }
-    state._seaTick--;
-    // smooth কিন্তু দ্রুত transition (~২-৩ tick এ পৌঁছে যায়)
-    if (state._seaMulCur === undefined) state._seaMulCur = 1.0;
-    state._seaMulCur += ((state._seaTarget || 1.0) - state._seaMulCur) * 0.4;
-  }
-  const seaMul = (!ctrl.mode || ctrl.mode === 'auto') ? state._seaMulCur : 1.0;
-
-  // ── [OLD-FILE RANDOM TICK] প্রতি tick এ এলোমেলো ছোট movement — old
-  // file এর সেই সরল random tick। এটা candle এর body/direction বদলায় না
-  // (সেটা উপরের physics velocity ঠিক করে), শুধু প্রতিটা tick কে এলোমেলো
-  // করে যাতে price line real chart এর মতো jagged/জীবন্ত লাগে, মসৃণ
-  // রোবটিক না। trader পরের এক tick সহজে অনুমান করতে পারে না।
-  if (!ctrl.mode || ctrl.mode === 'auto') {
-    delta += (Math.random() - 0.5) * v * 3.2 * seaMul;
-  }
-
-  // ── [RANDOM SPIKE TICK] মাঝে মাঝে হঠাৎ বড় tick — real market এ হঠাৎ
-  // বড় order এলে price ঝট করে সরে যায়। বেশিরভাগ tick স্বাভাবিক, কিন্তু
-  // ~3% tick এ হঠাৎ একটা বড় লাফ (safety clamp এর মধ্যেই)।
-  if ((!ctrl.mode || ctrl.mode === 'auto') && Math.random() < 0.03) {
-    // spike direction — বেশিরভাগ সময় current velocity দিকে, কখনো random
-    const spikeDir = Math.random() < 0.7 ? Math.sign(delta || (Math.random()-0.5)) : (Math.random() < 0.5 ? 1 : -1);
-    const spikeMag = v * (0.8 + Math.random() * 1.4); // বড় movement (clamp এর নিচে varied)
-    delta += spikeDir * spikeMag * seaMul;
-  }
-
-  const maxStep = state.price * 0.0015; // hard safety — প্রতি tick max ±0.15%
-  delta = Math.max(-maxStep, Math.min(maxStep, delta));
-  state.price = Math.max(state.price + delta, 0.0001);
+  state.price = engine.nextPrice(state._eng, Date.now(), {
+    unit: engine.CFG.unit * volMul * speed,
+    forceDir: manual ? (dir === 'up' ? 1 : dir === 'down' ? -1 : 0) : 0,
+    trendStrength: ctrl.trendStrength ?? 0.6,
+  });
 
   _tickTail(id, state);
 }
 
-// ── candle গঠন, settlement, live লেখা — দুই পথেই একই কোড ──
+
 function _tickTail(id, state) {
   const now = Date.now();
 
