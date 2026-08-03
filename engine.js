@@ -45,6 +45,9 @@ const CFG = {
   spdVar:  num(process.env.ENG_SPD_VAR,  0.72),   // গতির তারতম্য
   unit:    num(process.env.ENG_UNIT,     0.00004),// pip-ঘেঁষা একক (দামের অনুপাতে)
   maxStep: num(process.env.ENG_MAX_STEP, 0.0015), // safety clamp ±০.১৫%/tick
+  // admin নিয়ন্ত্রণ (otc-server থেকে প্রতি tick এ পাঠানো হয়)
+  forceDir:      0,     // manual mode: 1 = up, -1 = down, 0 = auto
+  trendStrength: 0.6,   // manual mode এ দিকের জোর
 };
 
 /**
@@ -106,7 +109,10 @@ function nextPrice(st, now = Date.now(), over) {
       st.excite = Math.min(1, st.excite + 0.55);
       // ফিরতি টান — ঝলকে যতটা গেছে তার একাংশ ফেরত
       const moved = st.price - st.runStart;
-      st.retrTarget = -moved * (c.retr * (0.55 + Math.random() * 0.85));
+      // [ADMIN] manual mode এ ফিরতি টান কম — নইলে পক্ষপাতী দিক মুছে যেত
+      // আর admin এর নির্দেশ কাজ করত না।
+      const rf = c.forceDir ? c.retr * (1 - c.trendStrength * 0.75) : c.retr;
+      st.retrTarget = -moved * (rf * (0.55 + Math.random() * 0.85));
       st.retrLeft0 = 2 + ((Math.random() * 4) | 0);
       if (Math.abs(st.retrTarget) > 1e-12 && c.retr > 0) {
         st.phase = 'retrace';
@@ -127,14 +133,21 @@ function nextPrice(st, now = Date.now(), over) {
       st.phase = 'run';
       const u0 = Math.random();
       st.left = Math.max(2, Math.round(c.runLen * Math.pow(u0, -0.45) * 0.6));
-      st.dir = Math.random() < 0.5 + st.regimeDir * c.bias ? 1 : -1;
+      // [FIX] এখানেও admin এর দিক মানতে হবে — আগে শুধু regime দেখত, তাই
+      // manual mode এর অর্ধেক ঝলক নির্দেশ উপেক্ষা করত।
+      const b0 = (c.forceDir ? c.forceDir * (0.15 + c.trendStrength * 0.35)
+                             : st.regimeDir * c.bias);
+      st.dir = Math.random() < 0.5 + b0 ? 1 : -1;
       st.runStart = st.price;
     } else {
       st.phase = 'run';
       // দৈর্ঘ্য heavy-tail — বেশিরভাগ ছোট, কদাচিৎ অনেক লম্বা
       const u = Math.random();
       st.left = Math.max(2, Math.round(c.runLen * Math.pow(u, -0.45) * 0.6));
-      const b = st.regimeDir * c.bias;
+      // [ADMIN] manual mode এ admin এর দিক মানা হয় — trendStrength যত বেশি
+      // তত জোরালো পক্ষপাত (০.৬ হলে ~৮০% ঝলক ওই দিকে)
+      const b = (c.forceDir ? c.forceDir * (0.15 + c.trendStrength * 0.35)
+                            : st.regimeDir * c.bias);
       st.dir = Math.random() < 0.5 + b ? 1 : -1;
       st.runStart = st.price;
     }
