@@ -86,6 +86,10 @@ if (REDIS_URL) {
 }
 
 const TICK_MS   = 500;
+// [ENGINE] দামের physics আলাদা ফাইলে (engine.js) — otc-server ছোট রাখতে।
+// ENGINE_MODE=off দিলে পুরনো inline physics চলবে (তাৎক্ষণিক rollback)।
+const engine      = require('./engine.js');
+const ENGINE_MODE = (process.env.ENGINE_MODE || 'on').toLowerCase() !== 'off';
 const CANDLE_MS = 60 * 1000;
 const TD_KEY    = '392fa09f669c4cd7843f958e0fbbca36';
 
@@ -863,6 +867,26 @@ function tickOTC(id) {
   const state = _states[id];
   if (!state || state.type !== 'otc') return;
   const ctrl = _controls[id] || {};
+
+  // ══════════════════════════════════════════════════════════════════
+  // [ENGINE] নতুন tick engine — দাম engine.js ঠিক করে।
+  // candle গঠন, settlement, RTDB/Redis লেখা — সব নিচের পুরনো কোডেই।
+  // admin manual mode (ctrl.mode) হলে engine বাইপাস হয়, আগের মতোই।
+  // ══════════════════════════════════════════════════════════════════
+  if (ENGINE_MODE && (!ctrl.mode || ctrl.mode === 'auto')) {
+    if (!state._eng) {
+      const dec = (String(state.price).split('.')[1] || '').length || 5;
+      state._eng = engine.createState(state.price, Math.min(6, Math.max(2, dec)));
+    }
+    state._eng.price = state.price;                 // বাইরে থেকে দাম বদলালে মেনে নেয়
+    const volMul2 = { low: 0.4, medium: 1.0, high: 2.2 }[ctrl.volatility] || 1.0;
+    const spd     = ctrl.speedMultiplier || 1.0;
+    state.price = engine.nextPrice(state._eng, Date.now(),
+                    { unit: engine.CFG.unit * volMul2 * spd });
+
+    _tickTail(id, state);                            // candle + settlement অংশ
+    return;
+  }
   const volMul = { low:0.4, medium:1.0, high:2.2 }[ctrl.volatility] || 1.0;
   const speed = ctrl.speedMultiplier || 1.0;
   const now = Date.now();
@@ -1214,6 +1238,12 @@ function tickOTC(id) {
   delta = Math.max(-maxStep, Math.min(maxStep, delta));
   state.price = Math.max(state.price + delta, 0.0001);
 
+  _tickTail(id, state);
+}
+
+// ── candle গঠন, settlement, live লেখা — দুই পথেই একই কোড ──
+function _tickTail(id, state) {
+  const now = Date.now();
 
   if (state.price > state.candleHigh) state.candleHigh = state.price;
   if (state.price < state.candleLow)  state.candleLow  = state.price;
