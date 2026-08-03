@@ -31,16 +31,17 @@ const num = (v, d) => (v === undefined || v === '' || isNaN(+v) ? d : +v);
 
 const CFG = {
   volMem:  num(process.env.ENG_VOL_MEM,  0.994),  // অস্থিরতার স্মৃতির দৈর্ঘ্য
-  volAmp:  num(process.env.ENG_VOL_AMP,  0.28),   // ওঠানামার মাত্রা
+  volAmp:  num(process.env.ENG_VOL_AMP,  0.45),   // ওঠানামার মাত্রা
+  volSpd:  num(process.env.ENG_VOL_SPD,  0.75),   // অস্থিরতা কতটা গতি বদলায়
   runLen:  num(process.env.ENG_RUN_LEN,  6),      // ঝলকের গড় tick
   restLen: num(process.env.ENG_REST_LEN, 5),      // শ্বাসের গড় tick
   clust:   num(process.env.ENG_CLUST,    0.45),   // ঝলক গুচ্ছ হওয়া
   retr:    num(process.env.ENG_RETR,     0.40),   // ফিরতি টান
   jump:    num(process.env.ENG_JUMP,     1.8),    // হঠাৎ বড় লাফ %
   spread:  num(process.env.ENG_SPREAD,   0),      // bid-ask কাঁপুনি — ০ = দোলাদুলি নেই
-  bias:    num(process.env.ENG_BIAS,     0.02),   // trend পক্ষপাত
+  bias:    num(process.env.ENG_BIAS,     0.012),  // trend পক্ষপাত (কমানো — লম্বা সময়সীমায় মার্জিন বাড়াতে)
   session: num(process.env.ENG_SESSION,  0.55),   // দিনের ছন্দ
-  gapMs:   num(process.env.ENG_GAP_MS,   320),    // গড় tick ব্যবধান
+  gapMs:   num(process.env.ENG_GAP_MS,   700),    // গড় tick ব্যবধান (vol দিয়ে ভাগ হয়)
   spdVar:  num(process.env.ENG_SPD_VAR,  0.72),   // গতির তারতম্য
   unit:    num(process.env.ENG_UNIT,     0.00004),// pip-ঘেঁষা একক (দামের অনুপাতে)
   maxStep: num(process.env.ENG_MAX_STEP, 0.0015), // safety clamp ±০.১৫%/tick
@@ -111,12 +112,13 @@ function nextPrice(st, now = Date.now(), over) {
         st.phase = 'retrace';
         st.left = st.retrLeft0;
       } else {
-        const rest = Math.max(0, c.restLen * (1 - st.excite * c.clust));
+        const rest = Math.max(0, c.restLen * (1 - st.excite * c.clust) / Math.max(0.4, st.vol));
         st.phase = 'rest';
         st.left = 1 + ((Math.random() * (rest + 1)) | 0);
       }
     } else if (st.phase === 'retrace') {
-      const rest = Math.max(0, c.restLen * (1 - st.excite * c.clust));
+      // শান্ত সময়ে লম্বা শ্বাস, উত্তাল সময়ে ছোট — vol যত বেশি তত কম বিরতি
+      const rest = Math.max(0, c.restLen * (1 - st.excite * c.clust) / Math.max(0.4, st.vol));
       st.phase = 'rest';
       st.left = 1 + ((Math.random() * (rest + 1)) | 0);
     } else if (st.phase === 'rest') {
@@ -185,6 +187,12 @@ function nextPrice(st, now = Date.now(), over) {
 function nextDelay(st, over) {
   const c = over ? { ...CFG, ...over } : CFG;
   let g = c.gapMs;
+
+  /* [VOL↔SPEED] আসল বাজারে অস্থিরতা বাড়লে শুধু পা বড় হয় না — tick ও
+     ঘন আসে। আগে দুটো আলাদা ছিল, তাই বড় candle ও ধীর গতিতে তৈরি হত এবং
+     সব সময় একই গতি মনে হত। এখন vol বেশি হলে ব্যবধান কমে যায়:
+     vol ২.৫ → প্রায় অর্ধেক ব্যবধান, vol ০.৪ → দ্বিগুণ। */
+  g /= Math.pow(Math.max(0.3, st.vol), c.volSpd);
 
   g *= st.phase === 'run' ? 0.5 : st.phase === 'rest' ? 1.4 : 1;
   g *= 1 - 0.6 * st.excite * c.spdVar;          // উত্তেজনায় দ্রুত
