@@ -71,6 +71,7 @@ function createState(price, decimals = 5) {
     runStart: price,
     retrTarget: 0,
     retrLeft0: 1,
+    retrFast: false,
     frozenUntil: 0,        // এই সময় পর্যন্ত জমাট
     nextFreezeAt: 0,       // পরের জমাট কখন
     regimeDir: Math.random() < 0.5 ? 1 : -1,
@@ -170,7 +171,12 @@ function nextPrice(st, now = Date.now(), over) {
       const volFade = 1 / (1 + (st.vol - 1) * 0.45);
       const frac = (0.01 + Math.random() * (rf - 0.01)) * Math.max(0.35, Math.min(1.6, volFade));
       st.retrTarget = -moved * frac;
-      st.retrLeft0 = 2 + ((Math.random() * 4) | 0);
+      // ফেরতের গতি — কখনো ঝট করে (২ tick), কখনো ধীরে গড়িয়ে (৭ tick)।
+      // শুরুতেই ঠিক হয়, পুরো ফেরত জুড়ে একই থাকে, তাই চলাচল মসৃণ।
+      const fast = Math.random() < 0.45;
+      st.retrLeft0 = fast ? (2 + ((Math.random() * 2) | 0))     // দ্রুত
+                          : (4 + ((Math.random() * 4) | 0));    // ধীরে
+      st.retrFast = fast;
       if (Math.abs(st.retrTarget) > 1e-12 && c.retr > 0) {
         st.phase = 'retrace';
         st.left = st.retrLeft0;
@@ -268,7 +274,10 @@ function nextDelay(st, over) {
      vol ২.৫ → প্রায় অর্ধেক ব্যবধান, vol ০.৪ → দ্বিগুণ। */
   g /= Math.pow(Math.max(0.3, st.vol), c.volSpd);
 
-  g *= st.phase === 'run' ? 0.5 : st.phase === 'rest' ? 1.4 : 1;
+  g *= st.phase === 'run' ? 0.5
+     : st.phase === 'rest' ? 1.4
+     : st.phase === 'retrace' ? (st.retrFast ? 0.55 : 1.15)   // দ্রুত/ধীর ফেরত
+     : 1;
   g *= 1 - 0.6 * st.excite * c.spdVar;          // উত্তেজনায় দ্রুত
 
   const roll = Math.random();
