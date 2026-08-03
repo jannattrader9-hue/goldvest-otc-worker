@@ -37,7 +37,7 @@ const CFG = {
   clust:   num(process.env.ENG_CLUST,    0.45),   // ঝলক গুচ্ছ হওয়া
   retr:    num(process.env.ENG_RETR,     0.40),   // ফিরতি টান
   jump:    num(process.env.ENG_JUMP,     1.8),    // হঠাৎ বড় লাফ %
-  spread:  num(process.env.ENG_SPREAD,   1.0),    // bid-ask কাঁপুনি
+  spread:  num(process.env.ENG_SPREAD,   0),      // bid-ask কাঁপুনি — ০ = দোলাদুলি নেই
   bias:    num(process.env.ENG_BIAS,     0.02),   // trend পক্ষপাত
   session: num(process.env.ENG_SESSION,  0.55),   // দিনের ছন্দ
   gapMs:   num(process.env.ENG_GAP_MS,   320),    // গড় tick ব্যবধান
@@ -120,8 +120,13 @@ function nextPrice(st, now = Date.now(), over) {
       st.phase = 'rest';
       st.left = 1 + ((Math.random() * (rest + 1)) | 0);
     } else if (st.phase === 'rest') {
-      st.phase = 'step';
-      st.left = 1 + ((Math.random() * 4) | 0);
+      // [NO WOBBLE] আগে এখানে 'step' পর্ব ছিল — দিকহীন ছোট নড়াচড়া, যা
+      // দোলাদুলির মত লাগত। এখন শ্বাসের পর সরাসরি নতুন ঝলক।
+      st.phase = 'run';
+      const u0 = Math.random();
+      st.left = Math.max(2, Math.round(c.runLen * Math.pow(u0, -0.45) * 0.6));
+      st.dir = Math.random() < 0.5 + st.regimeDir * c.bias ? 1 : -1;
+      st.runStart = st.price;
     } else {
       st.phase = 'run';
       // দৈর্ঘ্য heavy-tail — বেশিরভাগ ছোট, কদাচিৎ অনেক লম্বা
@@ -141,7 +146,7 @@ function nextPrice(st, now = Date.now(), over) {
   } else if (st.phase === 'rest') {
     delta = 0;                                          // একদম স্থির
   } else if (st.phase === 'step') {
-    delta = (Math.random() - 0.5) * base * c.spread * st.vol * sm;
+    delta = (Math.random() - 0.5) * base * c.spread * st.vol * sm;   // spread=0 হলে ০
   } else {
     delta = st.dir * base * (1.0 + Math.random() * 1.6) * st.vol * sm;
   }
