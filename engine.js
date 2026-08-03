@@ -37,10 +37,10 @@ const CFG = {
   freezeMin: num(process.env.ENG_FRZ_MIN, 1000),  // ন্যূনতম ১s
   freezeMax: num(process.env.ENG_FRZ_MAX, 7000),  // সর্বোচ্চ ৭s (hard limit)
   freezeGap: num(process.env.ENG_FRZ_GAP, 0.55),  // কত ঘন ঘন জমাট আসে
-  runLen:  num(process.env.ENG_RUN_LEN,  6),      // ঝলকের গড় tick
+  runLen:  num(process.env.ENG_RUN_LEN,  3),      // ঝলকের গড় tick
   restLen: num(process.env.ENG_REST_LEN, 5),      // শ্বাসের গড় tick
   clust:   num(process.env.ENG_CLUST,    0.45),   // ঝলক গুচ্ছ হওয়া
-  retr:    num(process.env.ENG_RETR,     0.40),   // ফিরতি টান
+  retr:    num(process.env.ENG_RETR,     0.20),   // ফিরতি টান — সর্বোচ্চ ২০%
   jump:    num(process.env.ENG_JUMP,     1.8),    // হঠাৎ বড় লাফ %
   spread:  num(process.env.ENG_SPREAD,   0),      // bid-ask কাঁপুনি — ০ = দোলাদুলি নেই
   bias:    num(process.env.ENG_BIAS,     0.012),  // trend পক্ষপাত (কমানো — লম্বা সময়সীমায় মার্জিন বাড়াতে)
@@ -134,7 +134,7 @@ function nextPrice(st, now = Date.now(), over) {
       st.retrTarget = 0;
       // জমাট শুরুর আগে দাম কিছুটা ফিরিয়ে আনি — জমাটের আগের ও পরের
       // চলাচল যেন এক সরলরেখা না হয় (নইলে ৫s এ দিক অনুমান করা যেত)।
-      const back = (st.price - st.runStart) * (0.15 + Math.random() * 0.25);
+      const back = (st.price - st.runStart) * (0.65 + Math.random() * 0.25);
       if (isFinite(back)) {
         const q1 = Math.pow(10, st.decimals);
         st.price = Math.round((st.price - back) * q1) / q1;
@@ -163,7 +163,13 @@ function nextPrice(st, now = Date.now(), over) {
       // [ADMIN] manual mode এ ফিরতি টান কম — নইলে পক্ষপাতী দিক মুছে যেত
       // আর admin এর নির্দেশ কাজ করত না।
       const rf = c.forceDir ? c.retr * (1 - c.trendStrength * 0.75) : c.retr;
-      st.retrTarget = -moved * (rf * (0.55 + Math.random() * 0.85));
+      // ফেরতের পরিমাণ ১% থেকে সর্বোচ্চ retr (২০%) পর্যন্ত এলোমেলো —
+      // কখনো প্রায় পুরোটাই ধরে রাখে, কখনো এক-পঞ্চমাংশ ছেড়ে দেয়।
+      // অস্থিরতার স্মৃতি মিশিয়ে: শান্ত বাজারে ফেরত বেশি (দাম ফিরে আসে),
+      // উত্তাল বাজারে কম (চলাচল ধরে রাখে) — আসল বাজারের ধর্ম।
+      const volFade = 1 / (1 + (st.vol - 1) * 0.45);
+      const frac = (0.01 + Math.random() * (rf - 0.01)) * Math.max(0.35, Math.min(1.6, volFade));
+      st.retrTarget = -moved * frac;
       st.retrLeft0 = 2 + ((Math.random() * 4) | 0);
       if (Math.abs(st.retrTarget) > 1e-12 && c.retr > 0) {
         st.phase = 'retrace';
