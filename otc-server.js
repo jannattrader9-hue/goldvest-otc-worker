@@ -1524,10 +1524,40 @@ async function main() {
   console.log('GoldVest Server starting (Admin SDK)...');
   watchFirestoreMarkets();
   await _recoverLiveTradesFromRTDB();
+  // ══════════════════════════════════════════════════════════════════
+  // [TICK RHYTHM] প্রতিটা market নিজের ছন্দে tick পাঠায়।
+  // engine চললে ছন্দ engine.nextDelay() থেকেই আসে — ঝলকে দ্রুত, শ্বাসে
+  // ধীর, মাঝে মাঝে ঝাঁক। আগে স্থির ৫০০ms ছিল, তাই পরীক্ষার পাতার মত
+  // লাগত না (ওখানে গড় ~৩২০ms ও অসম)।
+  // settlement আগের মতোই স্থির ছন্দে — কোনো পরিবর্তন নেই।
+  // ══════════════════════════════════════════════════════════════════
+  const _tickTimers = {};
+
+  function _tickDelay(id) {
+    const st = _states[id];
+    if (ENGINE_MODE && st && st._eng) return engine.nextDelay(st._eng);
+    return TICK_MS * (0.75 + Math.random() * 0.5);   // পুরনো physics এর জন্য
+  }
+
+  function _scheduleTick(id) {
+    _tickTimers[id] = setTimeout(() => {
+      if (!_activeMarkets.has(id)) { delete _tickTimers[id]; return; }
+      try {
+        const st = _states[id];
+        if (st?.type === 'otc')   tickOTC(id);
+        if (st?.type === 'forex') tickForex(id);
+      } catch (e) {
+        console.error(`[tick] ${id}:`, e.message);
+      }
+      _scheduleTick(id);
+    }, _tickDelay(id));
+  }
+
   setInterval(() => {
-    _activeMarkets.forEach(id => {
-      if (_states[id]?.type === 'otc')   tickOTC(id);
-      if (_states[id]?.type === 'forex') tickForex(id);
+    // সক্রিয় market এর ছন্দ চালু আছে কিনা দেখি, বন্ধ হলে timer সরাই
+    _activeMarkets.forEach(id => { if (!_tickTimers[id]) _scheduleTick(id); });
+    Object.keys(_tickTimers).forEach(id => {
+      if (!_activeMarkets.has(id)) { clearTimeout(_tickTimers[id]); delete _tickTimers[id]; }
     });
     _settleDueTradesFromMemory().catch(e => console.error('[tick-settle] error:', e.message));
     _settleDueTradesFromRTDB().catch(e => console.error('[rtdb-tick-settle] error:', e.message));
