@@ -33,6 +33,10 @@ const CFG = {
   volMem:  num(process.env.ENG_VOL_MEM,  0.994),  // অস্থিরতার স্মৃতির দৈর্ঘ্য
   volAmp:  num(process.env.ENG_VOL_AMP,  0.45),   // ওঠানামার মাত্রা
   volSpd:  num(process.env.ENG_VOL_SPD,  0.75),   // অস্থিরতা কতটা গতি বদলায়
+  // জমাট অবস্থা — দাম প্রায় থেমে থাকে, তারপর আবার চলা শুরু
+  freezeMin: num(process.env.ENG_FRZ_MIN, 1000),  // ন্যূনতম ১s
+  freezeMax: num(process.env.ENG_FRZ_MAX, 7000),  // সর্বোচ্চ ৭s (hard limit)
+  freezeGap: num(process.env.ENG_FRZ_GAP, 0.55),  // কত ঘন ঘন জমাট আসে
   runLen:  num(process.env.ENG_RUN_LEN,  6),      // ঝলকের গড় tick
   restLen: num(process.env.ENG_REST_LEN, 5),      // শ্বাসের গড় tick
   clust:   num(process.env.ENG_CLUST,    0.45),   // ঝলক গুচ্ছ হওয়া
@@ -67,6 +71,8 @@ function createState(price, decimals = 5) {
     runStart: price,
     retrTarget: 0,
     retrLeft0: 1,
+    frozenUntil: 0,        // এই সময় পর্যন্ত জমাট
+    nextFreezeAt: 0,       // পরের জমাট কখন
     regimeDir: Math.random() < 0.5 ? 1 : -1,
     regimeLeft: 200 + ((Math.random() * 400) | 0),
   };
@@ -94,6 +100,51 @@ function sessionMul(t, amt) {
 function nextPrice(st, now = Date.now(), over) {
   const c = over ? { ...CFG, ...over } : CFG;
   const base = st.price * c.unit;
+
+  /* ══ [FREEZE] জমাট অবস্থা ═══════════════════════════════════════════
+     আসল বাজারে দাম মাঝে মাঝে কয়েক সেকেন্ড একদম থেমে থাকে (কোনো order
+     আসে না), তারপর আবার চলা শুরু। আগে vol কম হলেও ছোট ছোট নড়াচড়া
+     চলতেই থাকত — সেটাই "সবসময় নড়ছে" ভাব দিত।
+
+     জমাটে দাম প্রায় স্থির, তবে কদাচিৎ ১ ধাপ নড়ে — একদম মৃত না, আর
+     trade একই দামে শেষ হলে settler এমনিতেই পুরো টাকা ফেরত দেয়।
+     দৈর্ঘ্য ১-৭ সেকেন্ড, hard limit ছাড়ায় না।
+     ══════════════════════════════════════════════════════════════════ */
+  if (!st.nextFreezeAt) st.nextFreezeAt = now + 2000 + Math.random() * 8000;
+
+  if (now < st.frozenUntil) {
+    // জমাট চলছে — কদাচিৎ এক ধাপ, নইলে একদম স্থির
+    if (Math.random() < 0.06) {
+      const q0 = Math.pow(10, st.decimals);
+      st.price = Math.round((st.price + (Math.random() < 0.5 ? 1 : -1) / q0) * q0) / q0;
+    }
+    return st.price;
+  }
+
+  if (now >= st.nextFreezeAt) {
+    // শান্ত বাজারে জমাট বেশি, উত্তালে কম
+    if (Math.random() < c.freezeGap / Math.max(0.35, st.vol)) {
+      const dur = c.freezeMin + Math.random() * (c.freezeMax - c.freezeMin);
+      st.frozenUntil = now + Math.min(c.freezeMax, dur);
+      // জমাটের পর দিক নতুন করে ঠিক হয় — নইলে "জমাটের আগে যেদিকে যাচ্ছিল
+      // সেদিকেই যাবে" ধরে ৫s trade জেতা যেত (মাপা হয়েছিল ৫৩.৪%)।
+      st.phase = 'rest'; st.left = 1;
+      st.excite = 0;
+      st.regimeDir = Math.random() < 0.5 ? 1 : -1;
+      st.retrTarget = 0;
+      // জমাট শুরুর আগে দাম কিছুটা ফিরিয়ে আনি — জমাটের আগের ও পরের
+      // চলাচল যেন এক সরলরেখা না হয় (নইলে ৫s এ দিক অনুমান করা যেত)।
+      const back = (st.price - st.runStart) * (0.15 + Math.random() * 0.25);
+      if (isFinite(back)) {
+        const q1 = Math.pow(10, st.decimals);
+        st.price = Math.round((st.price - back) * q1) / q1;
+        st.runStart = st.price;
+      }
+    }
+    // পরের যাচাই জমাট শেষ হওয়ার পরে — নইলে দুটো জমাট জুড়ে গিয়ে
+    // ৭ সেকেন্ডের সীমা ছাড়িয়ে যেত
+    st.nextFreezeAt = Math.max(now, st.frozenUntil) + 1500 + Math.random() * 5000;
+  }
 
   /* ── ১. অস্থিরতার স্মৃতি ── */
   const shock = (Math.random() - 0.5) * c.volAmp;
@@ -199,6 +250,10 @@ function nextPrice(st, now = Date.now(), over) {
  */
 function nextDelay(st, over) {
   const c = over ? { ...CFG, ...over } : CFG;
+
+  // জমাট অবস্থায় tick ধীরে — নইলে একই দাম বারবার পাঠিয়ে bandwidth নষ্ট হত
+  if (Date.now() < st.frozenUntil) return 600 + Math.random() * 700;
+
   let g = c.gapMs;
 
   /* [VOL↔SPEED] আসল বাজারে অস্থিরতা বাড়লে শুধু পা বড় হয় না — tick ও
