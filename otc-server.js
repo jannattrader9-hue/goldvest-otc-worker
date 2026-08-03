@@ -877,6 +877,7 @@ function tickOTC(id) {
     if (!state._eng) {
       const dec = (String(state.price).split('.')[1] || '').length || 5;
       state._eng = engine.createState(state.price, Math.min(6, Math.max(2, dec)));
+      console.log(`[engine] ${id} — চালু (decimals: ${state._eng.decimals})`);
     }
     state._eng.price = state.price;                 // বাইরে থেকে দাম বদলালে মেনে নেয়
     const volMul2 = { low: 0.4, medium: 1.0, high: 2.2 }[ctrl.volatility] || 1.0;
@@ -887,6 +888,12 @@ function tickOTC(id) {
     _tickTail(id, state);                            // candle + settlement অংশ
     return;
   }
+  // engine এ যায়নি — কেন, একবার জানিয়ে রাখি (ঠিক করতে সুবিধা হয়)
+  if (!state._engSkipLogged) {
+    state._engSkipLogged = true;
+    console.log(`[engine] ${id} — বাইপাস (ENGINE_MODE=${ENGINE_MODE}, ctrl.mode=${ctrl.mode || 'auto'})`);
+  }
+
   const volMul = { low:0.4, medium:1.0, high:2.2 }[ctrl.volatility] || 1.0;
   const speed = ctrl.speedMultiplier || 1.0;
   const now = Date.now();
