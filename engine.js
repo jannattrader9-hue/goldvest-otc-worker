@@ -33,7 +33,7 @@ const num = (v, d) => (v === undefined || v === '' || isNaN(+v) ? d : +v);
 
 /* পরীক্ষার পাতার স্লাইডারের মান — হুবহু একই */
 const CFG = {
-  unit:    num(process.env.ENG_UNIT,     0.00004),  // base একক (দামের অনুপাতে)
+  unit:    num(process.env.ENG_UNIT,     0.0000065),  // base একক (দামের অনুপাতে)
   volMem:  num(process.env.ENG_VOL_MEM,  0.994),    // অস্থিরতার স্মৃতি
   volAmp:  num(process.env.ENG_VOL_AMP,  0.28),     // ওঠানামার মাত্রা
   runLen:  num(process.env.ENG_RUN_LEN,  6),        // ঝলকের গড় tick
@@ -42,9 +42,9 @@ const CFG = {
   retr:    num(process.env.ENG_RETR,     0.40),     // ফিরতি টান
   jump:    num(process.env.ENG_JUMP,     1.8),      // হঠাৎ বড় লাফ %
   spread:  num(process.env.ENG_SPREAD,   1.0),      // bid-ask কাঁপুনি
-  gapMs:   num(process.env.ENG_GAP_MS,   320),      // গড় tick ব্যবধান
+  gapMs:   num(process.env.ENG_GAP_MS,   170),      // গড় tick ব্যবধান
   spdVar:  num(process.env.ENG_SPD_VAR,  0.72),     // গতির তারতম্য
-  bias:    num(process.env.ENG_BIAS,     0.02),     // trend পক্ষপাত
+  bias:    num(process.env.ENG_BIAS,     0.028),     // trend পক্ষপাত
   session: num(process.env.ENG_SESSION,  0.55),     // দিনের ছন্দ
   maxStep: num(process.env.ENG_MAX_STEP, 0.0015),   // safety ±০.১৫%/tick
 
@@ -114,7 +114,9 @@ function nextPrice(st, now = Date.now(), over) {
       // ফিরতি টান — ঝলকে যতটা গেছে তার একাংশ ফেরত
       const moved = st.price - st.runStart;
       st.retrTarget = -moved * (c.retr * (0.55 + Math.random() * 0.85));
-      st.retrLeft0 = 2 + ((Math.random() * 4) | 0);
+      // [NO WAVE] ফেরত ১-২ লাফে শেষ — আগে ২-৫ tick এ ভাগ হত, তাই
+      // ধীরে গড়িয়ে ফিরত (ঢেউ)। এখন এক ঝটকায়।
+      st.retrLeft0 = 1 + ((Math.random() * 2) | 0);
       if (Math.abs(st.retrTarget) > 1e-12 && c.retr > 0) {
         st.phase = 'retrace';
         st.left = st.retrLeft0;
@@ -128,8 +130,14 @@ function nextPrice(st, now = Date.now(), over) {
       st.phase = 'rest';
       st.left = 1 + ((Math.random() * (rest + 1)) | 0);
     } else if (st.phase === 'rest') {
-      st.phase = 'step';
-      st.left = 1 + ((Math.random() * 4) | 0);
+      // [NO WAVE] 'step' পর্ব (দিকহীন কাঁপুনি) বাদ — ওটাই ঢেউয়ের ভাব
+      // দিত। শ্বাসের পর সরাসরি নতুন ঝলক।
+      st.phase = 'run';
+      st.left = 2 + ((Math.random() * 5) | 0);
+      const b1 = c.forceDir ? c.forceDir * (0.10 + c.trendStrength * 0.22)
+                            : st.regimeDir * c.bias;
+      st.dir = Math.random() < 0.5 + b1 ? 1 : -1;
+      st.runStart = st.price;
     } else {
       st.phase = 'run';
       // দৈর্ঘ্য heavy-tail — বেশিরভাগ ছোট, কদাচিৎ অনেক লম্বা
@@ -155,7 +163,10 @@ function nextPrice(st, now = Date.now(), over) {
     /* ── ৪. bid-ask কাঁপুনি ── */
     delta = (Math.random() - 0.5) * base * c.spread * st.vol * sm;
   } else {
-    delta = st.dir * base * (1.0 + Math.random() * 1.6) * st.vol * sm;
+    // [JUMP] পায়ের মাপ ভারী-লেজ — বেশিরভাগ মাঝারি, কদাচিৎ অনেক বড়।
+    // সমান মাপের পা হলে চলাচল যান্ত্রিক ও অনুমানযোগ্য লাগত।
+    const mag = 0.45 + Math.pow(Math.random(), -0.42) * 0.75;
+    delta = st.dir * base * Math.min(6, mag) * st.vol * sm;
   }
 
   /* ── ৫. ভারী লেজ ── */
