@@ -887,7 +887,17 @@ function _tickTail(id, state) {
     state.candleTime = state.nextCandle/1000; state.candleOpen = state.price;
     state.candleHigh = state.price; state.candleLow = state.price;
     state.nextCandle += CANDLE_MS;
-    while (state.nextCandle <= now) { state.candleTime = state.nextCandle/1000; state.nextCandle += CANDLE_MS; }
+    // [FIX] tick দেরিতে এলে (জমাটে ব্যবধান বড় হয়) একাধিক candle পার হয়ে
+    // যেতে পারে। আগে এখানে শুধু সময় এগোত, কিন্তু open/high/low পুরনোই
+    // থেকে যেত — ফলে নতুন candle পুরনো শিখর নিয়ে শুরু করত আর বিশাল
+    // wick দেখাত। এখন প্রতিটা এড়িয়ে যাওয়া candle এও নতুন করে বসে।
+    while (state.nextCandle <= now) {
+      state.candleTime = state.nextCandle/1000;
+      state.candleOpen = state.price;
+      state.candleHigh = state.price;
+      state.candleLow  = state.price;
+      state.nextCandle += CANDLE_MS;
+    }
   } else {
     saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle });
   }
@@ -905,7 +915,15 @@ function _tickTail(id, state) {
       ss.candleHigh = state.price;
       ss.candleLow  = state.price;
       ss.nextCandle += ss.ms;
-      while (ss.nextCandle <= now) { ss.candleTime = ss.nextCandle / 1000; ss.nextCandle += ss.ms; }
+      // [FIX] এড়িয়ে যাওয়া candle এও open/high/low নতুন করে — নইলে
+      // পুরনো শিখর বয়ে নিয়ে গিয়ে বিশাল wick দেখাত (উপরে একই সংশোধন)
+      while (ss.nextCandle <= now) {
+        ss.candleTime = ss.nextCandle / 1000;
+        ss.candleOpen = state.price;
+        ss.candleHigh = state.price;
+        ss.candleLow  = state.price;
+        ss.nextCandle += ss.ms;
+      }
     } else {
       saveLiveSubCandle(id, label, { time:ss.candleTime, open:ss.candleOpen, high:ss.candleHigh, low:ss.candleLow, close:state.price, nextCandle:ss.nextCandle });
     }
@@ -1092,7 +1110,15 @@ function tickForex(id) {
       ss.candleHigh = price;
       ss.candleLow  = price;
       ss.nextCandle += ss.ms;
-      while (ss.nextCandle <= now) { ss.candleTime = ss.nextCandle / 1000; ss.nextCandle += ss.ms; }
+      // [FIX] এড়িয়ে যাওয়া candle এও open/high/low নতুন করে — নইলে
+      // পুরনো শিখর বয়ে নিয়ে গিয়ে বিশাল wick দেখাত (উপরে একই সংশোধন)
+      while (ss.nextCandle <= now) {
+        ss.candleTime = ss.nextCandle / 1000;
+        ss.candleOpen = state.price;
+        ss.candleHigh = state.price;
+        ss.candleLow  = state.price;
+        ss.nextCandle += ss.ms;
+      }
     } else {
       saveLiveSubCandle(id, label, { time:ss.candleTime, open:ss.candleOpen, high:ss.candleHigh, low:ss.candleLow, close:price, nextCandle:ss.nextCandle });
     }
