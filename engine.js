@@ -31,7 +31,7 @@ const num = (v, d) => (v === undefined || v === '' || isNaN(+v) ? d : +v);
 
 const CFG = {
   volMem:  num(process.env.ENG_VOL_MEM,  0.994),  // অস্থিরতার স্মৃতির দৈর্ঘ্য
-  volAmp:  num(process.env.ENG_VOL_AMP,  0.45),   // ওঠানামার মাত্রা
+  volAmp:  num(process.env.ENG_VOL_AMP,  0.38),   // ওঠানামার মাত্রা
   volSpd:  num(process.env.ENG_VOL_SPD,  0.75),   // অস্থিরতা কতটা গতি বদলায়
   // জমাট অবস্থা — দাম প্রায় থেমে থাকে, তারপর আবার চলা শুরু
   freezeMin: num(process.env.ENG_FRZ_MIN, 1000),  // ন্যূনতম ১s
@@ -170,7 +170,7 @@ function nextPrice(st, now = Date.now(), over) {
   /* ── ১. অস্থিরতার স্মৃতি ── */
   const shock = (Math.random() - 0.5) * c.volAmp;
   st.vol = st.vol * c.volMem + (1 - c.volMem) * (1 + shock * 3);
-  st.vol = Math.max(0.25, Math.min(4.5, st.vol));
+  st.vol = Math.max(0.35, Math.min(2.6, st.vol));   // সীমা কমানো — নইলে vol ছাদে আটকে candle বিশাল হত
 
   /* ── ২. উত্তেজনা ধীরে শান্ত হয় (গুচ্ছ ঝলক) ── */
   st.excite *= 0.93;
@@ -263,10 +263,10 @@ function nextPrice(st, now = Date.now(), over) {
 
   /* ── ৫. ভারী লেজ ── */
   if (Math.random() * 100 < c.jump) {
-    const mag = base * (4 + Math.pow(Math.random(), -0.5) * 3) * st.vol;
+    const mag = base * (3 + Math.pow(Math.random(), -0.4) * 2) * st.vol;
     delta += (Math.random() < 0.5 ? 1 : -1) * mag;
     st.excite = Math.min(1, st.excite + 0.7);
-    st.vol = Math.min(4.5, st.vol * 1.25);
+    st.vol = Math.min(2.6, st.vol * 1.10);   // লাফের পর vol সামান্য বাড়ে (আগে ১.২৫ — জমে ছাদে উঠত)
   }
 
   /* ── regime — কয়েক মিনিট পরপর দিক বদলায় ── */
