@@ -36,9 +36,9 @@ const CFG = {
   // জমাট অবস্থা — দাম প্রায় থেমে থাকে, তারপর আবার চলা শুরু
   freezeMin: num(process.env.ENG_FRZ_MIN, 1000),  // ন্যূনতম ১s
   freezeMax: num(process.env.ENG_FRZ_MAX, 4000),  // সর্বোচ্চ ৪s (hard limit)
-  freezeGap: num(process.env.ENG_FRZ_GAP, 0.55),  // কত ঘন ঘন জমাট আসে
+  freezeGap: num(process.env.ENG_FRZ_GAP, 0.28),  // কত ঘন ঘন জমাট আসে
   runLen:  num(process.env.ENG_RUN_LEN,  3),      // ঝলকের গড় tick
-  restLen: num(process.env.ENG_REST_LEN, 5),      // শ্বাসের গড় tick
+  restLen: num(process.env.ENG_REST_LEN, 2),      // শ্বাসের গড় tick — ছোট, ঝলকই প্রধান
   clust:   num(process.env.ENG_CLUST,    0.45),   // ঝলক গুচ্ছ হওয়া
   retr:    num(process.env.ENG_RETR,     0.20),   // ফিরতি টান — সর্বোচ্চ ২০%
   jump:    num(process.env.ENG_JUMP,     1.8),    // হঠাৎ বড় লাফ %
@@ -210,7 +210,8 @@ function nextPrice(st, now = Date.now(), over) {
     } else if (st.phase === 'retrace') {
       // ফেরতের পর প্রায়ই সরাসরি আরেকটা ছোট ঝলক (২-৩ tick) — শ্বাস ছাড়াই।
       // এতে চলাচল বেশি জীবন্ত লাগে, প্রতিবার থেমে যায় না।
-      if (Math.random() < 0.55) {
+      // Quotex এর মত — ফেরতের পর প্রায় সবসময়ই নতুন ঝলক, খুব কম সময় থামে
+      if (Math.random() < 0.80) {
         st.phase = 'run';
         st.left = 2 + ((Math.random() * 2) | 0);
         const b2 = (c.forceDir ? c.forceDir * (0.15 + c.trendStrength * 0.35)
@@ -263,8 +264,12 @@ function nextPrice(st, now = Date.now(), over) {
 
   /* ── ৫. ভারী লেজ ── */
   if (Math.random() * 100 < c.jump) {
-    const mag = base * (3 + Math.pow(Math.random(), -0.4) * 2) * st.vol;
-    delta += (Math.random() < 0.5 ? 1 : -1) * mag;
+    // [WICK] লাফ ছোট করা — আগে এক tick এ candle এর ৮০% পর্যন্ত লাফাত,
+    // তাই প্রায় প্রতি candle এ বড় wick তৈরি হত। এখন লাফ মাঝারি, আর
+    // ঝলকের দিকেই বেশি ঝোঁকে (এলোমেলো spike কম)।
+    const mag = base * (1.8 + Math.pow(Math.random(), -0.3) * 1.2) * st.vol;
+    const jd  = Math.random() < 0.65 ? st.dir : (Math.random() < 0.5 ? 1 : -1);
+    delta += jd * mag;
     st.excite = Math.min(1, st.excite + 0.7);
     st.vol = Math.min(2.6, st.vol * 1.10);   // লাফের পর vol সামান্য বাড়ে (আগে ১.২৫ — জমে ছাদে উঠত)
   }
