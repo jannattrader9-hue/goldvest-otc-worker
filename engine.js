@@ -1,45 +1,29 @@
 /**
- * engine.js — GoldVest OTC price engine (v2)
+ * engine.js — GoldVest OTC price engine
  * ═══════════════════════════════════════════════════════════════════════
- * আসল FX বাজার যে নিয়মে চলে, সেই নিয়মেই দাম তৈরি করে। আগের সংস্করণে
- * "ঝলক / শ্বাস / জমাট" এর মত ধাপ হাতে বানানো ছিল — সেটা বাদ। এবার দাম
- * চলে বাজারের প্রকৃত কারণ থেকে, তাই কোনো ছক চোখে ধরা পড়ে না।
+ * candle.html পরীক্ষার পাতার মডেল হুবহু এখানে আনা হয়েছে — যেটা দেখে
+ * পছন্দ করা হয়েছিল। কোনো সূত্র বদলানো হয়নি, শুধু server এ চালানোর
+ * উপযোগী করে সাজানো।
  *
- * ─── কোন নীতিগুলো বসানো ────────────────────────────────────────────
+ * ─── কী কী স্তর ────────────────────────────────────────────────────
+ * ১. অস্থিরতার স্মৃতি — বাজার একবার অস্থির হলে কিছুক্ষণ অস্থিরই থাকে।
+ *    এটাই candle গুলোকে আলাদা আকারের করে।
+ * ২. উত্তেজনা — ঝলকের পর কিছুক্ষণ tick ঘন আসে (গুচ্ছ ঝলক)।
+ * ৩. পর্ব — ঝলক / ফিরতি টান / শ্বাস / ছোট পা, চক্রাকারে।
+ * ৪. bid-ask কাঁপুনি — ছোট পায়ের পর্বে দিকহীন লাফ।
+ * ৫. ভারী লেজ — কদাচিৎ বড় লাফ, তারপর উত্তেজনা বাড়ে।
+ * ৬. pip ধাপ — দাম নির্দিষ্ট ধাপে লাফায়।
+ * ৭. regime — কয়েক মিনিট পরপর মৃদু ঝোঁক বদলায়।
+ * ৮. অধিবেশন — লন্ডন/নিউইয়র্কে উত্তাল, এশীয় সময়ে ঝিমানো।
  *
- * ১. অর্ডার-প্রবাহের ভারসাম্যহীনতা (order flow imbalance)
- *    দাম নড়ে কারণ কেনা বা বেচার চাপ বেশি পড়ে। চাপ এলোমেলোভাবে আসে,
- *    কিন্তু কিছুক্ষণ রেশ থেকে যায় — তাই ছোট ছোট ধারা তৈরি হয়।
- *
- * ২. অস্থিরতার গুচ্ছ (volatility clustering — GARCH)
- *    আজকের ধাক্কা পরের কিছুক্ষণের অস্থিরতা বাড়ায়। এটাই candle গুলোকে
- *    আলাদা আকারের করে; না থাকলে সব candle একরকম দেখাত।
- *
- * ৩. বাজার-নির্মাতার মজুত (inventory)
- *    দাম এক দিকে বেশি সরলে নির্মাতার মজুত ভারী হয়, তখন সে উল্টো দিকে
- *    দর দেয় — দাম আংশিক ফিরে আসে। এটাই retracement এর আসল কারণ, আর
- *    এটাই দিককে অনুমান-অযোগ্য রাখে।
- *
- * ৪. তারল্য ঘন-পাতলা (liquidity depth)
- *    বইয়ের গভীরতা কমলে একই চাপে দাম অনেক বেশি লাফায়। তাই মাঝে মাঝে
- *    হঠাৎ বড় লাফ — আলাদা করে "spike" বানাতে হয় না।
- *
- * ৫. স্টপ ঝাঁক (stop cascade)
- *    দাম স্তর ভাঙলে জমে থাকা stop-loss একসাথে চালু হয়ে দ্রুত কয়েক ধাপ
- *    ঠেলে দেয়, তারপর থেমে যায়।
- *
- * ৬. গোল সংখ্যার টান (round-number magnetism)
- *    গোল সংখ্যার কাছে জমা order দাম কিছুক্ষণ ধরে রাখে।
- *
- * ৭. অধিবেশনের ছন্দ — লন্ডন/নিউইয়র্কে উত্তাল, এশীয় সময়ে ঝিমানো।
- *
- * ৮. pip ধাপ — দাম ধারাবাহিক নয়, নির্দিষ্ট ধাপে লাফায়।
+ * ─── tick এর ছন্দ ──────────────────────────────────────────────────
+ * ঝলকে দ্রুত, শ্বাসে ধীর, উত্তেজনায় আরও দ্রুত। মাঝে মাঝে কয়েকটা tick
+ * প্রায় একসাথে (ঝাঁক), আবার কদাচিৎ হঠাৎ থমকে যাওয়া। এটাই "কখনো ফাস্ট,
+ * কখনো ধীর — পালস ফলো করে চলা" ভাব দেয়।
  *
  * ─── নিরাপত্তা ─────────────────────────────────────────────────────
- * ৯২% payout এ ব্রেক-ইভেন ৫২.১%। চাপের রেশ অল্পক্ষণ থাকে আর মজুতের টান
- * তাকে ভারসাম্যে ফেরায়, তাই কোনো সময়সীমাতেই দিক অনুমান করে জেতা যায় না।
- *
- * ⚠ কোনো সংখ্যা বদলালে জয়ের হার বদলাতে পারে — বদলানোর আগে মেপে নিও।
+ * ৯২% payout এ ব্রেক-ইভেন ৫২.১%। সব সময়সীমায় জয়ের হার ওই সীমার নিচে
+ * থাকতে হবে — কোনো সংখ্যা বদলালে আগে মেপে নিও।
  * ═══════════════════════════════════════════════════════════════════════
  */
 
@@ -47,48 +31,22 @@
 
 const num = (v, d) => (v === undefined || v === '' || isNaN(+v) ? d : +v);
 
+/* পরীক্ষার পাতার স্লাইডারের মান — হুবহু একই */
 const CFG = {
-  // এক ধাপের আনুমানিক মাপ (দামের অনুপাতে)
-  unit:      num(process.env.ENG_UNIT,      0.000035),
-
-  // ১. অর্ডার-প্রবাহ
-  flowMem:   num(process.env.ENG_FLOW_MEM,  0.72),   // চাপের রেশ
-  flowAmp:   num(process.env.ENG_FLOW_AMP,  1.00),   // চাপের মাত্রা
-
-  // ২. অস্থিরতার গুচ্ছ
-  volMem:    num(process.env.ENG_VOL_MEM,   0.995),
-  volAmp:    num(process.env.ENG_VOL_AMP,   0.40),
-  volMin:    num(process.env.ENG_VOL_MIN,   0.40),
-  volMax:    num(process.env.ENG_VOL_MAX,   2.40),
-
-  // ৩. মজুতের টান
-  invPull:   num(process.env.ENG_INV_PULL,  0.055),
-  invMem:    num(process.env.ENG_INV_MEM,   0.988),
-
-  // ৪. তারল্য
-  liqMem:    num(process.env.ENG_LIQ_MEM,   0.93),
-  liqDepth:  num(process.env.ENG_LIQ_DEPTH, 0.55),
-
-  // ৫. স্টপ ঝাঁক
-  stopOdds:  num(process.env.ENG_STOP_ODDS, 0.006),
-  stopSize:  num(process.env.ENG_STOP_SIZE, 3.2),
-
-  // ৬. গোল সংখ্যার টান
-  roundPull: num(process.env.ENG_ROUND,     0.30),
-
-  // ৭. অধিবেশন
-  session:   num(process.env.ENG_SESSION,   0.50),
-
-  // ঝোঁক — খুব মৃদু, নইলে অনুমানযোগ্য
-  bias:      num(process.env.ENG_BIAS,      0.010),
-  biasMem:   num(process.env.ENG_BIAS_MEM,  0.9995),
-
-  // tick এর ছন্দ
-  gapMs:     num(process.env.ENG_GAP_MS,    170),
-  gapVar:    num(process.env.ENG_GAP_VAR,   0.80),
-
-  // নিরাপত্তা
-  maxStep:   num(process.env.ENG_MAX_STEP,  0.0015),  // ±০.১৫%/tick
+  unit:    num(process.env.ENG_UNIT,     0.00004),  // base একক (দামের অনুপাতে)
+  volMem:  num(process.env.ENG_VOL_MEM,  0.994),    // অস্থিরতার স্মৃতি
+  volAmp:  num(process.env.ENG_VOL_AMP,  0.28),     // ওঠানামার মাত্রা
+  runLen:  num(process.env.ENG_RUN_LEN,  6),        // ঝলকের গড় tick
+  restLen: num(process.env.ENG_REST_LEN, 5),        // শ্বাসের গড় tick
+  clust:   num(process.env.ENG_CLUST,    0.45),     // ঝলক গুচ্ছ হওয়া
+  retr:    num(process.env.ENG_RETR,     0.40),     // ফিরতি টান
+  jump:    num(process.env.ENG_JUMP,     1.8),      // হঠাৎ বড় লাফ %
+  spread:  num(process.env.ENG_SPREAD,   1.0),      // bid-ask কাঁপুনি
+  gapMs:   num(process.env.ENG_GAP_MS,   320),      // গড় tick ব্যবধান
+  spdVar:  num(process.env.ENG_SPD_VAR,  0.72),     // গতির তারতম্য
+  bias:    num(process.env.ENG_BIAS,     0.02),     // trend পক্ষপাত
+  session: num(process.env.ENG_SESSION,  0.55),     // দিনের ছন্দ
+  maxStep: num(process.env.ENG_MAX_STEP, 0.0015),   // safety ±০.১৫%/tick
 
   // admin (otc-server প্রতি tick এ পাঠায়)
   forceDir: 0,
@@ -105,17 +63,19 @@ function _fitDecimals(price, given) {
 
 /** নতুন market এর অবস্থা */
 function createState(price, decimals = 5) {
-  decimals = _fitDecimals(price, decimals);
   return {
     price,
-    decimals,
-    flow: 0,          // চলতি অর্ডার-চাপ
-    vol: 1,           // চলতি অস্থিরতা
-    liq: 1,           // তারল্যের গভীরতা (কম = পাতলা = বড় লাফ)
-    drift: 0,         // দীর্ঘমেয়াদি মৃদু ঝোঁক
-    stopLeft: 0,      // স্টপ ঝাঁক আর কত tick
-    stopDir: 1,
-    anchor: price,    // মজুত হিসাবের চলমান ভিত্তি
+    decimals: _fitDecimals(price, decimals),
+    vol: 1,                                   // চলতি অস্থিরতা
+    phase: 'rest',
+    left: 3,
+    dir: 1,
+    excite: 0,                                // ঝলকের পর উত্তেজনা
+    runStart: price,
+    retrTarget: 0,
+    retrLeft0: 1,
+    regimeDir: Math.random() < 0.5 ? 1 : -1,
+    regimeLeft: 200 + ((Math.random() * 500) | 0),
   };
 }
 
@@ -124,18 +84,9 @@ function sessionMul(t, amt) {
   const d = new Date(t);
   const h = d.getUTCHours() + d.getUTCMinutes() / 60;
   const curve = 0.55
-    + 0.80 * Math.exp(-Math.pow((h - 13.5) / 5.0, 2))   // লন্ডন + নিউইয়র্ক
-    + 0.30 * Math.exp(-Math.pow((h - 8.0) / 2.0, 2))    // লন্ডন খোলা
-    + 0.15 * Math.exp(-Math.pow((h - 1.0) / 2.5, 2));   // টোকিও
+    + 0.75 * Math.exp(-Math.pow((h - 13) / 5.5, 2))
+    + 0.35 * Math.exp(-Math.pow((h - 8.5) / 2.2, 2));
   return 1 + (curve - 1) * amt;
-}
-
-/* গাউসীয় এলোমেলো — আসল বাজারের চাপ এভাবেই বণ্টিত */
-function _gauss() {
-  let u = 0, v = 0;
-  while (u === 0) u = Math.random();
-  while (v === 0) v = Math.random();
-  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 }
 
 /**
@@ -146,83 +97,113 @@ function _gauss() {
  */
 function nextPrice(st, now = Date.now(), over) {
   const c = over ? { ...CFG, ...over } : CFG;
-  const unit = st.price * c.unit;
-  const sm = sessionMul(now, c.session);
+  const base = st.price * c.unit;
 
-  /* ── ২. অস্থিরতার গুচ্ছ ── */
-  const shock = Math.abs(_gauss());
-  st.vol = st.vol * c.volMem + (1 - c.volMem) * (0.55 + shock * c.volAmp * 1.6);
-  st.vol = Math.max(c.volMin, Math.min(c.volMax, st.vol));
+  /* ── ১. অস্থিরতার স্মৃতি ── */
+  const shock = (Math.random() - 0.5) * c.volAmp;
+  st.vol = st.vol * c.volMem + (1 - c.volMem) * (1 + shock * 3);
+  st.vol = Math.max(0.25, Math.min(4.5, st.vol));
 
-  /* ── ৪. তারল্য — পাতলা হলে একই চাপে বড় লাফ ── */
-  st.liq = st.liq * c.liqMem + (1 - c.liqMem) * (0.55 + Math.random() * 0.9);
-  st.liq = Math.max(0.25, Math.min(1.8, st.liq));
-  const thin = 1 / Math.max(0.25, st.liq * (1 - c.liqDepth) + c.liqDepth);
+  /* ── ২. উত্তেজনা ধীরে শান্ত হয় ── */
+  st.excite *= 0.93;
 
-  /* ── ঝোঁক — খুব ধীরে বদলায়, খুব মৃদু ── */
-  if (Math.random() > c.biasMem) st.drift = Math.random() < 0.5 ? -1 : 1;
-  const adminDir = c.forceDir || 0;
-  const biasNow = adminDir
-    ? adminDir * (0.35 + c.trendStrength * 0.75)   // admin manual mode
-    : st.drift * c.bias;
-
-  /* ── ১. অর্ডার-প্রবাহ ── */
-  st.flow = st.flow * c.flowMem + _gauss() * c.flowAmp * (1 - c.flowMem) * 3;
-
-  /* ── ৩. মজুতের টান ── */
-  st.anchor = st.anchor * c.invMem + st.price * (1 - c.invMem);
-  const inv = (st.price - st.anchor) / Math.max(unit, 1e-12);
-  const pull = -inv * c.invPull * (adminDir ? 0.25 : 1);
-
-  /* ── ৫. স্টপ ঝাঁক ── */
-  if (st.stopLeft <= 0 && Math.random() < c.stopOdds * st.vol) {
-    st.stopLeft = 2 + ((Math.random() * 4) | 0);
-    st.stopDir = st.flow >= 0 ? 1 : -1;         // যেদিকে চাপ, সেদিকেই ভাঙে
-  }
-  let stop = 0;
-  if (st.stopLeft > 0) {
-    st.stopLeft--;
-    stop = st.stopDir * c.stopSize * (0.5 + Math.random());
-  }
-
-  /* ── সব মিলিয়ে এক ধাপ ── */
-  let delta = (st.flow + pull + biasNow * 6 + stop) * unit * st.vol * thin * sm;
-
-  /* ── ৬. গোল সংখ্যার টান ── */
-  if (c.roundPull > 0) {
-    const gridPx = Math.pow(10, -(st.decimals - 2));
-    if (gridPx > 0) {
-      const nearest = Math.round(st.price / gridPx) * gridPx;
-      const dist = (st.price - nearest) / gridPx;      // −0.5 … +0.5
-      if (Math.abs(dist) < 0.30) delta -= dist * gridPx * c.roundPull * 0.5;
+  /* ── ৩. পর্ব বদল ── */
+  if (--st.left <= 0) {
+    if (st.phase === 'run') {
+      st.excite = Math.min(1, st.excite + 0.55);
+      // ফিরতি টান — ঝলকে যতটা গেছে তার একাংশ ফেরত
+      const moved = st.price - st.runStart;
+      st.retrTarget = -moved * (c.retr * (0.55 + Math.random() * 0.85));
+      st.retrLeft0 = 2 + ((Math.random() * 4) | 0);
+      if (Math.abs(st.retrTarget) > 1e-12 && c.retr > 0) {
+        st.phase = 'retrace';
+        st.left = st.retrLeft0;
+      } else {
+        const rest = Math.max(0, c.restLen * (1 - st.excite * c.clust));
+        st.phase = 'rest';
+        st.left = 1 + ((Math.random() * (rest + 1)) | 0);
+      }
+    } else if (st.phase === 'retrace') {
+      const rest = Math.max(0, c.restLen * (1 - st.excite * c.clust));
+      st.phase = 'rest';
+      st.left = 1 + ((Math.random() * (rest + 1)) | 0);
+    } else if (st.phase === 'rest') {
+      st.phase = 'step';
+      st.left = 1 + ((Math.random() * 4) | 0);
+    } else {
+      st.phase = 'run';
+      // দৈর্ঘ্য heavy-tail — বেশিরভাগ ছোট, কদাচিৎ অনেক লম্বা
+      const u = Math.random();
+      st.left = Math.max(2, Math.round(c.runLen * Math.pow(u, -0.45) * 0.6));
+      // admin manual mode হলে তার দিক, নইলে regime এর মৃদু পক্ষপাত
+      const b = c.forceDir
+        ? c.forceDir * (0.10 + c.trendStrength * 0.22)
+        : st.regimeDir * c.bias;
+      st.dir = Math.random() < 0.5 + b ? 1 : -1;
+      st.runStart = st.price;
     }
   }
 
-  /* ── নিরাপত্তা: প্রতি tick এ সর্বোচ্চ ±০.১৫% ── */
+  const sm = sessionMul(now, c.session);
+  let delta;
+
+  if (st.phase === 'retrace') {
+    delta = (st.retrTarget / st.retrLeft0) * (0.6 + Math.random() * 0.8);
+  } else if (st.phase === 'rest') {
+    delta = 0;                                       // একদম স্থির
+  } else if (st.phase === 'step') {
+    /* ── ৪. bid-ask কাঁপুনি ── */
+    delta = (Math.random() - 0.5) * base * c.spread * st.vol * sm;
+  } else {
+    delta = st.dir * base * (1.0 + Math.random() * 1.6) * st.vol * sm;
+  }
+
+  /* ── ৫. ভারী লেজ ── */
+  if (Math.random() * 100 < c.jump) {
+    const mag = base * (4 + Math.pow(Math.random(), -0.5) * 3) * st.vol;
+    delta += (Math.random() < 0.5 ? 1 : -1) * mag;
+    st.excite = Math.min(1, st.excite + 0.7);
+    st.vol = Math.min(4.5, st.vol * 1.25);
+  }
+
+  /* ── ৭. regime — কয়েক মিনিট পরপর ঝোঁক বদলায় ── */
+  if (--st.regimeLeft <= 0) {
+    st.regimeDir = Math.random() < 0.5 ? 1 : -1;
+    st.regimeLeft = 200 + ((Math.random() * 500) | 0);
+  }
+
+  /* ── safety clamp ── */
   const cap = st.price * c.maxStep;
   delta = Math.max(-cap, Math.min(cap, delta));
 
   st.price = Math.max(st.price + delta, 1e-8);
 
-  /* ── ৮. pip ধাপ ── */
-  const qz = Math.pow(10, st.decimals);
-  st.price = Math.round(st.price * qz) / qz;
+  /* ── ৬. pip ধাপ ── */
+  const q = Math.pow(10, st.decimals);
+  st.price = Math.round(st.price * q) / q;
 
   return st.price;
 }
 
 /**
- * পরের tick কত ms পরে।
- * আসল বাজারে tick গুচ্ছ হয়ে আসে — অস্থির সময়ে ঘন, শান্ত সময়ে বিরল।
- * ব্যবধান lognormal ধাঁচে: বেশিরভাগ ছোট, কদাচিৎ অনেক বড়।
+ * পরের tick কত ms পরে — পরীক্ষার পাতার হুবহু একই ছন্দ।
+ * ঝলকে দ্রুত, শ্বাসে ধীর, উত্তেজনায় আরও দ্রুত; মাঝে মাঝে ঝাঁক বা
+ * হঠাৎ থমকে যাওয়া।
  */
 function nextDelay(st, over) {
   const c = over ? { ...CFG, ...over } : CFG;
-  const activity = Math.pow(st.vol, 0.8) *
-                   Math.pow(1 / Math.max(0.3, st.liq), 0.3);
-  const base = c.gapMs / Math.max(0.35, activity);
-  const jitter = Math.exp(_gauss() * c.gapVar * 0.55);
-  return Math.max(35, Math.min(2500, base * jitter));
+  let g = c.gapMs;
+
+  g *= st.phase === 'run' ? 0.5 : st.phase === 'rest' ? 1.4 : 1;
+  g *= 1 - 0.6 * st.excite * c.spdVar;          // উত্তেজনায় দ্রুত
+
+  const roll = Math.random();
+  if (roll < 0.12 * c.spdVar) g *= 0.22;        // ঝাঁক — খুব দ্রুত
+  else if (roll < 0.20 * c.spdVar) g *= 0.45;
+  else if (roll > 1 - 0.07 * c.spdVar) g *= 2.4; // হঠাৎ থমকে যাওয়া
+
+  g *= 0.6 + Math.random() * 0.8;
+  return Math.max(35, g);
 }
 
 module.exports = { createState, nextPrice, nextDelay, sessionMul, CFG };
