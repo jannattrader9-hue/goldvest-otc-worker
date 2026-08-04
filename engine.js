@@ -44,7 +44,7 @@ const CFG = {
   spread:  num(process.env.ENG_SPREAD,   1.0),      // bid-ask কাঁপুনি
   gapMs:   num(process.env.ENG_GAP_MS,   170),      // গড় tick ব্যবধান
   spdVar:  num(process.env.ENG_SPD_VAR,  0.72),     // গতির তারতম্য
-  bias:    num(process.env.ENG_BIAS,     0.018),     // trend পক্ষপাত
+  bias:    num(process.env.ENG_BIAS,     0.008),     // trend পক্ষপাত
   session: num(process.env.ENG_SESSION,  0.55),     // দিনের ছন্দ
   maxStep: num(process.env.ENG_MAX_STEP, 0.0015),   // safety ±০.১৫%/tick
 
@@ -53,19 +53,37 @@ const CFG = {
   trendStrength: 0.6,
 };
 
-/* দামের সাথে মানানসই দশমিক ঘর — ছোট দামের market এ এক ধাপ যেন পায়ের
-   চেয়ে বড় হয়ে না যায় (নইলে দাম প্রায় নড়ত না)। */
+/* ⚠ দশমিক ঘর কখনো market এর নিজের ঘরের চেয়ে বেশি করা যাবে না।
+   আগে ছোট দামের market এ ঘর বাড়ানো হত (দাম যাতে নড়ে), কিন্তু তাতে
+   পর্দায় দেখানো দাম আর settlement এর দাম আলাদা হয়ে যেত — user দেখত
+   "একই দাম" অথচ ভেতরে আলাদা, তাই refund এর বদলে loss হত; আবার কখনো
+   দেখানো দিকের উল্টো ফল আসত।
+
+   এখন ঘর হুবহু market এর মতোই। ছোট দামের market এ দাম যাতে তবু নড়ে,
+   তার সমাধান পায়ের মাপে (নিচে scaleForTick) — ঘর বাড়িয়ে নয়। */
 function _fitDecimals(price, given) {
-  if (!isFinite(price) || price <= 0) return given;
-  const need = Math.ceil(Math.log10(1 / (price * 0.00002)));
-  return Math.min(8, Math.max(given, need));
+  return given;
+}
+
+/* এক pip ধাপ পায়ের চেয়ে বড় হলে দাম নড়ত না। তাই ওই market এ পায়ের
+   মাপ বাড়িয়ে দিই — অন্তত ২-৩ ধাপ যেন হয়। দেখানো দাম অপরিবর্তিত থাকে। */
+function _tickScale(price, decimals) {
+  const step = Math.pow(10, -decimals);        // এক ধাপ (pip)
+  const want = price * 0.000012;               // পায়ের স্বাভাবিক মাপ
+  if (want >= step * 0.9) return 1;            // ধাপ যথেষ্ট সূক্ষ্ম
+  /* ধাপ মোটা (যেমন USD/INR এ ২ ঘর) — পা একটু বড় করি যাতে দাম নড়ে,
+     কিন্তু ৩ গুণের বেশি নয়, নইলে candle অস্বাভাবিক বড় হত। এই market
+     গুলোতে দাম কম বার বদলাবে — সেটাই স্বাভাবিক, কারণ আসল বাজারেও
+     মোটা ধাপের instrument কম নড়ে। */
+  return Math.min(3, (step * 0.9) / Math.max(want, 1e-12));
 }
 
 /** নতুন market এর অবস্থা */
 function createState(price, decimals = 5) {
   return {
     price,
-    decimals: _fitDecimals(price, decimals),
+    decimals,
+    tickScale: _tickScale(price, decimals),
     vol: 1,                                   // চলতি অস্থিরতা
     phase: 'rest',
     left: 3,
@@ -99,7 +117,7 @@ function sessionMul(t, amt) {
  */
 function nextPrice(st, now = Date.now(), over) {
   const c = over ? { ...CFG, ...over } : CFG;
-  const base = st.price * c.unit;
+  const base = st.price * c.unit * (st.tickScale || 1);
 
   /* ── ১. অস্থিরতার স্মৃতি ── */
   const shock = (Math.random() - 0.5) * c.volAmp;
