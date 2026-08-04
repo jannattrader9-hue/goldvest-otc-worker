@@ -45,7 +45,7 @@ const CFG = {
   spread:  num(process.env.ENG_SPREAD,   0),      // bid-ask কাঁপুনি — ০ = দোলাদুলি নেই
   bias:    num(process.env.ENG_BIAS,     0.012),  // trend পক্ষপাত (কমানো — লম্বা সময়সীমায় মার্জিন বাড়াতে)
   session: num(process.env.ENG_SESSION,  0.55),   // দিনের ছন্দ
-  gapMs:   num(process.env.ENG_GAP_MS,   200),    // গড় tick ব্যবধান (vol দিয়ে ভাগ হয়)
+  gapMs:   num(process.env.ENG_GAP_MS,   420),    // গড় tick ব্যবধান (vol দিয়ে ভাগ হয়)
   spdVar:  num(process.env.ENG_SPD_VAR,  0.72),   // গতির তারতম্য
   // গতির মেজাজ — প্রতি ২-৩ সেকেন্ডে গতি বদলায়
   moodMin: num(process.env.ENG_MOOD_MIN, 2000),  // মেজাজ কত কম সময় থাকে
@@ -76,6 +76,7 @@ function createState(price, decimals = 5) {
     retrTarget: 0,
     retrLeft0: 1,
     retrFast: false,
+    runSpd: 1,             // চলতি ঝলকের নিজস্ব গতি — প্রতি ঝলকে নতুন
     mood: 1,               // চলতি গতির মেজাজ (১ = স্বাভাবিক)
     moodUntil: 0,          // এই সময় পর্যন্ত এই মেজাজ
     frozenUntil: 0,        // এই সময় পর্যন্ত জমাট
@@ -104,6 +105,17 @@ function sessionMul(t, amt) {
  * @param {number} now  বর্তমান সময় (ms)
  * @param {object} [over]  ঐচ্ছিক — নির্দিষ্ট market এর জন্য CFG override
  */
+/* প্রতিটা ঝলকের নিজস্ব গতি — একটা ঝলক ঝড়ের মত, পরেরটা আলস্যভরে।
+   তিন ভাগে: ধীর (৩০%), স্বাভাবিক (৪৫%), ঝড় (২৫%)।
+   শুধু tick এর ব্যবধান বদলায় — পায়ের আকার নয়, তাই candle এর মাপ
+   ও জয়ের হার অপরিবর্তিত থাকে। */
+function _runSpeed() {
+  const r = Math.random();
+  if (r < 0.30) return 0.35 + Math.random() * 0.30;   // ধীর — থেমে থেমে
+  if (r < 0.75) return 0.85 + Math.random() * 0.55;   // স্বাভাবিক
+  return 2.2 + Math.random() * 1.8;                   // ঝড় — ১০০ গতি
+}
+
 function nextPrice(st, now = Date.now(), over) {
   const c = over ? { ...CFG, ...over } : CFG;
   const base = st.price * c.unit;
@@ -217,6 +229,7 @@ function nextPrice(st, now = Date.now(), over) {
         const b2 = (c.forceDir ? c.forceDir * (0.15 + c.trendStrength * 0.35)
                                : st.regimeDir * c.bias);
         st.dir = Math.random() < 0.5 + b2 ? 1 : -1;   // দিক নতুন করে
+        st.runSpd = _runSpeed();                      // এই ঝলকের নিজস্ব গতি
         st.runStart = st.price;
       } else {
         const rest = Math.max(0, c.restLen * (1 - st.excite * c.clust) / Math.max(0.4, st.vol));
@@ -245,6 +258,7 @@ function nextPrice(st, now = Date.now(), over) {
       const b = (c.forceDir ? c.forceDir * (0.15 + c.trendStrength * 0.35)
                             : st.regimeDir * c.bias);
       st.dir = Math.random() < 0.5 + b ? 1 : -1;
+      st.runSpd = _runSpeed();                        // এই ঝলকের নিজস্ব গতি
       st.runStart = st.price;
     }
   }
@@ -310,28 +324,31 @@ function nextDelay(st, over) {
   // [MOOD] গতির মেজাজ — মেজাজ যত বড়, tick তত দ্রুত।
   // মেজাজের গড় প্রভাব ১ এ রাখতে normalize করা হয়, নইলে গড় ব্যবধান
   // বেড়ে গিয়ে tick হার অর্ধেকে নেমে যেত।
-  const MOOD_NORM = 1.25;   // মেজাজের গড় (2^±0.85 এর হারমোনিক গড়)
-  g /= Math.max(0.3, Math.min(3.5, (st.mood || 1))) / MOOD_NORM;
+  // মেজাজ এখন মৃদু — প্রতিটা ঝলকের নিজস্ব গতিই প্রধান নিয়ন্ত্রক
+  const MOOD_NORM = 1.08;
+  g /= Math.max(0.6, Math.min(1.7, (st.mood || 1))) / MOOD_NORM;
 
   /* [VOL↔SPEED] আসল বাজারে অস্থিরতা বাড়লে শুধু পা বড় হয় না — tick ও
      ঘন আসে। আগে দুটো আলাদা ছিল, তাই বড় candle ও ধীর গতিতে তৈরি হত এবং
      সব সময় একই গতি মনে হত। এখন vol বেশি হলে ব্যবধান কমে যায়:
      vol ২.৫ → প্রায় অর্ধেক ব্যবধান, vol ০.৪ → দ্বিগুণ। */
-  g /= Math.pow(Math.max(0.3, st.vol), c.volSpd);
+  g /= Math.pow(Math.max(0.3, st.vol), c.volSpd * 0.5);
 
-  g *= st.phase === 'run' ? 0.5
+  // ঝলকের নিজস্ব গতি — এই ঝলকটা ধীরে না ঝড়ের মত যাবে
+  const rs = Math.max(0.3, Math.min(4, st.runSpd || 1));
+  g *= st.phase === 'run' ? 0.5 / rs
      : st.phase === 'rest' ? 1.4
-     : st.phase === 'retrace' ? (st.retrFast ? 0.55 : 1.15)   // দ্রুত/ধীর ফেরত
+     : st.phase === 'retrace' ? (st.retrFast ? 0.55 : 1.15) / Math.sqrt(rs)  // ফেরতেও কিছুটা
      : 1;
   g *= 1 - 0.6 * st.excite * c.spdVar;          // উত্তেজনায় দ্রুত
 
+  // এলোমেলো ঝাঁক মৃদু — নইলে ঝলকের নিজস্ব গতি ঢাকা পড়ে যেত
   const roll = Math.random();
-  if (roll < 0.12 * c.spdVar) g *= 0.22;        // ঝাঁক — খুব দ্রুত
-  else if (roll < 0.20 * c.spdVar) g *= 0.45;
-  else if (roll > 1 - 0.07 * c.spdVar) g *= 2.4; // হঠাৎ থমকে যাওয়া
+  if (roll < 0.08) g *= 0.55;
+  else if (roll > 0.94) g *= 1.6;
 
-  g *= 0.6 + Math.random() * 0.8;
-  return Math.max(35, g);
+  g *= 0.82 + Math.random() * 0.36;
+  return Math.max(28, g);
 }
 
 module.exports = { createState, nextPrice, nextDelay, sessionMul, CFG };
