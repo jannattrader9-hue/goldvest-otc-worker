@@ -842,8 +842,10 @@ function tickOTC(id) {
   //   speedMultiplier— সব নড়াচড়ার গুণক
   // ══════════════════════════════════════════════════════════════════
   if (!state._eng) {
+    // দামের নিজস্ব দশমিক ঘর — engine প্রয়োজনে বাড়িয়ে নেয় (ছোট দামের
+    // market এ এক pip ধাপ যেন পায়ের চেয়ে বড় হয়ে না যায়)
     const dec = (String(state.price).split('.')[1] || '').length || 5;
-    state._eng = engine.createState(state.price, Math.min(6, Math.max(2, dec)));
+    state._eng = engine.createState(state.price, Math.max(1, dec));
     console.log(`[engine] ${id} — চালু (decimals: ${state._eng.decimals})`);
   }
   state._eng.price = state.price;          // বাইরে থেকে দাম বদলালে মেনে নেয়
