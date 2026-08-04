@@ -45,7 +45,7 @@ const CFG = {
   spread:  num(process.env.ENG_SPREAD,   0),      // bid-ask কাঁপুনি — ০ = দোলাদুলি নেই
   bias:    num(process.env.ENG_BIAS,     0.012),  // trend পক্ষপাত (কমানো — লম্বা সময়সীমায় মার্জিন বাড়াতে)
   session: num(process.env.ENG_SESSION,  0.55),   // দিনের ছন্দ
-  gapMs:   num(process.env.ENG_GAP_MS,   420),    // গড় tick ব্যবধান (vol দিয়ে ভাগ হয়)
+  gapMs:   num(process.env.ENG_GAP_MS,   90),    // গড় tick ব্যবধান — ঘন (Quotex ~৮০ms)
   spdVar:  num(process.env.ENG_SPD_VAR,  0.72),   // গতির তারতম্য
   // গতির মেজাজ — প্রতি ২-৩ সেকেন্ডে গতি বদলায়
   moodMin: num(process.env.ENG_MOOD_MIN, 2000),  // মেজাজ কত কম সময় থাকে
@@ -331,7 +331,8 @@ function nextDelay(st, over) {
   // জমাট অবস্থায় tick ধীরে — নইলে একই দাম বারবার পাঠিয়ে bandwidth নষ্ট হত
   // জমাটে tick ধীরে — তবে খুব ধীর নয়, নইলে গোটা মিনিটের tick হার
   // নেমে যেত (জমাট সময়ের ~২০% হলেও tick এর বড় অংশ খেয়ে ফেলত)।
-  if (Date.now() < st.frozenUntil) return 260 + Math.random() * 260;
+  // জমাটে দাম স্থির, তাই tick বিরল — bandwidth অকারণে খরচ হয় না
+  if (Date.now() < st.frozenUntil) return 320 + Math.random() * 300;
 
   let g = c.gapMs;
 
@@ -362,7 +363,7 @@ function nextDelay(st, over) {
   else if (roll > 0.94) g *= 1.6;
 
   g *= 0.82 + Math.random() * 0.36;
-  return Math.max(28, g);
+  return Math.max(22, g);
 }
 
 module.exports = { createState, nextPrice, nextDelay, sessionMul, CFG };
