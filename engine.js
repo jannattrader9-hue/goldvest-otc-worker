@@ -33,7 +33,7 @@ const num = (v, d) => (v === undefined || v === '' || isNaN(+v) ? d : +v);
 
 /* পরীক্ষার পাতার স্লাইডারের মান — হুবহু একই */
 const CFG = {
-  unit:    num(process.env.ENG_UNIT,     0.0000065),  // base একক (দামের অনুপাতে)
+  unit:    num(process.env.ENG_UNIT,     0.0000075),  // base একক (দামের অনুপাতে)
   volMem:  num(process.env.ENG_VOL_MEM,  0.994),    // অস্থিরতার স্মৃতি
   volAmp:  num(process.env.ENG_VOL_AMP,  0.28),     // ওঠানামার মাত্রা
   runLen:  num(process.env.ENG_RUN_LEN,  6),        // ঝলকের গড় tick
@@ -44,7 +44,7 @@ const CFG = {
   spread:  num(process.env.ENG_SPREAD,   1.0),      // bid-ask কাঁপুনি
   gapMs:   num(process.env.ENG_GAP_MS,   170),      // গড় tick ব্যবধান
   spdVar:  num(process.env.ENG_SPD_VAR,  0.72),     // গতির তারতম্য
-  bias:    num(process.env.ENG_BIAS,     0.028),     // trend পক্ষপাত
+  bias:    num(process.env.ENG_BIAS,     0.018),     // trend পক্ষপাত
   session: num(process.env.ENG_SESSION,  0.55),     // দিনের ছন্দ
   maxStep: num(process.env.ENG_MAX_STEP, 0.0015),   // safety ±০.১৫%/tick
 
@@ -74,6 +74,8 @@ function createState(price, decimals = 5) {
     runStart: price,
     retrTarget: 0,
     retrLeft0: 1,
+    retrFast: false,
+    retrDone: 0,
     regimeDir: Math.random() < 0.5 ? 1 : -1,
     regimeLeft: 200 + ((Math.random() * 500) | 0),
   };
@@ -114,9 +116,13 @@ function nextPrice(st, now = Date.now(), over) {
       // ফিরতি টান — ঝলকে যতটা গেছে তার একাংশ ফেরত
       const moved = st.price - st.runStart;
       st.retrTarget = -moved * (c.retr * (0.55 + Math.random() * 0.85));
-      // [NO WAVE] ফেরত ১-২ লাফে শেষ — আগে ২-৫ tick এ ভাগ হত, তাই
-      // ধীরে গড়িয়ে ফিরত (ঢেউ)। এখন এক ঝটকায়।
-      st.retrLeft0 = 1 + ((Math.random() * 2) | 0);
+      // [BACK LIKE RUN] ফেরতও ঝলকের মতোই — কখনো ১ লাফে ঝট করে, কখনো
+      // ৩-৪ লাফে ধাপে ধাপে। দৈর্ঘ্য ও গতি প্রতিবার নতুন করে ঠিক হয়,
+      // তাই ফেরত আর একঘেয়ে টান নয়।
+      st.retrFast = Math.random() < 0.5;
+      st.retrLeft0 = st.retrFast ? (1 + ((Math.random() * 2) | 0))   // ঝট করে
+                                 : (2 + ((Math.random() * 3) | 0));  // ধাপে ধাপে
+      st.retrDone = 0;
       if (Math.abs(st.retrTarget) > 1e-12 && c.retr > 0) {
         st.phase = 'retrace';
         st.left = st.retrLeft0;
@@ -156,7 +162,19 @@ function nextPrice(st, now = Date.now(), over) {
   let delta;
 
   if (st.phase === 'retrace') {
-    delta = (st.retrTarget / st.retrLeft0) * (0.6 + Math.random() * 0.8);
+    // প্রতিটা পা আলাদা মাপের (ঝলকের মতোই ভারী-লেজ), কিন্তু মোট ফেরত
+    // লক্ষ্য ছাড়ায় না — শেষ পায়ে বাকিটুকু মিটিয়ে দেয়।
+    const remain = st.retrTarget - (st.retrDone || 0);
+    if (st.left <= 1) {
+      delta = remain;                                    // শেষ পা — বাকিটুকু
+    } else {
+      const share = remain / st.left;
+      const mag = 0.45 + Math.pow(Math.random(), -0.42) * 0.75;
+      delta = share * Math.min(3.2, mag);
+      // লক্ষ্য পেরিয়ে গেলে থামি
+      if (Math.abs((st.retrDone || 0) + delta) > Math.abs(st.retrTarget)) delta = remain;
+    }
+    st.retrDone = (st.retrDone || 0) + delta;
   } else if (st.phase === 'rest') {
     delta = 0;                                       // একদম স্থির
   } else if (st.phase === 'step') {
@@ -205,7 +223,10 @@ function nextDelay(st, over) {
   const c = over ? { ...CFG, ...over } : CFG;
   let g = c.gapMs;
 
-  g *= st.phase === 'run' ? 0.5 : st.phase === 'rest' ? 1.4 : 1;
+  g *= st.phase === 'run' ? 0.5
+     : st.phase === 'rest' ? 1.4
+     : st.phase === 'retrace' ? (st.retrFast ? 0.45 : 1.05)   // দ্রুত/ধীর ফেরত
+     : 1;
   g *= 1 - 0.6 * st.excite * c.spdVar;          // উত্তেজনায় দ্রুত
 
   const roll = Math.random();
