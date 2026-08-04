@@ -45,8 +45,12 @@ const CFG = {
   spread:  num(process.env.ENG_SPREAD,   0),      // bid-ask কাঁপুনি — ০ = দোলাদুলি নেই
   bias:    num(process.env.ENG_BIAS,     0.012),  // trend পক্ষপাত (কমানো — লম্বা সময়সীমায় মার্জিন বাড়াতে)
   session: num(process.env.ENG_SESSION,  0.55),   // দিনের ছন্দ
-  gapMs:   num(process.env.ENG_GAP_MS,   700),    // গড় tick ব্যবধান (vol দিয়ে ভাগ হয়)
+  gapMs:   num(process.env.ENG_GAP_MS,   200),    // গড় tick ব্যবধান (vol দিয়ে ভাগ হয়)
   spdVar:  num(process.env.ENG_SPD_VAR,  0.72),   // গতির তারতম্য
+  // গতির মেজাজ — প্রতি ২-৩ সেকেন্ডে গতি বদলায়
+  moodMin: num(process.env.ENG_MOOD_MIN, 2000),  // মেজাজ কত কম সময় থাকে
+  moodMax: num(process.env.ENG_MOOD_MAX, 3500),  // কত বেশি
+  moodAmp: num(process.env.ENG_MOOD_AMP, 0.85),  // কতটা দ্রুত/ধীর হয়
   unit:    num(process.env.ENG_UNIT,     0.00004),// pip-ঘেঁষা একক (দামের অনুপাতে)
   maxStep: num(process.env.ENG_MAX_STEP, 0.0015), // safety clamp ±০.১৫%/tick
   // admin নিয়ন্ত্রণ (otc-server থেকে প্রতি tick এ পাঠানো হয়)
@@ -72,6 +76,8 @@ function createState(price, decimals = 5) {
     retrTarget: 0,
     retrLeft0: 1,
     retrFast: false,
+    mood: 1,               // চলতি গতির মেজাজ (১ = স্বাভাবিক)
+    moodUntil: 0,          // এই সময় পর্যন্ত এই মেজাজ
     frozenUntil: 0,        // এই সময় পর্যন্ত জমাট
     nextFreezeAt: 0,       // পরের জমাট কখন
     regimeDir: Math.random() < 0.5 ? 1 : -1,
@@ -111,6 +117,20 @@ function nextPrice(st, now = Date.now(), over) {
      trade একই দামে শেষ হলে settler এমনিতেই পুরো টাকা ফেরত দেয়।
      দৈর্ঘ্য ১-৭ সেকেন্ড, hard limit ছাড়ায় না।
      ══════════════════════════════════════════════════════════════════ */
+  /* ══ [MOOD] গতির মেজাজ ═════════════════════════════════════════════
+     প্রতি ২-৩.৫ সেকেন্ডে একটা নতুন গুণক ঠিক হয় — কখনো দ্রুত, কখনো ধীর।
+     এটা পর্বের (ঝলক/ফেরত/শ্বাস) নিজস্ব গতির উপরে বসে, তাই একই ধরনের
+     ঝলকও কখনো ঝড়ের মত, কখনো আলস্যভরে চলে। ১ মিনিটের candle এ ~২০-৩০
+     বার গতি বদলায়।
+
+     শুধু সময় বদলায়, দিক নয় — তাই জয়ের হারে প্রভাব পড়ে না। ══ */
+  if (now >= st.moodUntil) {
+    const r = Math.random();
+    // অসম বণ্টন: বেশিরভাগ মাঝারি, কদাচিৎ খুব দ্রুত বা খুব ধীর
+    st.mood = Math.pow(2, (r * 2 - 1) * c.moodAmp);
+    st.moodUntil = now + c.moodMin + Math.random() * (c.moodMax - c.moodMin);
+  }
+
   if (!st.nextFreezeAt) st.nextFreezeAt = now + 2000 + Math.random() * 8000;
 
   if (now < st.frozenUntil) {
@@ -174,8 +194,10 @@ function nextPrice(st, now = Date.now(), over) {
       // ফেরতের গতি — কখনো ঝট করে (২ tick), কখনো ধীরে গড়িয়ে (৭ tick)।
       // শুরুতেই ঠিক হয়, পুরো ফেরত জুড়ে একই থাকে, তাই চলাচল মসৃণ।
       const fast = Math.random() < 0.45;
-      st.retrLeft0 = fast ? (2 + ((Math.random() * 2) | 0))     // দ্রুত
-                          : (4 + ((Math.random() * 4) | 0));    // ধীরে
+      // ফেরত ছোট (১-২০%) হলে অল্প tick এই শেষ — নইলে সময়ের বড় অংশ
+      // ফেরতেই চলে যেত আর ঝলক কম দেখা যেত।
+      st.retrLeft0 = fast ? (1 + ((Math.random() * 2) | 0))     // দ্রুত: ১-২
+                          : (2 + ((Math.random() * 3) | 0));    // ধীরে: ২-৪
       st.retrFast = fast;
       if (Math.abs(st.retrTarget) > 1e-12 && c.retr > 0) {
         st.phase = 'retrace';
@@ -274,9 +296,17 @@ function nextDelay(st, over) {
   const c = over ? { ...CFG, ...over } : CFG;
 
   // জমাট অবস্থায় tick ধীরে — নইলে একই দাম বারবার পাঠিয়ে bandwidth নষ্ট হত
-  if (Date.now() < st.frozenUntil) return 600 + Math.random() * 700;
+  // জমাটে tick ধীরে — তবে খুব ধীর নয়, নইলে গোটা মিনিটের tick হার
+  // নেমে যেত (জমাট সময়ের ~২০% হলেও tick এর বড় অংশ খেয়ে ফেলত)।
+  if (Date.now() < st.frozenUntil) return 260 + Math.random() * 260;
 
   let g = c.gapMs;
+
+  // [MOOD] গতির মেজাজ — মেজাজ যত বড়, tick তত দ্রুত।
+  // মেজাজের গড় প্রভাব ১ এ রাখতে normalize করা হয়, নইলে গড় ব্যবধান
+  // বেড়ে গিয়ে tick হার অর্ধেকে নেমে যেত।
+  const MOOD_NORM = 1.25;   // মেজাজের গড় (2^±0.85 এর হারমোনিক গড়)
+  g /= Math.max(0.3, Math.min(3.5, (st.mood || 1))) / MOOD_NORM;
 
   /* [VOL↔SPEED] আসল বাজারে অস্থিরতা বাড়লে শুধু পা বড় হয় না — tick ও
      ঘন আসে। আগে দুটো আলাদা ছিল, তাই বড় candle ও ধীর গতিতে তৈরি হত এবং
