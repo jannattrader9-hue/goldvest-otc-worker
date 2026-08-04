@@ -186,16 +186,26 @@ function nextPrice(st, now = Date.now(), over) {
         st.left = 1 + ((Math.random() * (rest + 1)) | 0);
       }
     } else if (st.phase === 'retrace') {
-      // শান্ত সময়ে লম্বা শ্বাস, উত্তাল সময়ে ছোট — vol যত বেশি তত কম বিরতি
-      const rest = Math.max(0, c.restLen * (1 - st.excite * c.clust) / Math.max(0.4, st.vol));
-      st.phase = 'rest';
-      st.left = 1 + ((Math.random() * (rest + 1)) | 0);
+      // ফেরতের পর প্রায়ই সরাসরি আরেকটা ছোট ঝলক (২-৩ tick) — শ্বাস ছাড়াই।
+      // এতে চলাচল বেশি জীবন্ত লাগে, প্রতিবার থেমে যায় না।
+      if (Math.random() < 0.55) {
+        st.phase = 'run';
+        st.left = 2 + ((Math.random() * 2) | 0);
+        const b2 = (c.forceDir ? c.forceDir * (0.15 + c.trendStrength * 0.35)
+                               : st.regimeDir * c.bias);
+        st.dir = Math.random() < 0.5 + b2 ? 1 : -1;   // দিক নতুন করে
+        st.runStart = st.price;
+      } else {
+        const rest = Math.max(0, c.restLen * (1 - st.excite * c.clust) / Math.max(0.4, st.vol));
+        st.phase = 'rest';
+        st.left = 1 + ((Math.random() * (rest + 1)) | 0);
+      }
     } else if (st.phase === 'rest') {
       // [NO WOBBLE] আগে এখানে 'step' পর্ব ছিল — দিকহীন ছোট নড়াচড়া, যা
       // দোলাদুলির মত লাগত। এখন শ্বাসের পর সরাসরি নতুন ঝলক।
       st.phase = 'run';
       const u0 = Math.random();
-      st.left = Math.max(2, Math.round(c.runLen * Math.pow(u0, -0.45) * 0.6));
+      st.left = 2 + ((Math.random() * 5) | 0);   // ঝলক ২-৬ tick এলোমেলো
       // [FIX] এখানেও admin এর দিক মানতে হবে — আগে শুধু regime দেখত, তাই
       // manual mode এর অর্ধেক ঝলক নির্দেশ উপেক্ষা করত।
       const b0 = (c.forceDir ? c.forceDir * (0.15 + c.trendStrength * 0.35)
@@ -206,7 +216,7 @@ function nextPrice(st, now = Date.now(), over) {
       st.phase = 'run';
       // দৈর্ঘ্য heavy-tail — বেশিরভাগ ছোট, কদাচিৎ অনেক লম্বা
       const u = Math.random();
-      st.left = Math.max(2, Math.round(c.runLen * Math.pow(u, -0.45) * 0.6));
+      st.left = 2 + ((Math.random() * 5) | 0);   // ঝলক ২-৬ tick এলোমেলো
       // [ADMIN] manual mode এ admin এর দিক মানা হয় — trendStrength যত বেশি
       // তত জোরালো পক্ষপাত (০.৬ হলে ~৮০% ঝলক ওই দিকে)
       const b = (c.forceDir ? c.forceDir * (0.15 + c.trendStrength * 0.35)
