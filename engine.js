@@ -63,7 +63,21 @@ const CFG = {
  * @param {number} price  শুরুর দাম
  * @param {number} decimals  দামের দশমিক ঘর (pip ধাপের জন্য)
  */
+/* [DECIMALS] দশমিক ঘর দামের সাথে মানানসই কিনা যাচাই।
+   সমস্যা: কিছু market এ দাম ছোট কিন্তু দশমিক কম (যেমন NZD/USD 0.59 এ
+   ৪ ঘর), তখন এক pip ধাপ engine এর গড় পায়ের চেয়ে বড় হয়ে যেত আর দাম
+   প্রায় নড়ত না (৬০s এ ৪ বার)। এখন ন্যূনতম ঘর হিসাব করে নেওয়া হয়,
+   যাতে এক ধাপ দামের ~০.০০১% এর কাছাকাছি থাকে — সব market এ সমান
+   মসৃণ চলাচল। */
+function _fitDecimals(price, given) {
+  if (!isFinite(price) || price <= 0) return given;
+  // এক ধাপ যেন দামের ০.০০২% এর বেশি না হয়
+  const need = Math.ceil(Math.log10(1 / (price * 0.00002)));
+  return Math.min(8, Math.max(given, need));
+}
+
 function createState(price, decimals = 5) {
+  decimals = _fitDecimals(price, decimals);
   return {
     price,
     decimals,
