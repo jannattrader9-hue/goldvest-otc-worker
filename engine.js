@@ -35,7 +35,7 @@ const CFG = {
   volSpd:  num(process.env.ENG_VOL_SPD,  0.75),   // অস্থিরতা কতটা গতি বদলায়
   // জমাট অবস্থা — দাম প্রায় থেমে থাকে, তারপর আবার চলা শুরু
   freezeMin: num(process.env.ENG_FRZ_MIN, 1000),  // ন্যূনতম ১s
-  freezeMax: num(process.env.ENG_FRZ_MAX, 7000),  // সর্বোচ্চ ৭s (hard limit)
+  freezeMax: num(process.env.ENG_FRZ_MAX, 4000),  // সর্বোচ্চ ৪s (hard limit)
   freezeGap: num(process.env.ENG_FRZ_GAP, 0.55),  // কত ঘন ঘন জমাট আসে
   runLen:  num(process.env.ENG_RUN_LEN,  3),      // ঝলকের গড় tick
   restLen: num(process.env.ENG_REST_LEN, 5),      // শ্বাসের গড় tick
