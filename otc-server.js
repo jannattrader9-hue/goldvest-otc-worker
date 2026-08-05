@@ -261,6 +261,7 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
         _activeTradesMemory.delete(key);
         _pendingSettle.add(key);
       });
+      await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
       _candleSettlingSymbols.delete(symbol);
       return;
@@ -274,7 +275,9 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
         const t = tradeNode.val();
         // symbol filter — একই candleTime-এ অনেক symbol-এর trades থাকতে পারে
         if (t.symbol === symbol && t.accountType === 'live') {
-          trades.push({ userId, tradeId: tradeNode.key, closePrice, type: t.type || '', amount: t.amount || 0 });
+          // [TICK HISTORY] candleTime ই এই trade গুলোর expiry — ওই মুহূর্তের
+          // দাম ইতিহাস থেকে নেওয়া হবে (_applyExpiryPrices)
+          trades.push({ userId, tradeId: tradeNode.key, closePrice, expiryTimestamp: candleTime, type: t.type || '', amount: t.amount || 0 });
           // tick-settle duplicate এড়াতে pending mark করো
           const key = `${userId}/${tradeNode.key}`;
           _activeTradesMemory.delete(key);
@@ -290,6 +293,7 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
     const pendingKeys = trades.map(t => `${t.userId}/${t.tradeId}`);
     setTimeout(() => pendingKeys.forEach(k => _pendingSettle.delete(k)), 30000);
 
+    await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
     await _batchSettleAndBroadcast(symbol, trades, closePrice);
 
     // Candle settle শেষ — tick-settle আবার চলতে পারবে
@@ -400,6 +404,26 @@ function _logShadowDueTrades() {
 // symbol এর current state.price দিয়ে সাথে সাথে settle করো (candle-close
 // trigger এর পাশাপাশি/parallel — duplicate-safe, কারণ _doSettle এ
 // status !== 'live' guard আছে)
+/**
+ * [TICK HISTORY] প্রতিটা trade এর closePrice কে তার নিজের expiry এর
+ * সঠিক মুহূর্তের দাম দিয়ে বদলে দেয়।
+ *
+ * কেন: settle চলে প্রতি ৫০০ms এ, তাই ৫s এর trade ৫.৩s এ settle হলে
+ * আগে ০.৩ সেকেন্ড পরের দাম ধরা হত। এখন expiry এর ঠিক মুহূর্তের দাম
+ * নেওয়া হয় — settle কখন চলল তাতে কিছু যায় আসে না, ফল সবসময় একই।
+ *
+ * ইতিহাসে না পেলে আগের দামই থাকে (trade কখনো আটকায় না)।
+ */
+async function _applyExpiryPrices(symbol, trades) {
+  if (!HIST_ON) return;
+  await Promise.allSettled(trades.map(async (t) => {
+    const expSec = t.expiryTimestamp;
+    if (!expSec) return;
+    const p = await _histPriceAt(symbol, expSec * 1000);
+    if (p) t.closePrice = p;
+  }));
+}
+
 async function _settleDueTradesFromMemory() {
   const nowSec = Math.floor(Date.now() / 1000);
   const due = [];
@@ -425,12 +449,15 @@ async function _settleDueTradesFromMemory() {
     const state = _states[t.symbol];
     if (!state || typeof state.price !== 'number') continue;
     if (!bySymbol.has(t.symbol)) bySymbol.set(t.symbol, { closePrice: state.price, trades: [] });
-    bySymbol.get(t.symbol).trades.push({ userId: t.userId, tradeId: t.tradeId, closePrice: state.price, type: t.type || '', amount: t.amount || 0 });
+    // [TICK HISTORY] closePrice নিচে expiry এর সঠিক মুহূর্তের দাম দিয়ে
+    // বদলে দেওয়া হয় (_applyExpiryPrices)। এখানে state.price শুধু fallback।
+    bySymbol.get(t.symbol).trades.push({ userId: t.userId, tradeId: t.tradeId, closePrice: state.price, expiryTimestamp: t.expiryTimestamp, type: t.type || '', amount: t.amount || 0 });
   }
 
   // প্রতি symbol-এর trades batchSettle-এ পাঠাও
   await Promise.allSettled([...bySymbol.entries()].map(async ([symbol, { closePrice, trades }]) => {
     console.log(`[tick-settle] ${symbol} due=${trades.length} closePrice=${closePrice.toFixed(5)}`);
+    await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
     await _batchSettleAndBroadcast(symbol, trades, closePrice);
   }));
 
@@ -487,6 +514,7 @@ async function _settleDueTradesFromRTDB() {
 
     await Promise.allSettled([...bySymbol.entries()].map(async ([symbol, { closePrice, trades }]) => {
       console.log(`[rtdb-tick-settle] ${symbol} due=${trades.length} closePrice=${closePrice.toFixed(5)}`);
+      await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
       // settle হয়ে গেলে RTDB queue থেকে delete করো
       await Promise.allSettled(trades.map(t =>
@@ -598,6 +626,63 @@ function saveLiveCandle(id, candle) {
     });
     // fire-and-forget — publish ব্যর্থ হলেও RTDB path অক্ষত, দাম বন্ধ হয় না
     redisPub.publish(`px:${id}`, msg).catch(() => {});
+    // [TICK HISTORY] সময় সহ দাম জমা — entry ও settlement দুটোতেই ব্যবহার
+    _histWrite(id, Date.now(), candle.close);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// [TICK HISTORY] সময় সহ দামের ইতিহাস — Redis Sorted Set এ
+// ----------------------------------------------------------------------
+// কেন দরকার:
+//   • Entry — user ক্লিক করা থেকে request পৌঁছাতে ১০০-৩০০ms লাগে, ওই
+//     সময়ে দাম বদলে যায়। ইতিহাস থাকলে ক্লিকের ঠিক মুহূর্তের দাম বসে।
+//   • Settlement — settle চলে প্রতি ৫০০ms এ, তাই ৫s trade ৫.৩s এ settle
+//     হলে ০.৩s পরের দাম ধরা হত। এখন expiry এর ঠিক মুহূর্তের দাম নেওয়া হয়।
+//
+// Redis এ রাখার কারণ: server restart এ মুছে যায় না, settler ও পড়তে
+// পারে, আর একাধিক worker চললেও সবাই একই ইতিহাস দেখে।
+//
+// গঠন: ZSET  px:hist:{symbol}  →  score = timestamp(ms), member = "ts:price"
+// পুরনো entry নিজে থেকেই ছাঁটা হয় (৫ ঘণ্টার বেশি রাখা হয় না — সবচেয়ে
+// লম্বা trade ৪ ঘণ্টা, তাই নিরাপদ মার্জিন সহ)।
+// ══════════════════════════════════════════════════════════════════════
+const HIST_KEEP_MS = 5 * 3600 * 1000;         // ৫ ঘণ্টা
+const HIST_ON = (process.env.TICK_HISTORY || 'on').toLowerCase() !== 'off';
+const _histTrimAt = {};                        // symbol → শেষ কবে ছাঁটা হয়েছে
+
+function _histWrite(id, ts, price) {
+  if (!HIST_ON || !redisPub) return;
+  const key = `px:hist:${id}`;
+  // একই ms এ দুটো tick এলে member আলাদা রাখতে ts+price একসাথে
+  redisPub.zadd(key, ts, `${ts}:${price}`).catch(() => {});
+
+  // প্রতি ৩০ সেকেন্ডে একবার পুরনো ছাঁটি — প্রতি tick এ নয় (খরচ কম)
+  const last = _histTrimAt[id] || 0;
+  if (ts - last > 30000) {
+    _histTrimAt[id] = ts;
+    redisPub.zremrangebyscore(key, 0, ts - HIST_KEEP_MS).catch(() => {});
+    redisPub.expire(key, Math.ceil(HIST_KEEP_MS / 1000) + 600).catch(() => {});
+  }
+}
+
+/**
+ * নির্দিষ্ট সময়ে দাম কত ছিল — "ওই সময় বা তার ঠিক আগের শেষ tick"।
+ * এটাই আসল broker দের নিয়ম।
+ * @returns {Promise<number|null>} দাম, না পেলে null
+ */
+async function _histPriceAt(id, ts) {
+  if (!HIST_ON || !redisPub) return null;
+  try {
+    // ts এর সমান বা ছোট, সবচেয়ে কাছের একটা
+    const rows = await redisPub.zrevrangebyscore(
+      `px:hist:${id}`, ts, ts - 60000, 'LIMIT', 0, 1
+    );
+    if (!rows || !rows.length) return null;
+    const v = parseFloat(String(rows[0]).split(':')[1]);
+    return isFinite(v) && v > 0 ? v : null;
+  } catch (e) {
+    return null;
   }
 }
 
@@ -1285,7 +1370,24 @@ http.createServer(async (req, res) => {
       const _serverState = _states[trade.symbol];
       const _serverPrice = (_serverState && typeof _serverState.price === 'number')
                            ? _serverState.price : 0;
-      const entryPrice = _serverPrice > 0 ? _serverPrice : _clientEntry;
+      // [TICK HISTORY] client ক্লিকের সঠিক সময় পাঠালে সেই মুহূর্তের দাম
+      // ইতিহাস থেকে নিই — নেটওয়ার্কে ১০০-৩০০ms দেরির কারণে দাম বদলে
+      // যাওয়ার সমস্যা এতে মেটে। সময় যাচাই: server সময়ের ±২ সেকেন্ডের
+      // মধ্যে হতে হবে, নইলে কেউ পুরনো সময় পাঠিয়ে সুবিধা নিতে পারত।
+      let _histEntry = 0;
+      const _clickTs = parseInt(trade.clickTs) || 0;
+      if (_clickTs > 0) {
+        const _drift = Math.abs(Date.now() - _clickTs);
+        if (_drift <= 2000) {
+          const _hp = await _histPriceAt(trade.symbol, _clickTs);
+          if (_hp) _histEntry = _hp;
+        } else {
+          console.warn(`[place-trade] clickTs drift=${_drift}ms — উপেক্ষা (userId=${userId})`);
+        }
+      }
+
+      const entryPrice = _histEntry > 0 ? _histEntry
+                       : (_serverPrice > 0 ? _serverPrice : _clientEntry);
       if (_serverPrice > 0 && _clientEntry > 0) {
         const _diffPct = Math.abs(_serverPrice - _clientEntry) / _serverPrice * 100;
         if (_diffPct > 0.5) {
