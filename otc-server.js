@@ -1080,8 +1080,12 @@ function tickOTC(id) {
   // ══════════════════════════════════════════════════════════════════
   if (!state._eng) {
     // দামের নিজস্ব দশমিক ঘর — engine প্রয়োজনে বাড়িয়ে নেয় (ছোট দামের
-    // market এ এক pip ধাপ যেন পায়ের চেয়ে বড় হয়ে না যায়)
-    const dec = (String(state.price).split('.')[1] || '').length || 5;
+    // market এ এক pip ধাপ যেন পায়ের চেয়ে বড় হয়ে না যায়)।
+    // [MIN DECIMALS] initial seed price এর string length কম হলে (যেমন
+    // "0.707" → dec=3) ছোট নড়াচড়া display এ হারিয়ে যেত (0.7070 এর
+    // বদলে সবসময় 0.707 দেখাত)। Quotex কখনো ৫ এর কম দেখায় না, তাই
+    // ন্যূনতম ৫ বসিয়ে দিলাম — বড় হলে (ছোট দামের market) বাড়তেই পারে।
+    const dec = Math.max(5, (String(state.price).split('.')[1] || '').length || 5);
     state._eng = engine.createState(state.price, Math.max(1, dec));
     console.log(`[engine] ${id} — চালু (decimals: ${state._eng.decimals})`);
     // [REFERENCE ANCHOR] শুধু প্রথমবার engine তৈরি হওয়ার সময় Firestore
