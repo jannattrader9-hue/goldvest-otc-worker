@@ -849,6 +849,24 @@ async function backfillOTC(id, lastTime, lastPrice) {
 // ══════════════════════════════════════════════════════════════════════
 const REFERENCE_JUMP_THRESHOLD = 0.15;   // ১৫% এর বেশি ফারাক হলে সংশোধন
 
+// [DECIMALS TABLE] প্রতিটা market এর দশমিক ঘর — Quotex এর সাথে সরাসরি
+// মিলিয়ে (২৫টা pair এর current price দেখে)। আগে "seed price এর string
+// length" বা "মোট ৬ সংখ্যা" জাতীয় সূত্র দিয়ে অনুমান করা হচ্ছিল, কিন্তু
+// কোনো সূত্রই ১০০% মেলেনি (যেমন USD/ARS ২ ঘর, EUR/JPY ৩ ঘর, AUD/USD ৫
+// ঘর — কোনো একক magnitude-নিয়মে পড়ে না)। তাই এখন সরাসরি নির্ভুল তালিকা।
+// নতুন market যোগ হলে এখানে না থাকলে পুরনো fallback (string-length,
+// ন্যূনতম ৫) ব্যবহার হবে — market বন্ধ হবে না, শুধু হয়তো ঠিক দশমিক
+// নাও মিলতে পারে যতক্ষণ না এখানে যোগ করা হয়।
+const _MARKET_DECIMALS = {
+  AUDNZDOTC: 5, AUDUSDOTC: 5, CADCHFOTC: 5, CNYJPYOTC: 4,
+  EURAUDOTC: 5, EURGBPOTC: 5, EURJPYOTC: 3, EURNZDOTC: 5,
+  GBPJPYOTC: 3, GBPUSDOTC: 5, INRUSDOTC: 5, MXNUSDOTC: 5,
+  NZDJPYOTC: 4, NZDUSDOTC: 5, USDARSOTC: 2, USDBRLOTC: 5,
+  USDCADOTC: 5, USDCHFOTC: 5, USDCOPOTC: 2, USDEGPOTC: 4,
+  USDIDROTC: 2, USDJPYOTC: 3, USDNGNOTC: 2, USDPHPOTC: 4,
+  USDPKROTC: 3,
+};
+
 // symbol → [base, quote] — admin panel এর ঠিক তালিকা অনুযায়ী (Index.js
 // এর _OTC_PAIR_MAP এর সাথে হুবহু মিলিয়ে রাখা, দুই জায়গায় duplicate
 // রাখা হলো কারণ otc-server.js ও Index.js সম্পূর্ণ আলাদা service/repo)
@@ -1079,15 +1097,13 @@ function tickOTC(id) {
   //   speedMultiplier— সব নড়াচড়ার গুণক
   // ══════════════════════════════════════════════════════════════════
   if (!state._eng) {
-    // দামের নিজস্ব দশমিক ঘর — engine প্রয়োজনে বাড়িয়ে নেয় (ছোট দামের
-    // market এ এক pip ধাপ যেন পায়ের চেয়ে বড় হয়ে না যায়)।
-    // [MIN DECIMALS] initial seed price এর string length কম হলে (যেমন
-    // "0.707" → dec=3) ছোট নড়াচড়া display এ হারিয়ে যেত (0.7070 এর
-    // বদলে সবসময় 0.707 দেখাত)। Quotex কখনো ৫ এর কম দেখায় না, তাই
-    // ন্যূনতম ৫ বসিয়ে দিলাম — বড় হলে (ছোট দামের market) বাড়তেই পারে।
-    const dec = Math.max(5, (String(state.price).split('.')[1] || '').length || 5);
+    // [DECIMALS] প্রথমে _MARKET_DECIMALS table থেকে সঠিক দশমিক ঘর খুঁজি
+    // (Quotex এর সাথে সরাসরি মিলিয়ে যাচাই করা)। table এ না থাকলে (নতুন
+    // market) পুরনো fallback — seed price এর string length, ন্যূনতম ৫।
+    const dec = _MARKET_DECIMALS[id]
+      ?? Math.max(5, (String(state.price).split('.')[1] || '').length || 5);
     state._eng = engine.createState(state.price, Math.max(1, dec));
-    console.log(`[engine] ${id} — চালু (decimals: ${state._eng.decimals})`);
+    console.log(`[engine] ${id} — চালু (decimals: ${state._eng.decimals}${_MARKET_DECIMALS[id] ? ', table থেকে' : ', fallback দিয়ে'})`);
     // [REFERENCE ANCHOR] শুধু প্রথমবার engine তৈরি হওয়ার সময় Firestore
     // থেকে reference price পড়ি (প্রতি tick এ নয় — খরচ/গতি বাঁচাতে)।
     // ব্যর্থ হলেও কিছু আটকাবে না (referencePrice: 0 = anchor নিষ্ক্রিয়,
