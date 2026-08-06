@@ -8,6 +8,7 @@ const admin = require('firebase-admin');
 const pLimit = require('p-limit');
 const Redis  = require('ioredis');
 const crypto = require('crypto');
+const https  = require('https');   // [MARKET REFERENCE] real-world price fetch করতে
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
@@ -828,6 +829,144 @@ async function backfillOTC(id, lastTime, lastPrice) {
   return price;
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// [MARKET REFERENCE] Real-world price এর সাথে বড় ফারাক ঠিক করা
+// ------------------------------------------------------------------------
+// সমস্যা: OTC engine শুধু random walk করে, কোনো "সত্যিকারের দামের দিকে
+// ফেরার" ব্যবস্থা নেই। তাই সময়ের সাথে (সপ্তাহ/মাস) দাম আসল বাজার থেকে
+// অনেক দূরে সরে যেতে পারে (দেখা গেছে: AUD/NZD আসল ~1.198, synthetic হয়ে
+// গিয়েছিল 0.0238 — প্রায় ৫০ ভাগের ১ ভাগ)।
+//
+// সমাধান: market শুরু/restart হওয়ার সময় Firestore এর market_reference
+// collection (Index.js এর updateMarketReferencePrices প্রতিদিন লেখে)
+// থেকে real price পড়ি। >১৫% ফারাক থাকলে একটা মাত্র candle এ সম্পূর্ণ
+// জাম্প করে ঠিক জায়গায় নিয়ে যাই — ধাপে ধাপে না, কারণ ধাপে ধাপে গেলে
+// দাম কয়েক candle ধরে predictable দিকে সরত, user সেটা ধরে নিয়ে সহজে
+// জিততে পারত। এক-লাফে হলে দিক অননুমেয়ই থাকে।
+//
+// পুরনো candle history কখনো মোছা হয় না — এই জাম্প শুধু নতুন candle
+// হিসেবে যোগ হয়।
+// ══════════════════════════════════════════════════════════════════════
+const REFERENCE_JUMP_THRESHOLD = 0.15;   // ১৫% এর বেশি ফারাক হলে সংশোধন
+
+// symbol → [base, quote] — admin panel এর ঠিক তালিকা অনুযায়ী (Index.js
+// এর _OTC_PAIR_MAP এর সাথে হুবহু মিলিয়ে রাখা, দুই জায়গায় duplicate
+// রাখা হলো কারণ otc-server.js ও Index.js সম্পূর্ণ আলাদা service/repo)
+const _OTC_PAIR_MAP = {
+  AUDNZDOTC: ['AUD', 'NZD'], AUDUSDOTC: ['AUD', 'USD'],
+  CADCHFOTC: ['CAD', 'CHF'], CNYJPYOTC: ['CNY', 'JPY'],
+  EURAUDOTC: ['EUR', 'AUD'], EURGBPOTC: ['EUR', 'GBP'],
+  EURJPYOTC: ['EUR', 'JPY'], EURNZDOTC: ['EUR', 'NZD'],
+  GBPJPYOTC: ['GBP', 'JPY'], GBPUSDOTC: ['GBP', 'USD'],
+  INRUSDOTC: ['INR', 'USD'], MXNUSDOTC: ['MXN', 'USD'],
+  NZDJPYOTC: ['NZD', 'JPY'], NZDUSDOTC: ['NZD', 'USD'],
+  USDARSOTC: ['USD', 'ARS'], USDBRLOTC: ['USD', 'BRL'],
+  USDCADOTC: ['USD', 'CAD'], USDCHFOTC: ['USD', 'CHF'],
+  USDCOPOTC: ['USD', 'COP'], USDEGPOTC: ['USD', 'EGP'],
+  USDIDROTC: ['USD', 'IDR'], USDJPYOTC: ['USD', 'JPY'],
+  USDNGNOTC: ['USD', 'NGN'], USDPHPOTC: ['USD', 'PHP'],
+  USDPKROTC: ['USD', 'PKR'],
+  USDTBDT:   ['USD', 'BDT'],
+};
+
+function _fetchJson(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch (e) { reject(new Error('JSON parse failed: ' + e.message)); }
+      });
+    }).on('error', reject);
+  });
+}
+
+/**
+ * [MARKET REFERENCE — STARTUP FETCH] Server চালু হওয়ার সাথে সাথেই
+ * (deploy/restart এ) নিজে থেকে exchangerate-api থেকে real price টেনে
+ * Firestore এর market_reference collection এ লিখে দেয়। Index.js এর
+ * দৈনিক schedule (রাত ০০:৩০ UTC) এর জন্য অপেক্ষা করতে হয় না — deploy
+ * করার সাথে সাথেই সংশোধন কার্যকর হয়।
+ *
+ * ব্যর্থ হলে (API down, key নেই) শুধু log করে থেমে যায় — server চালু
+ * হতে বা market শুরু হতে কখনো বাধা দেয় না।
+ */
+async function _fetchAndStoreReferencePrices() {
+  const apiKey = process.env.EXCHANGE_RATE_API_KEY;
+  if (!apiKey) {
+    console.warn('[market-reference] EXCHANGE_RATE_API_KEY নেই — startup fetch skip (দৈনিক Firebase schedule এর উপর নির্ভর করবে)');
+    return;
+  }
+  try {
+    const data = await _fetchJson(`https://v6.exchangerate-api.com/v6/${apiKey}/latest/USD`);
+    if (data.result !== 'success' || !data.conversion_rates) {
+      console.error('[market-reference] startup fetch ব্যর্থ:', data.result || 'unknown response');
+      return;
+    }
+    const rates = data.conversion_rates;
+    const batch = firestore.batch();
+    let count = 0;
+
+    for (const [symbol, [base, quote]] of Object.entries(_OTC_PAIR_MAP)) {
+      const baseRate  = base  === 'USD' ? 1 : rates[base];
+      const quoteRate = quote === 'USD' ? 1 : rates[quote];
+      if (!baseRate || !quoteRate) continue;
+      const price = quoteRate / baseRate;
+      batch.set(firestore.collection('market_reference').doc(symbol), {
+        price, base, quote,
+        source: 'exchangerate-api-startup',
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+      count++;
+    }
+
+    await batch.commit();
+    console.log(`[market-reference] startup fetch — ${count}/${Object.keys(_OTC_PAIR_MAP).length} pair Firestore এ লেখা হলো`);
+  } catch (e) {
+    console.error('[market-reference] startup fetch ব্যর্থ:', e.message);
+    // ব্যর্থ হলেও থেমে থাকব না — Index.js এর দৈনিক schedule পরে ঠিক করে দেবে
+  }
+}
+
+async function _getReferencePrice(id) {
+  try {
+    const snap = await firestore.collection('market_reference').doc(id).get();
+    if (!snap.exists) return null;
+    const p = snap.data().price;
+    return (typeof p === 'number' && p > 0) ? p : null;
+  } catch (e) {
+    console.error(`[market-reference] ${id} পড়তে ব্যর্থ:`, e.message);
+    return null;   // ব্যর্থ হলে কিছুই বদলাবে না, market স্বাভাবিকভাবে চলবে
+  }
+}
+
+/**
+ * বর্তমান দাম real-world reference থেকে অনেক দূরে থাকলে একটা জাম্প-candle
+ * দিয়ে ঠিক জায়গায় নিয়ে যায়। ফেরত দেয় চূড়ান্ত (সম্ভবত সংশোধিত) দাম।
+ */
+async function _snapToReferenceIfNeeded(id, price) {
+  const ref = await _getReferencePrice(id);
+  if (!ref) return price;   // reference নেই (crypto market, বা fetch ব্যর্থ) — অপরিবর্তিত
+
+  const diff = Math.abs(price - ref) / ref;
+  if (diff <= REFERENCE_JUMP_THRESHOLD) return price;   // যথেষ্ট কাছেই আছে
+
+  // বড় ফারাক — এক candle এ জাম্প করে সংশোধন। wick টা পুরনো ও নতুন দাম
+  // দুটোই ধরে রাখে (high/low), তাই chart এ real history দেখা যায়।
+  const now = Date.now();
+  const candleTime = Math.floor(now / 1000 / 60) * 60;
+  saveCandle(id, {
+    time:  candleTime,
+    open:  price,
+    high:  Math.max(price, ref),
+    low:   Math.min(price, ref),
+    close: ref,
+  });
+  console.warn(`[market-reference] ${id} — বড় ফারাক (${(diff*100).toFixed(1)}%), সংশোধন: ${price.toFixed(6)} → ${ref.toFixed(6)}`);
+  return ref;
+}
+
 async function initOTC(market) {
   const { id, baseSymbol, startPrice: fixedStart } = market;
   if (_activeMarkets.has(id)) return;
@@ -839,6 +978,13 @@ async function initOTC(market) {
   } else {
     price = baseSymbol ? await fetchBinancePrice(baseSymbol) : (fixedStart || 1.0);
     if (!price || price <= 0) price = fixedStart || 1.0;
+  }
+
+  // [MARKET REFERENCE] শুধু pre-existing market এর ক্ষেত্রেই সংশোধন করি
+  // (crypto/নতুন market — baseSymbol/fixedStart থেকে already real price)।
+  // "last" থাকা মানে এই market আগে থেকেই চলছিল, তাই drift জমে থাকতে পারে।
+  if (last) {
+    price = await _snapToReferenceIfNeeded(id, price);
   }
 
   _controls[id] = { mode:'auto', nextDirection:'auto', volatility:'medium', trendStrength:0.6, speedMultiplier:1.0 };
@@ -1262,6 +1408,11 @@ setInterval(() => {
 
 async function main() {
   console.log('GoldVest Server starting (Admin SDK)...');
+  // [MARKET REFERENCE] watchFirestoreMarkets() (যেটা initOTC ডাকে) এর
+  // আগেই real price fetch করে ফেলি, যাতে market শুরু হওয়ার সময় সংশোধনের
+  // জন্য দরকারি ডেটা ইতিমধ্যে Firestore এ থাকে — deploy করার সাথে সাথেই
+  // কাজ করে, দৈনিক schedule এর জন্য অপেক্ষা করতে হয় না।
+  await _fetchAndStoreReferencePrices();
   watchFirestoreMarkets();
   await _recoverLiveTradesFromRTDB();
   // ══════════════════════════════════════════════════════════════════
@@ -1983,4 +2134,3 @@ setInterval(() => {
     .then(() => console.log('[ping] OK'))
     .catch(() => {});
 }, 8*60*1000);
-
