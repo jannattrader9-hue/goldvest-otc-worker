@@ -1084,6 +1084,21 @@ function tickOTC(id) {
     const dec = (String(state.price).split('.')[1] || '').length || 5;
     state._eng = engine.createState(state.price, Math.max(1, dec));
     console.log(`[engine] ${id} — চালু (decimals: ${state._eng.decimals})`);
+    // [REFERENCE ANCHOR] শুধু প্রথমবার engine তৈরি হওয়ার সময় Firestore
+    // থেকে reference price পড়ি (প্রতি tick এ নয় — খরচ/গতি বাঁচাতে)।
+    // ব্যর্থ হলেও কিছু আটকাবে না (referencePrice: 0 = anchor নিষ্ক্রিয়,
+    // যেটা createState() এর নিরাপদ ডিফল্ট)।
+    _getReferencePrice(id).then(ref => {
+      if (ref && state._eng) state._eng.referencePrice = ref;
+    }).catch(() => {});
+    state._refRefreshAt = Date.now() + 3600000;   // ১ ঘণ্টা পর হালকা refresh
+  } else if (Date.now() >= (state._refRefreshAt || Infinity)) {
+    // পর্যায়ক্রমে refresh — Firebase এর দৈনিক আপডেট চলার সময় market
+    // দীর্ঘক্ষণ চলতে থাকলেও নতুন reference ধরতে পারে।
+    state._refRefreshAt = Date.now() + 3600000;
+    _getReferencePrice(id).then(ref => {
+      if (ref && state._eng) state._eng.referencePrice = ref;
+    }).catch(() => {});
   }
   state._eng.price = state.price;          // বাইরে থেকে দাম বদলালে মেনে নেয়
 
