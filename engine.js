@@ -48,6 +48,14 @@ const CFG = {
   session: num(process.env.ENG_SESSION,  0.55),     // দিনের ছন্দ
   maxStep: num(process.env.ENG_MAX_STEP, 0.0015),   // safety ±০.১৫%/tick
 
+  // [REFERENCE ANCHOR] দাম সময়ের সাথে real-world থেকে দূরে সরে না যায়
+  // তার জন্য মৃদু, দীর্ঘমেয়াদী টান। কাছাকাছি (anchorBand এর মধ্যে)
+  // থাকলে সম্পূর্ণ নিষ্ক্রিয় — স্বাভাবিক random walk। দূরে গেলে খুব
+  // ধীরে টান শুরু হয়, কোনো ৫s/৬০s trade এ দিক বোঝা যাবে না এমন
+  // মৃদুতায় (Quotex এর মত ~১-২% এর মধ্যে থাকে, তাই আমরাও একই লক্ষ্যে)।
+  anchorBand:     num(process.env.ENG_ANCHOR_BAND,     0.06),   // ৬% এর মধ্যে — কোনো টান নেই
+  anchorStrength: num(process.env.ENG_ANCHOR_STRENGTH, 0.00005), // দূরে হলে কত মৃদু টান
+
   // admin (otc-server প্রতি tick এ পাঠায়)
   forceDir: 0,
   trendStrength: 0.6,
@@ -84,6 +92,7 @@ function createState(price, decimals = 5) {
     price,
     decimals,
     tickScale: _tickScale(price, decimals),
+    referencePrice: 0,   // [REFERENCE ANCHOR] otc-server সেট করবে; ০ মানে কোনো anchor নেই
     vol: 1,                                   // চলতি অস্থিরতা
     phase: 'rest',
     left: 3,
@@ -217,6 +226,20 @@ function nextPrice(st, now = Date.now(), over) {
   if (--st.regimeLeft <= 0) {
     st.regimeDir = Math.random() < 0.5 ? 1 : -1;
     st.regimeLeft = 200 + ((Math.random() * 500) | 0);
+  }
+
+  /* ── [REFERENCE ANCHOR] দূরে সরে গেলে মৃদু টান ──────────────────
+     anchorBand এর মধ্যে থাকলে সম্পূর্ণ নিষ্ক্রিয় (কিছুই যোগ হয় না)।
+     দূরে গেলে ফারাকের সমানুপাতে (কিন্তু অত্যন্ত ছোট গুণক দিয়ে) delta
+     তে সামান্য যোগ হয় — কয়েক ঘণ্টা/দিন ধরে ধীরে reference এর দিকে
+     নিয়ে যায়। এক tick এ প্রভাব maxStep এর অনেক নিচে, তাই কোনো trade
+     duration এ দিক বোঝার সুযোগ থাকে না। */
+  if (st.referencePrice > 0) {
+    const refDiff = (st.referencePrice - st.price) / st.referencePrice;
+    if (Math.abs(refDiff) > c.anchorBand) {
+      const pull = (refDiff - Math.sign(refDiff) * c.anchorBand) * c.anchorStrength;
+      delta += st.price * pull;
+    }
   }
 
   /* ── safety clamp ── */
