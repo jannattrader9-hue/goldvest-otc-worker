@@ -276,8 +276,9 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
         // symbol filter — একই candleTime-এ অনেক symbol-এর trades থাকতে পারে
         if (t.symbol === symbol && t.accountType === 'live') {
           // [TICK HISTORY] candleTime ই এই trade গুলোর expiry — ওই মুহূর্তের
-          // দাম ইতিহাস থেকে নেওয়া হবে (_applyExpiryPrices)
-          trades.push({ userId, tradeId: tradeNode.key, closePrice, expiryTimestamp: candleTime, type: t.type || '', amount: t.amount || 0 });
+          // দাম ইতিহাস থেকে নেওয়া হবে (_applyExpiryPrices)। t.expiryTimestampMs
+          // থাকলে (user এর আসল ms-নির্ভুল expiry) সেটাই প্রাধান্য পাবে।
+          trades.push({ userId, tradeId: tradeNode.key, closePrice, expiryTimestamp: candleTime, expiryTimestampMs: t.expiryTimestampMs || 0, type: t.type || '', amount: t.amount || 0 });
           // tick-settle duplicate এড়াতে pending mark করো
           const key = `${userId}/${tradeNode.key}`;
           _activeTradesMemory.delete(key);
@@ -362,6 +363,7 @@ async function _recoverLiveTradesFromRTDB() {
             tradeId: tradeNode.key,
             symbol: t.symbol,
             expiryTimestamp,
+            expiryTimestampMs: parseInt(t.expiryTimestampMs) || 0,   // [PRECISION FIX] recovery তেও বহাল রাখা
             accountType: 'live',
             status: 'live',
           });
@@ -417,9 +419,13 @@ function _logShadowDueTrades() {
 async function _applyExpiryPrices(symbol, trades) {
   if (!HIST_ON) return;
   await Promise.allSettled(trades.map(async (t) => {
-    const expSec = t.expiryTimestamp;
-    if (!expSec) return;
-    const p = await _histPriceAt(symbol, expSec * 1000);
+    // [PRECISION FIX] আগে expSec * 1000 করলে sub-second (0-999ms) অংশ
+    // হারিয়ে যেত, ৫s trade এ যা duration এর ~২০% পর্যন্ত ভুল সময়ের দাম
+    // ধরিয়ে দিত। এখন ms-নির্ভুল expiry থাকলে সেটাই ব্যবহার হয়; পুরনো
+    // client (যাদের এই field নেই) এর জন্য সেকেন্ড-fallback অক্ষত রইল।
+    const expMs = t.expiryTimestampMs > 0 ? t.expiryTimestampMs : (t.expiryTimestamp ? t.expiryTimestamp * 1000 : 0);
+    if (!expMs) return;
+    const p = await _histPriceAt(symbol, expMs);
     if (p) t.closePrice = p;
   }));
 }
@@ -451,7 +457,7 @@ async function _settleDueTradesFromMemory() {
     if (!bySymbol.has(t.symbol)) bySymbol.set(t.symbol, { closePrice: state.price, trades: [] });
     // [TICK HISTORY] closePrice নিচে expiry এর সঠিক মুহূর্তের দাম দিয়ে
     // বদলে দেওয়া হয় (_applyExpiryPrices)। এখানে state.price শুধু fallback।
-    bySymbol.get(t.symbol).trades.push({ userId: t.userId, tradeId: t.tradeId, closePrice: state.price, expiryTimestamp: t.expiryTimestamp, type: t.type || '', amount: t.amount || 0 });
+    bySymbol.get(t.symbol).trades.push({ userId: t.userId, tradeId: t.tradeId, closePrice: state.price, expiryTimestamp: t.expiryTimestamp, expiryTimestampMs: t.expiryTimestampMs || 0, type: t.type || '', amount: t.amount || 0 });
   }
 
   // প্রতি symbol-এর trades batchSettle-এ পাঠাও
@@ -502,7 +508,7 @@ async function _settleDueTradesFromRTDB() {
           const state = _states[t.symbol];
           if (!state || typeof state.price !== 'number') return;
           if (!bySymbol.has(t.symbol)) bySymbol.set(t.symbol, { closePrice: state.price, trades: [] });
-          bySymbol.get(t.symbol).trades.push({ userId, tradeId: tradeNode.key, closePrice: state.price, expiryTimestamp, type: t.type || '', amount: t.amount || 0 });
+          bySymbol.get(t.symbol).trades.push({ userId, tradeId: tradeNode.key, closePrice: state.price, expiryTimestamp, expiryTimestampMs: t.expiryTimestampMs || 0, type: t.type || '', amount: t.amount || 0 });
           _rtdbSettledKeys.add(key);
           _pendingSettle.add(key);
           _activeTradesMemory.delete(key);
@@ -1432,6 +1438,9 @@ http.createServer(async (req, res) => {
         'status',          'live',
         'accountType',     'live',
         'expiryTimestamp', String(trade.expiryTimestamp || 0),
+        // [PRECISION FIX] settlement এর সময় ms-নির্ভুল দাম খুঁজতে —
+        // না থাকলে (পুরনো client) 0, তখন fallback সেকেন্ড-ভিত্তিক path
+        'expiryTimestampMs', String(trade.expiryTimestampMs || 0),
         'currency',        trade.currency || 'USD',
       );
       // [MAX DURATION] সর্বোচ্চ ৪ ঘণ্টার trade + ১ ঘণ্টা নিরাপত্তা মার্জিন।
@@ -1448,18 +1457,22 @@ http.createServer(async (req, res) => {
         amount:      amount,
         feedType:    trade.feedType || '',
         entryPrice,   // [SECURITY] server এর দাম
+        // [PRECISION FIX] path key (সেকেন্ড) অপরিবর্তিত রাখা হলো — শুধু
+        // data এর ভেতরে ms-নির্ভুল expiry যোগ, settlement এ ব্যবহার হবে
+        expiryTimestampMs: trade.expiryTimestampMs || 0,
       }).catch(e => console.error('[place-trade] RTDB queue failed:', e.message));
 
       // [SCALE ২.১] in-memory map এ যোগ — আগে Firestore listener এটা করত।
       // এতে tick-settle (সবচেয়ে দ্রুত পথ) Firestore ছাড়াই কাজ করে।
       _activeTradesMemory.set(`${userId}/${tradeId}`, {
         userId, tradeId,
-        symbol:          trade.symbol || '',
-        expiryTimestamp: parseInt(trade.expiryTimestamp) || 0,
-        accountType:     'live',
-        status:          'live',
-        type:            trade.type || '',
-        amount:          amount,
+        symbol:            trade.symbol || '',
+        expiryTimestamp:   parseInt(trade.expiryTimestamp) || 0,
+        expiryTimestampMs: parseInt(trade.expiryTimestampMs) || 0,   // [PRECISION FIX]
+        accountType:       'live',
+        status:            'live',
+        type:              trade.type || '',
+        amount:            amount,
       });
 
       // 6. Firestore trade save — background, non-blocking
