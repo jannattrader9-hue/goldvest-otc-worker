@@ -1,10 +1,9 @@
 /**
- * engine.js — GoldVest OTC price engine (Modified with Fakeout/Whipsaw Logic)
+ * engine.js — GoldVest OTC price engine (Final Modified)
  * ═══════════════════════════════════════════════════════════════════════
- * ফেকআউট (Fakeout) আপডেট: 
- * সাধারণ run এর পাশাপাশি প্রায় ৪০% সময় মার্কেট মূল ট্রেন্ডের উল্টো দিকে 
- * (fakeout) গিয়ে ধোঁকা দেবে এবং শেষে প্রচণ্ড বেগে (snapback) সঠিক দিকে 
- * লাফিয়ে ফিরে আসবে। এর ফলে কোনো স্ট্র্যাটেজি নির্দিষ্ট প্যাটার্ন ধরতে পারবে না।
+ * ১. ফেকআউট (Fakeout) ও স্ন্যাপব্যাক (Snapback) আপডেট: ৪০% সময় ধোঁকা দেবে।
+ * ২. স্ট্রিক ব্রেকার (Streak Breaker) আপডেট: টানা একই কালারের ক্যান্ডেল 
+ *    তৈরি হওয়া রোধ করে রিয়েল মার্কেটের মতো জিগ-জ্যাগ (Pullback) তৈরি করবে।
  * ═══════════════════════════════════════════════════════════════════════
  */
 
@@ -64,6 +63,10 @@ function createState(price, decimals = 5) {
     retrDone: 0,
     regimeDir: Math.random() < 0.5 ? 1 : -1,
     regimeLeft: 200 + ((Math.random() * 500) | 0),
+    
+    // Streak Memory (টানা একই কালার ক্যান্ডেল প্রতিরোধের জন্য)
+    lastRunDir: 0, 
+    runStreak: 0,
   };
 }
 
@@ -127,10 +130,34 @@ function nextPrice(st, now = Date.now(), over) {
         st.phase = 'run';
         const u = Math.random();
         st.left = Math.max(2, Math.round(c.runLen * Math.pow(u, -0.45) * 0.6));
+        
         const b = c.forceDir
           ? c.forceDir * (0.10 + c.trendStrength * 0.22)
           : st.regimeDir * c.bias;
-        st.dir = Math.random() < 0.5 + b ? 1 : -1;
+        
+        // স্বাভাবিক সম্ভাবনা
+        let upProb = 0.5 + b;
+
+        // 🔥 STREAK BREAKER (টানা একই কালার ক্যান্ডেল থামানোর লজিক)
+        if (st.lastRunDir === 1) {
+            // যদি আগের মুভমেন্ট আপ হয়, তবে নতুন করে আপে যাওয়ার চান্স কমিয়ে দেব
+            upProb -= (st.runStreak * 0.18); 
+        } else if (st.lastRunDir === -1) {
+            // যদি আগের মুভমেন্ট ডাউন হয়, তবে আপে যাওয়ার (রিভার্স) চান্স বাড়িয়ে দেব
+            upProb += (st.runStreak * 0.18); 
+        }
+
+        // নতুন ডিরেকশন ঠিক করা
+        st.dir = Math.random() < upProb ? 1 : -1;
+        
+        // স্ট্রিক (টানা চলা) আপডেট করা
+        if (st.dir === st.lastRunDir) {
+            st.runStreak++; // একই দিকে গেলে স্ট্রিক বাড়বে
+        } else {
+            st.runStreak = 1; // দিক বদলে গেলে স্ট্রিক রিসেট হয়ে ১ হবে
+        }
+        st.lastRunDir = st.dir;
+
         st.runStart = st.price;
       }
     }
@@ -199,7 +226,6 @@ function nextDelay(st, over) {
   const c = over ? { ...CFG, ...over } : CFG;
   let g = c.gapMs;
 
-  // ফেকআউট হলে run এর মতই গতি থাকবে, আর snapback এর সময় ভয়ানক ফাস্ট হবে
   g *= (st.phase === 'run' || st.phase === 'fakeout') ? 0.5
      : st.phase === 'snapback' ? 0.25 
      : st.phase === 'rest' ? 1.4
