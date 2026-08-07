@@ -48,14 +48,6 @@ const CFG = {
   session: num(process.env.ENG_SESSION,  0.55),     // দিনের ছন্দ
   maxStep: num(process.env.ENG_MAX_STEP, 0.0015),   // safety ±০.১৫%/tick
 
-  // [REFERENCE ANCHOR] দাম সময়ের সাথে real-world থেকে দূরে সরে না যায়
-  // তার জন্য মৃদু, দীর্ঘমেয়াদী টান। কাছাকাছি (anchorBand এর মধ্যে)
-  // থাকলে সম্পূর্ণ নিষ্ক্রিয় — স্বাভাবিক random walk। দূরে গেলে খুব
-  // ধীরে টান শুরু হয়, কোনো ৫s/৬০s trade এ দিক বোঝা যাবে না এমন
-  // মৃদুতায় (Quotex এর মত ~১-২% এর মধ্যে থাকে, তাই আমরাও একই লক্ষ্যে)।
-  anchorBand:     num(process.env.ENG_ANCHOR_BAND,     0.06),   // ৬% এর মধ্যে — কোনো টান নেই
-  anchorStrength: num(process.env.ENG_ANCHOR_STRENGTH, 0.00005), // দূরে হলে কত মৃদু টান
-
   // admin (otc-server প্রতি tick এ পাঠায়)
   forceDir: 0,
   trendStrength: 0.6,
@@ -92,7 +84,6 @@ function createState(price, decimals = 5) {
     price,
     decimals,
     tickScale: _tickScale(price, decimals),
-    referencePrice: 0,   // [REFERENCE ANCHOR] otc-server সেট করবে; ০ মানে কোনো anchor নেই
     vol: 1,                                   // চলতি অস্থিরতা
     phase: 'rest',
     left: 3,
@@ -104,15 +95,7 @@ function createState(price, decimals = 5) {
     retrFast: false,
     retrDone: 0,
     regimeDir: Math.random() < 0.5 ? 1 : -1,
-    // [ANTI-STREAK] আগে ২০০-৭০০ tick ধরে regime একই দিকে স্থির থাকত,
-    // তাই user ৭-৯টা একরঙা candle দেখে uptrend/downtrend বুঝে ফেলত ও
-    // সেই দিকে trade দিয়ে জিতত। এখন অনেক ছোট (১৫-৫০ tick), তাই দীর্ঘ
-    // trend এর ভেতরেও দিক ঘন ঘন বদলাবে।
-    regimeLeft: 15 + ((Math.random() * 35) | 0),
-    // [ANTI-STREAK] প্রতিটা regime নিজে থেকেই zigzag করবে কিনা তার
-    // এলোমেলো সিদ্ধান্ত — long trend এর ভেতরেও মাঝে মাঝে countertrend
-    // burst আসবে, "uptrend মানেই সব green" এই predictability ভাঙতে।
-    zigzagMode: Math.random() < 0.45,
+    regimeLeft: 200 + ((Math.random() * 500) | 0),
   };
 }
 
@@ -175,14 +158,8 @@ function nextPrice(st, now = Date.now(), over) {
       // দিত। শ্বাসের পর সরাসরি নতুন ঝলক।
       st.phase = 'run';
       st.left = 2 + ((Math.random() * 5) | 0);
-      // [ANTI-STREAK] zigzagMode চালু থাকলে ২৫% সময় regime এর উল্টো
-      // দিকে ঝলক যায় — long trend এর ভেতরেও color alternation থাকে,
-      // "up trend মানেই সব green candle" প্যাটার্ন ভাঙে। কোনো fixed
-      // rule না (৩টার পর নিশ্চিত reverse জাতীয়), শুধু probability —
-      // তাই এটাও নিজে predictable strategy হয়ে ওঠে না।
-      const _regBias = st.zigzagMode && Math.random() < 0.25 ? -st.regimeDir : st.regimeDir;
       const b1 = c.forceDir ? c.forceDir * (0.10 + c.trendStrength * 0.22)
-                            : _regBias * c.bias;
+                            : st.regimeDir * c.bias;
       st.dir = Math.random() < 0.5 + b1 ? 1 : -1;
       st.runStart = st.price;
     } else {
@@ -191,11 +168,9 @@ function nextPrice(st, now = Date.now(), over) {
       const u = Math.random();
       st.left = Math.max(2, Math.round(c.runLen * Math.pow(u, -0.45) * 0.6));
       // admin manual mode হলে তার দিক, নইলে regime এর মৃদু পক্ষপাত
-      // [ANTI-STREAK] এখানেও একই zigzag সুযোগ
-      const _regBias2 = st.zigzagMode && Math.random() < 0.25 ? -st.regimeDir : st.regimeDir;
       const b = c.forceDir
         ? c.forceDir * (0.10 + c.trendStrength * 0.22)
-        : _regBias2 * c.bias;
+        : st.regimeDir * c.bias;
       st.dir = Math.random() < 0.5 + b ? 1 : -1;
       st.runStart = st.price;
     }
@@ -241,24 +216,7 @@ function nextPrice(st, now = Date.now(), over) {
   /* ── ৭. regime — কয়েক মিনিট পরপর ঝোঁক বদলায় ── */
   if (--st.regimeLeft <= 0) {
     st.regimeDir = Math.random() < 0.5 ? 1 : -1;
-    // [ANTI-STREAK] regimeLeft ও duration দুটোই ছোট করা হয়েছে (ছিল
-    // ২০০-৭০০ tick, এখন ১৫-৫০) — দীর্ঘ trend persist করবে না।
-    st.regimeLeft = 15 + ((Math.random() * 35) | 0);
-    st.zigzagMode = Math.random() < 0.45;
-  }
-
-  /* ── [REFERENCE ANCHOR] দূরে সরে গেলে মৃদু টান ──────────────────
-     anchorBand এর মধ্যে থাকলে সম্পূর্ণ নিষ্ক্রিয় (কিছুই যোগ হয় না)।
-     দূরে গেলে ফারাকের সমানুপাতে (কিন্তু অত্যন্ত ছোট গুণক দিয়ে) delta
-     তে সামান্য যোগ হয় — কয়েক ঘণ্টা/দিন ধরে ধীরে reference এর দিকে
-     নিয়ে যায়। এক tick এ প্রভাব maxStep এর অনেক নিচে, তাই কোনো trade
-     duration এ দিক বোঝার সুযোগ থাকে না। */
-  if (st.referencePrice > 0) {
-    const refDiff = (st.referencePrice - st.price) / st.referencePrice;
-    if (Math.abs(refDiff) > c.anchorBand) {
-      const pull = (refDiff - Math.sign(refDiff) * c.anchorBand) * c.anchorStrength;
-      delta += st.price * pull;
-    }
+    st.regimeLeft = 200 + ((Math.random() * 500) | 0);
   }
 
   /* ── safety clamp ── */
