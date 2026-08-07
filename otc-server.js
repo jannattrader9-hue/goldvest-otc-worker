@@ -1667,9 +1667,14 @@ http.createServer(async (req, res) => {
       });
 
       // 6. Firestore trade save — background, non-blocking
+      // [DECIMALS SYNC] tradehistorymanager.js এ Open/Close/Difference
+      // এখন এই field ব্যবহার করবে (নিজের magnitude-অনুমান বাদ দিয়ে) —
+      // chartengine.js তে যেমন করা হয়েছিল, একই ধরনের সংশোধন।
+      const _tradeDecimals = _states[trade.symbol]?._eng?.decimals;
       firestore.collection('users').doc(userId).collection('trades').doc(tradeId).set({
         ...trade,
         entryPrice,   // [SECURITY] client এর মান override — server এর দামই নথিতে
+        decimals:   _tradeDecimals || 5,   // [DECIMALS SYNC] fallback ৫ — undefined Firestore write ব্যর্থ করে না, কিন্তু নিরাপত্তার জন্য সংখ্যা রাখা ভালো
         redisDeducted: true,   // [১.৩] Redis এ balance কাটা হয়েছে — settler TTL miss
                                // এ এটা দেখেই বুঝবে জিতলে credit দেওয়া নিরাপদ
         userId,
