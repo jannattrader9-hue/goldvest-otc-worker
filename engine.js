@@ -35,7 +35,7 @@ const num = (v, d) => (v === undefined || v === '' || isNaN(+v) ? d : +v);
 const CFG = {
   unit:    num(process.env.ENG_UNIT,     0.0000075),  // base একক (দামের অনুপাতে)
   volMem:  num(process.env.ENG_VOL_MEM,  0.994),    // অস্থিরতার স্মৃতি
-  volAmp:  num(process.env.ENG_VOL_AMP,  0.42),     // ওঠানামার মাত্রা — [বাড়ানো হলো] prediction কঠিন করতে
+  volAmp:  num(process.env.ENG_VOL_AMP,  0.28),     // ওঠানামার মাত্রা
   runLen:  num(process.env.ENG_RUN_LEN,  6),        // ঝলকের গড় tick
   restLen: num(process.env.ENG_REST_LEN, 5),        // শ্বাসের গড় tick
   clust:   num(process.env.ENG_CLUST,    0.45),     // ঝলক গুচ্ছ হওয়া
@@ -104,15 +104,7 @@ function createState(price, decimals = 5) {
     retrFast: false,
     retrDone: 0,
     regimeDir: Math.random() < 0.5 ? 1 : -1,
-    // [ANTI-STREAK] আগে ২০০-৭০০ tick ধরে regime একই দিকে স্থির থাকত,
-    // তাই user ৭-৯টা একরঙা candle দেখে uptrend/downtrend বুঝে ফেলত ও
-    // সেই দিকে trade দিয়ে জিতত। এখন অনেক ছোট (১৫-৫০ tick), তাই দীর্ঘ
-    // trend এর ভেতরেও দিক ঘন ঘন বদলাবে।
-    regimeLeft: 15 + ((Math.random() * 35) | 0),
-    // [ANTI-STREAK] প্রতিটা regime নিজে থেকেই zigzag করবে কিনা তার
-    // এলোমেলো সিদ্ধান্ত — long trend এর ভেতরেও মাঝে মাঝে countertrend
-    // burst আসবে, "uptrend মানেই সব green" এই predictability ভাঙতে।
-    zigzagMode: Math.random() < 0.45,
+    regimeLeft: 200 + ((Math.random() * 500) | 0),
   };
 }
 
@@ -175,14 +167,8 @@ function nextPrice(st, now = Date.now(), over) {
       // দিত। শ্বাসের পর সরাসরি নতুন ঝলক।
       st.phase = 'run';
       st.left = 2 + ((Math.random() * 5) | 0);
-      // [ANTI-STREAK] zigzagMode চালু থাকলে ২৫% সময় regime এর উল্টো
-      // দিকে ঝলক যায় — long trend এর ভেতরেও color alternation থাকে,
-      // "up trend মানেই সব green candle" প্যাটার্ন ভাঙে। কোনো fixed
-      // rule না (৩টার পর নিশ্চিত reverse জাতীয়), শুধু probability —
-      // তাই এটাও নিজে predictable strategy হয়ে ওঠে না।
-      const _regBias = st.zigzagMode && Math.random() < 0.25 ? -st.regimeDir : st.regimeDir;
       const b1 = c.forceDir ? c.forceDir * (0.10 + c.trendStrength * 0.22)
-                            : _regBias * c.bias;
+                            : st.regimeDir * c.bias;
       st.dir = Math.random() < 0.5 + b1 ? 1 : -1;
       st.runStart = st.price;
     } else {
@@ -191,11 +177,9 @@ function nextPrice(st, now = Date.now(), over) {
       const u = Math.random();
       st.left = Math.max(2, Math.round(c.runLen * Math.pow(u, -0.45) * 0.6));
       // admin manual mode হলে তার দিক, নইলে regime এর মৃদু পক্ষপাত
-      // [ANTI-STREAK] এখানেও একই zigzag সুযোগ
-      const _regBias2 = st.zigzagMode && Math.random() < 0.25 ? -st.regimeDir : st.regimeDir;
       const b = c.forceDir
         ? c.forceDir * (0.10 + c.trendStrength * 0.22)
-        : _regBias2 * c.bias;
+        : st.regimeDir * c.bias;
       st.dir = Math.random() < 0.5 + b ? 1 : -1;
       st.runStart = st.price;
     }
@@ -241,10 +225,7 @@ function nextPrice(st, now = Date.now(), over) {
   /* ── ৭. regime — কয়েক মিনিট পরপর ঝোঁক বদলায় ── */
   if (--st.regimeLeft <= 0) {
     st.regimeDir = Math.random() < 0.5 ? 1 : -1;
-    // [ANTI-STREAK] regimeLeft ও duration দুটোই ছোট করা হয়েছে (ছিল
-    // ২০০-৭০০ tick, এখন ১৫-৫০) — দীর্ঘ trend persist করবে না।
-    st.regimeLeft = 15 + ((Math.random() * 35) | 0);
-    st.zigzagMode = Math.random() < 0.45;
+    st.regimeLeft = 200 + ((Math.random() * 500) | 0);
   }
 
   /* ── [REFERENCE ANCHOR] দূরে সরে গেলে মৃদু টান ──────────────────
