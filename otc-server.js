@@ -5,11 +5,10 @@
 // ============================================================
 
 const admin = require('firebase-admin');
-const https  = require('https');   // [MARKET REFERENCE] real-world price fetch করতে
 const pLimit = require('p-limit');
 const Redis  = require('ioredis');
 const crypto = require('crypto');
-const orderSettle = require('./ordersettle.js');   // [MTG PROTECTION] majority-loses close price adjustment
+const https  = require('https');   // [MARKET REFERENCE] real-world price fetch করতে
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
 
@@ -264,7 +263,6 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
         _pendingSettle.add(key);
       });
       await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
-      closePrice = orderSettle.adjustClosePrice(trades, closePrice);   // [MTG PROTECTION]
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
       _candleSettlingSymbols.delete(symbol);
       return;
@@ -279,7 +277,8 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
         // symbol filter — একই candleTime-এ অনেক symbol-এর trades থাকতে পারে
         if (t.symbol === symbol && t.accountType === 'live') {
           // [TICK HISTORY] candleTime ই এই trade গুলোর expiry — ওই মুহূর্তের
-          // দাম ইতিহাস থেকে নেওয়া হবে (_applyExpiryPrices)
+          // দাম ইতিহাস থেকে নেওয়া হবে (_applyExpiryPrices)। t.expiryTimestampMs
+          // থাকলে (user এর আসল ms-নির্ভুল expiry) সেটাই প্রাধান্য পাবে।
           trades.push({ userId, tradeId: tradeNode.key, closePrice, expiryTimestamp: candleTime, expiryTimestampMs: t.expiryTimestampMs || 0, type: t.type || '', amount: t.amount || 0 });
           // tick-settle duplicate এড়াতে pending mark করো
           const key = `${userId}/${tradeNode.key}`;
@@ -297,8 +296,7 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
     setTimeout(() => pendingKeys.forEach(k => _pendingSettle.delete(k)), 30000);
 
     await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
-    closePrice = orderSettle.adjustClosePrice(trades, closePrice);   // [MTG PROTECTION]
-      await _batchSettleAndBroadcast(symbol, trades, closePrice);
+    await _batchSettleAndBroadcast(symbol, trades, closePrice);
 
     // Candle settle শেষ — tick-settle আবার চলতে পারবে
     _candleSettlingSymbols.delete(symbol);
@@ -422,10 +420,10 @@ function _logShadowDueTrades() {
 async function _applyExpiryPrices(symbol, trades) {
   if (!HIST_ON) return;
   await Promise.allSettled(trades.map(async (t) => {
-    // [PRECISION FIX] expSec*1000 করলে sub-second (0-999ms) অংশ হারিয়ে
-    // যেত, ৫s trade এ duration এর ~২০% পর্যন্ত ভুল সময়ের দাম ধরত। এখন
-    // ms-নির্ভুল expiry থাকলে সেটাই ব্যবহার হয়; পুরনো client এর জন্য
-    // সেকেন্ড-fallback অক্ষত রইল।
+    // [PRECISION FIX] আগে expSec * 1000 করলে sub-second (0-999ms) অংশ
+    // হারিয়ে যেত, ৫s trade এ যা duration এর ~২০% পর্যন্ত ভুল সময়ের দাম
+    // ধরিয়ে দিত। এখন ms-নির্ভুল expiry থাকলে সেটাই ব্যবহার হয়; পুরনো
+    // client (যাদের এই field নেই) এর জন্য সেকেন্ড-fallback অক্ষত রইল।
     const expMs = t.expiryTimestampMs > 0 ? t.expiryTimestampMs : (t.expiryTimestamp ? t.expiryTimestamp * 1000 : 0);
     if (!expMs) return;
     const p = await _histPriceAt(symbol, expMs);
@@ -467,8 +465,7 @@ async function _settleDueTradesFromMemory() {
   await Promise.allSettled([...bySymbol.entries()].map(async ([symbol, { closePrice, trades }]) => {
     console.log(`[tick-settle] ${symbol} due=${trades.length} closePrice=${closePrice.toFixed(5)}`);
     await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
-    closePrice = orderSettle.adjustClosePrice(trades, closePrice);   // [MTG PROTECTION]
-      await _batchSettleAndBroadcast(symbol, trades, closePrice);
+    await _batchSettleAndBroadcast(symbol, trades, closePrice);
   }));
 
   // Safety cleanup — 30s পরে Firestore confirm না এলেও pending guard clear করো
@@ -525,7 +522,6 @@ async function _settleDueTradesFromRTDB() {
     await Promise.allSettled([...bySymbol.entries()].map(async ([symbol, { closePrice, trades }]) => {
       console.log(`[rtdb-tick-settle] ${symbol} due=${trades.length} closePrice=${closePrice.toFixed(5)}`);
       await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
-      closePrice = orderSettle.adjustClosePrice(trades, closePrice);   // [MTG PROTECTION]
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
       // settle হয়ে গেলে RTDB queue থেকে delete করো
       await Promise.allSettled(trades.map(t =>
@@ -833,12 +829,34 @@ async function backfillOTC(id, lastTime, lastPrice) {
   return price;
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// [MARKET REFERENCE] Real-world price এর সাথে বড় ফারাক ঠিক করা
+// ------------------------------------------------------------------------
+// সমস্যা: OTC engine শুধু random walk করে, কোনো "সত্যিকারের দামের দিকে
+// ফেরার" ব্যবস্থা নেই। তাই সময়ের সাথে (সপ্তাহ/মাস) দাম আসল বাজার থেকে
+// অনেক দূরে সরে যেতে পারে (দেখা গেছে: AUD/NZD আসল ~1.198, synthetic হয়ে
+// গিয়েছিল 0.0238 — প্রায় ৫০ ভাগের ১ ভাগ)।
+//
+// সমাধান: market শুরু/restart হওয়ার সময় Firestore এর market_reference
+// collection (Index.js এর updateMarketReferencePrices প্রতিদিন লেখে)
+// থেকে real price পড়ি। >১৫% ফারাক থাকলে একটা মাত্র candle এ সম্পূর্ণ
+// জাম্প করে ঠিক জায়গায় নিয়ে যাই — ধাপে ধাপে না, কারণ ধাপে ধাপে গেলে
+// দাম কয়েক candle ধরে predictable দিকে সরত, user সেটা ধরে নিয়ে সহজে
+// জিততে পারত। এক-লাফে হলে দিক অননুমেয়ই থাকে।
+//
+// পুরনো candle history কখনো মোছা হয় না — এই জাম্প শুধু নতুন candle
+// হিসেবে যোগ হয়।
+// ══════════════════════════════════════════════════════════════════════
+const REFERENCE_JUMP_THRESHOLD = 0.15;   // ১৫% এর বেশি ফারাক হলে সংশোধন
+
 // [DECIMALS TABLE] প্রতিটা market এর দশমিক ঘর — Quotex এর সাথে সরাসরি
-// মিলিয়ে (২৫টা pair এর current price দেখে)। "seed price এর string
-// length" বা "মোট ৬ সংখ্যা" জাতীয় সূত্র কোনোটাই ১০০% মেলেনি (যেমন
-// USD/ARS ২ ঘর, EUR/JPY ৩ ঘর, AUD/USD ৫ ঘর — কোনো একক magnitude-নিয়মে
-// পড়ে না)। তাই সরাসরি নির্ভুল তালিকা। table এ না থাকা নতুন market এ
-// পুরনো fallback (string-length, ন্যূনতম ৫) ব্যবহার হয়।
+// মিলিয়ে (২৫টা pair এর current price দেখে)। আগে "seed price এর string
+// length" বা "মোট ৬ সংখ্যা" জাতীয় সূত্র দিয়ে অনুমান করা হচ্ছিল, কিন্তু
+// কোনো সূত্রই ১০০% মেলেনি (যেমন USD/ARS ২ ঘর, EUR/JPY ৩ ঘর, AUD/USD ৫
+// ঘর — কোনো একক magnitude-নিয়মে পড়ে না)। তাই এখন সরাসরি নির্ভুল তালিকা।
+// নতুন market যোগ হলে এখানে না থাকলে পুরনো fallback (string-length,
+// ন্যূনতম ৫) ব্যবহার হবে — market বন্ধ হবে না, শুধু হয়তো ঠিক দশমিক
+// নাও মিলতে পারে যতক্ষণ না এখানে যোগ করা হয়।
 const _MARKET_DECIMALS = {
   AUDNZDOTC: 5, AUDUSDOTC: 5, CADCHFOTC: 5, CNYJPYOTC: 4,
   EURAUDOTC: 5, EURGBPOTC: 5, EURJPYOTC: 3, EURNZDOTC: 5,
@@ -849,16 +867,9 @@ const _MARKET_DECIMALS = {
   USDPKROTC: 3,
 };
 
-// ══════════════════════════════════════════════════════════════════════
-// [MARKET REFERENCE] Real-world price এর সাথে বড় ফারাক ঠিক করা
-// ------------------------------------------------------------------------
-// সমস্যা: OTC engine শুধু random walk করে, কোনো "সত্যিকারের দামের দিকে
-// ফেরার" ব্যবস্থা নেই। তাই সময়ের সাথে দাম আসল বাজার থেকে অনেক দূরে
-// সরে যেতে পারে (দেখা গেছে: AUD/NZD আসল ~1.198, synthetic হয়ে গিয়েছিল
-// 0.0238 — প্রায় ৫০ ভাগের ১ ভাগ)।
-// ══════════════════════════════════════════════════════════════════════
-const REFERENCE_JUMP_THRESHOLD = 0.15;   // ১৫% এর বেশি ফারাক হলে সংশোধন
-
+// symbol → [base, quote] — admin panel এর ঠিক তালিকা অনুযায়ী (Index.js
+// এর _OTC_PAIR_MAP এর সাথে হুবহু মিলিয়ে রাখা, দুই জায়গায় duplicate
+// রাখা হলো কারণ otc-server.js ও Index.js সম্পূর্ণ আলাদা service/repo)
 const _OTC_PAIR_MAP = {
   AUDNZDOTC: ['AUD', 'NZD'], AUDUSDOTC: ['AUD', 'USD'],
   CADCHFOTC: ['CAD', 'CHF'], CNYJPYOTC: ['CNY', 'JPY'],
@@ -891,13 +902,18 @@ function _fetchJson(url) {
 
 /**
  * [MARKET REFERENCE — STARTUP FETCH] Server চালু হওয়ার সাথে সাথেই
- * exchangerate-api থেকে real price টেনে Firestore এর market_reference
- * collection এ লিখে দেয়। ব্যর্থ হলে শুধু log করে থামে, কখনো block করে না।
+ * (deploy/restart এ) নিজে থেকে exchangerate-api থেকে real price টেনে
+ * Firestore এর market_reference collection এ লিখে দেয়। Index.js এর
+ * দৈনিক schedule (রাত ০০:৩০ UTC) এর জন্য অপেক্ষা করতে হয় না — deploy
+ * করার সাথে সাথেই সংশোধন কার্যকর হয়।
+ *
+ * ব্যর্থ হলে (API down, key নেই) শুধু log করে থেমে যায় — server চালু
+ * হতে বা market শুরু হতে কখনো বাধা দেয় না।
  */
 async function _fetchAndStoreReferencePrices() {
   const apiKey = process.env.EXCHANGE_RATE_API_KEY;
   if (!apiKey) {
-    console.warn('[market-reference] EXCHANGE_RATE_API_KEY নেই — startup fetch skip');
+    console.warn('[market-reference] EXCHANGE_RATE_API_KEY নেই — startup fetch skip (দৈনিক Firebase schedule এর উপর নির্ভর করবে)');
     return;
   }
   try {
@@ -927,6 +943,7 @@ async function _fetchAndStoreReferencePrices() {
     console.log(`[market-reference] startup fetch — ${count}/${Object.keys(_OTC_PAIR_MAP).length} pair Firestore এ লেখা হলো`);
   } catch (e) {
     console.error('[market-reference] startup fetch ব্যর্থ:', e.message);
+    // ব্যর্থ হলেও থেমে থাকব না — Index.js এর দৈনিক schedule পরে ঠিক করে দেবে
   }
 }
 
@@ -938,7 +955,7 @@ async function _getReferencePrice(id) {
     return (typeof p === 'number' && p > 0) ? p : null;
   } catch (e) {
     console.error(`[market-reference] ${id} পড়তে ব্যর্থ:`, e.message);
-    return null;
+    return null;   // ব্যর্থ হলে কিছুই বদলাবে না, market স্বাভাবিকভাবে চলবে
   }
 }
 
@@ -948,11 +965,13 @@ async function _getReferencePrice(id) {
  */
 async function _snapToReferenceIfNeeded(id, price) {
   const ref = await _getReferencePrice(id);
-  if (!ref) return price;
+  if (!ref) return price;   // reference নেই (crypto market, বা fetch ব্যর্থ) — অপরিবর্তিত
 
   const diff = Math.abs(price - ref) / ref;
-  if (diff <= REFERENCE_JUMP_THRESHOLD) return price;
+  if (diff <= REFERENCE_JUMP_THRESHOLD) return price;   // যথেষ্ট কাছেই আছে
 
+  // বড় ফারাক — এক candle এ জাম্প করে সংশোধন। wick টা পুরনো ও নতুন দাম
+  // দুটোই ধরে রাখে (high/low), তাই chart এ real history দেখা যায়।
   const now = Date.now();
   const candleTime = Math.floor(now / 1000 / 60) * 60;
   saveCandle(id, {
@@ -1087,11 +1106,15 @@ function tickOTC(id) {
     console.log(`[engine] ${id} — চালু (decimals: ${state._eng.decimals}${_MARKET_DECIMALS[id] ? ', table থেকে' : ', fallback দিয়ে'})`);
     // [REFERENCE ANCHOR] শুধু প্রথমবার engine তৈরি হওয়ার সময় Firestore
     // থেকে reference price পড়ি (প্রতি tick এ নয় — খরচ/গতি বাঁচাতে)।
+    // ব্যর্থ হলেও কিছু আটকাবে না (referencePrice: 0 = anchor নিষ্ক্রিয়,
+    // যেটা createState() এর নিরাপদ ডিফল্ট)।
     _getReferencePrice(id).then(ref => {
       if (ref && state._eng) state._eng.referencePrice = ref;
     }).catch(() => {});
-    state._refRefreshAt = Date.now() + 3600000;
+    state._refRefreshAt = Date.now() + 3600000;   // ১ ঘণ্টা পর হালকা refresh
   } else if (Date.now() >= (state._refRefreshAt || Infinity)) {
+    // পর্যায়ক্রমে refresh — Firebase এর দৈনিক আপডেট চলার সময় market
+    // দীর্ঘক্ষণ চলতে থাকলেও নতুন reference ধরতে পারে।
     state._refRefreshAt = Date.now() + 3600000;
     _getReferencePrice(id).then(ref => {
       if (ref && state._eng) state._eng.referencePrice = ref;
@@ -1124,9 +1147,14 @@ function _tickTail(id, state) {
     // trade.expiryTimestamp = candle close time (= next candle's open time), candleTime এ candle open time থাকে
     const closedCandleTime  = state.nextCandle / 1000;
     const closedCandleClose = state.price;
-    saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price });
+    // [DECIMALS SYNC] engine যে decimals ব্যবহার করছে (settlement এও যা
+    // ব্যবহার হয়) সেটাই candle data এর সাথে পাঠাই। আগে frontend নিজের
+    // magnitude-অনুমান দিয়ে decimals ঠিক করত, যা backend থেকে আলাদা হয়ে
+    // যেত (যেমন AUD/USD 0.7042 এ ছোট নড়াচড়া display এ হারিয়ে যেত)।
+    const _dec = state._eng ? state._eng.decimals : 5;   // [SAFETY] undefined RTDB write ব্যর্থ করে দেয়, তাই ৫ (আগের default) fallback
+    saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, decimals:_dec });
     // /live কে সাথে সাথে closed candle-এর final value দিয়ে আপডেট করো (null না) — client তাৎক্ষণিকভাবে সঠিক close পাবে
-    db.ref(`otc_candles/${id}/live`).set({ time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle }).catch(()=>{});
+    db.ref(`otc_candles/${id}/live`).set({ time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle, decimals:_dec }).catch(()=>{});
 
     // ── candle just closed — এই মুহূর্তের close price দিয়ে matching live trades settle করো ──
     // Synchronously mark — একই tick-এ _settleDueTradesFromMemory এই symbol skip করবে
@@ -1150,7 +1178,7 @@ function _tickTail(id, state) {
       state.nextCandle += CANDLE_MS;
     }
   } else {
-    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle });
+    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle, decimals: (state._eng ? state._eng.decimals : 5) });
   }
 
   for (const { label } of SUB_INTERVALS) {
@@ -1422,7 +1450,8 @@ async function main() {
   console.log('GoldVest Server starting (Admin SDK)...');
   // [MARKET REFERENCE] watchFirestoreMarkets() (যেটা initOTC ডাকে) এর
   // আগেই real price fetch করে ফেলি, যাতে market শুরু হওয়ার সময় সংশোধনের
-  // জন্য দরকারি ডেটা ইতিমধ্যে Firestore এ থাকে।
+  // জন্য দরকারি ডেটা ইতিমধ্যে Firestore এ থাকে — deploy করার সাথে সাথেই
+  // কাজ করে, দৈনিক schedule এর জন্য অপেক্ষা করতে হয় না।
   await _fetchAndStoreReferencePrices();
   watchFirestoreMarkets();
   await _recoverLiveTradesFromRTDB();
@@ -1600,7 +1629,8 @@ http.createServer(async (req, res) => {
         'status',          'live',
         'accountType',     'live',
         'expiryTimestamp', String(trade.expiryTimestamp || 0),
-        // [PRECISION FIX] settlement এর সময় ms-নির্ভুল দাম খুঁজতে
+        // [PRECISION FIX] settlement এর সময় ms-নির্ভুল দাম খুঁজতে —
+        // না থাকলে (পুরনো client) 0, তখন fallback সেকেন্ড-ভিত্তিক path
         'expiryTimestampMs', String(trade.expiryTimestampMs || 0),
         'currency',        trade.currency || 'USD',
       );
@@ -1618,7 +1648,8 @@ http.createServer(async (req, res) => {
         amount:      amount,
         feedType:    trade.feedType || '',
         entryPrice,   // [SECURITY] server এর দাম
-        // [PRECISION FIX] path key (সেকেন্ড) অপরিবর্তিত — data তে ms যোগ
+        // [PRECISION FIX] path key (সেকেন্ড) অপরিবর্তিত রাখা হলো — শুধু
+        // data এর ভেতরে ms-নির্ভুল expiry যোগ, settlement এ ব্যবহার হবে
         expiryTimestampMs: trade.expiryTimestampMs || 0,
       }).catch(e => console.error('[place-trade] RTDB queue failed:', e.message));
 
@@ -1628,7 +1659,7 @@ http.createServer(async (req, res) => {
         userId, tradeId,
         symbol:            trade.symbol || '',
         expiryTimestamp:   parseInt(trade.expiryTimestamp) || 0,
-        expiryTimestampMs: parseInt(trade.expiryTimestampMs) || 0,
+        expiryTimestampMs: parseInt(trade.expiryTimestampMs) || 0,   // [PRECISION FIX]
         accountType:       'live',
         status:            'live',
         type:              trade.type || '',
@@ -1636,9 +1667,14 @@ http.createServer(async (req, res) => {
       });
 
       // 6. Firestore trade save — background, non-blocking
+      // [DECIMALS SYNC] tradehistorymanager.js এ Open/Close/Difference
+      // এখন এই field ব্যবহার করবে (নিজের magnitude-অনুমান বাদ দিয়ে) —
+      // chartengine.js তে যেমন করা হয়েছিল, একই ধরনের সংশোধন।
+      const _tradeDecimals = _states[trade.symbol]?._eng?.decimals;
       firestore.collection('users').doc(userId).collection('trades').doc(tradeId).set({
         ...trade,
         entryPrice,   // [SECURITY] client এর মান override — server এর দামই নথিতে
+        decimals:   _tradeDecimals || 5,   // [DECIMALS SYNC] fallback ৫ — undefined Firestore write ব্যর্থ করে না, কিন্তু নিরাপত্তার জন্য সংখ্যা রাখা ভালো
         redisDeducted: true,   // [১.৩] Redis এ balance কাটা হয়েছে — settler TTL miss
                                // এ এটা দেখেই বুঝবে জিতলে credit দেওয়া নিরাপদ
         userId,
