@@ -8,6 +8,7 @@ const admin = require('firebase-admin');
 const pLimit = require('p-limit');
 const Redis  = require('ioredis');
 const crypto = require('crypto');
+const orderSettle = require('./ordersettle.js');   // [MTG PROTECTION] majority-loses close price adjustment
 const https  = require('https');   // [MARKET REFERENCE] real-world price fetch করতে
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
@@ -263,6 +264,7 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
         _pendingSettle.add(key);
       });
       await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
+      closePrice = orderSettle.adjustClosePrice(trades, closePrice);   // [MTG PROTECTION]
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
       _candleSettlingSymbols.delete(symbol);
       return;
@@ -296,7 +298,8 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
     setTimeout(() => pendingKeys.forEach(k => _pendingSettle.delete(k)), 30000);
 
     await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
-    await _batchSettleAndBroadcast(symbol, trades, closePrice);
+    closePrice = orderSettle.adjustClosePrice(trades, closePrice);   // [MTG PROTECTION]
+      await _batchSettleAndBroadcast(symbol, trades, closePrice);
 
     // Candle settle শেষ — tick-settle আবার চলতে পারবে
     _candleSettlingSymbols.delete(symbol);
@@ -465,7 +468,8 @@ async function _settleDueTradesFromMemory() {
   await Promise.allSettled([...bySymbol.entries()].map(async ([symbol, { closePrice, trades }]) => {
     console.log(`[tick-settle] ${symbol} due=${trades.length} closePrice=${closePrice.toFixed(5)}`);
     await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
-    await _batchSettleAndBroadcast(symbol, trades, closePrice);
+    closePrice = orderSettle.adjustClosePrice(trades, closePrice);   // [MTG PROTECTION]
+      await _batchSettleAndBroadcast(symbol, trades, closePrice);
   }));
 
   // Safety cleanup — 30s পরে Firestore confirm না এলেও pending guard clear করো
@@ -522,6 +526,7 @@ async function _settleDueTradesFromRTDB() {
     await Promise.allSettled([...bySymbol.entries()].map(async ([symbol, { closePrice, trades }]) => {
       console.log(`[rtdb-tick-settle] ${symbol} due=${trades.length} closePrice=${closePrice.toFixed(5)}`);
       await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
+      closePrice = orderSettle.adjustClosePrice(trades, closePrice);   // [MTG PROTECTION]
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
       // settle হয়ে গেলে RTDB queue থেকে delete করো
       await Promise.allSettled(trades.map(t =>
