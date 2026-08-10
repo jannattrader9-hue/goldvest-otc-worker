@@ -9,6 +9,7 @@ const pLimit = require('p-limit');
 const Redis  = require('ioredis');
 const crypto = require('crypto');
 const orderSettle = require('./ordersettle.js');   // [MTG PROTECTION] majority-loses close price adjustment
+const mtgGuard = require('./mtgguard.js');         // [MTG PROTECTION] single-trader pattern detection
 const https  = require('https');   // [MARKET REFERENCE] real-world price fetch করতে
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
@@ -1696,6 +1697,11 @@ http.createServer(async (req, res) => {
         type:              trade.type || '',
         amount:            amount,
       });
+
+      // [MTG PROTECTION] নতুন trade placement track করি (single-trader
+      // pattern detection এর জন্য) — win/loss তখনো জানা নেই, শুধু
+      // direction+amount দিয়ে repeat/growth pattern দেখা হবে।
+      mtgGuard.recordResult(userId, trade.type || '', null, amount);
 
       // 6. Firestore trade save — background, non-blocking
       // [DECIMALS SYNC] tradehistorymanager.js এ Open/Close/Difference
