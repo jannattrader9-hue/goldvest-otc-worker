@@ -175,9 +175,15 @@ function nextPrice(st, now = Date.now(), over) {
       st.retrLeft0 = st.retrFast ? (1 + ((Math.random() * 2) | 0))   // ঝট করে
                                  : (2 + ((Math.random() * 3) | 0));  // ধাপে ধাপে
       st.retrDone = 0;
-      // [NO FORCED RETRACE] শুধু ~৫০% সময় retrace হয় (mid-burst
-      // ট্রিগার হলেও), বাকি সময় সরাসরি নতুন burst বা rest এ যায়।
-      const _wantRetrace = Math.random() < 0.55;
+      // [MOVEMENT-DEPENDENT RETRACE] আগে fixed ৫৫% ছিল, তাই প্রতিটা
+      // burst এর পরে প্রায় একই ধরনের decision-structure দেখা যেত।
+      // এখন কতদূর movement হয়েছে (moved) আর কত excited state (st.excite)
+      // দুটোই মিলিয়ে probability ঠিক হয় — ছোট movement এ কম retrace
+      // (trend continue করার সম্ভাবনা বেশি), বড়/দ্রুত movement এ বেশি
+      // retrace (real market এর মতো "বেশি গেলে বেশি ফেরত" প্রবণতা)।
+      const _movedPct = Math.min(1, Math.abs(moved) / (st.price * 0.003));
+      const _retraceProb = 0.35 + _movedPct * 0.30 + st.excite * 0.15;
+      const _wantRetrace = Math.random() < _retraceProb;
       if (_wantRetrace && Math.abs(st.retrTarget) > 1e-12 && c.retr > 0) {
         st.phase = 'retrace';
         st.left = st.retrLeft0;
@@ -249,10 +255,21 @@ function nextPrice(st, now = Date.now(), over) {
   const sm = sessionMul(now, c.session);
   let delta;
 
-  // [VISIBLE PAUSE] hard-pause সক্রিয় থাকলে phase যাই হোক, delta
-  // জোর করে ০ — সম্পূর্ণ static, chart এ স্পষ্ট থেমে যাওয়া দেখাবে।
+  // [MICRO-MOVEMENT PAUSE] আগে hard-pause এ delta সম্পূর্ণ ০ ছিল —
+  // GPT এর observation অনুযায়ী এটা "artificial" লাগতে পারে, real
+  // market এ pause মানে সবসময় absolute zero না, মাঝে মাঝে খুবই ছোট
+  // (sub-pip) নড়াচড়া থাকে। তাই এখন ৭৫% সময় সত্যিই static (visible
+  // pause বজায় থাকে), কিন্তু ২৫% সময় এক pip এর সামান্য কম একটা
+  // micro-tick হয় — pause এর "থেমে যাওয়া" ভাব অক্ষত থাকে কিন্তু
+  // সম্পূর্ণ frozen লাগে না।
   if (st.hardPauseUntil && now < st.hardPauseUntil) {
-    st.price = Number(st.price.toFixed(st.decimals));
+    if (Math.random() < 0.25) {
+      const _pip = Math.pow(10, -st.decimals);
+      const _micro = (Math.random() < 0.5 ? 1 : -1) * _pip * 1.0;
+      st.price = Number((st.price + _micro).toFixed(st.decimals));
+    } else {
+      st.price = Number(st.price.toFixed(st.decimals));
+    }
     return st.price;
   }
 
@@ -302,23 +319,16 @@ function nextPrice(st, now = Date.now(), over) {
     if (_r < 0.25)      mag = 0.05 + Math.random() * 0.25;                  // প্রায়-flat
     else if (_r < 0.85) mag = 0.3 + Math.pow(Math.random(), -0.35) * 0.6;   // সাধারণ
     else                mag = 1.5 + Math.pow(Math.random(), -0.5) * 2;      // বড় লাফ
-    // [IMPULSE-PULLBACK] আগে শুধু random probability (৪২%) দিয়ে
-    // micro-reverse হত — এতে মাঝে মাঝে টানা অনেকগুলো tick একই দিকে
-    // চলে যেত (streak), সেটাই "ঢেউ এর মতো গড়িয়ে যাওয়া" ভাব দিত।
-    // এখন structured: মূল দিকে টানা ৩-৪টা tick যাওয়ার পর পরের
-    // tick জোর করে বিপরীত দিকে (pullback) — ঠিক real-market এর
-    // "impulse-then-pullback" প্যাটার্নের মতো। এরপর counter reset।
-    let _microDir;
-    if (st.impulseCount >= 3 + ((Math.random()*2)|0)) {   // ৩-৪ tick পরপর
-      _microDir = -st.dir;
-      st.impulseCount = 0;
-    } else {
-      // এই তিন-চারটার মধ্যেও সামান্য (২৫%) এলোমেলো reverse থাকবে,
-      // যাতে pattern পুরোপুরি fixed/predictable না হয়ে যায়।
-      _microDir = (Math.random() < 0.25) ? -st.dir : st.dir;
-      if (_microDir === st.dir) st.impulseCount++;
-      else st.impulseCount = 0;
-    }
+    // [MOMENTUM-DEPENDENT REVERSE] আগে দুই ধাপে ছিল — fixed ৪২% random,
+    // তারপর ৩-৪ tick পর জোর করে reverse। দুটোই hard-coded sequence
+    // তৈরি করছিল, real market এর মতো "emergent" লাগছিল না। এখন
+    // reverse probability সরাসরি excite (momentum/উত্তেজনা) এর সাথে
+    // যুক্ত — শান্ত অবস্থায় কম reverse (persistent direction),
+    // উত্তেজিত/volatile অবস্থায় বেশি reverse (choppy) — কোনো fixed
+    // trigger-count নেই, প্রতিটা tick এর সিদ্ধান্ত independent কিন্তু
+    // context-aware।
+    const _reverseProb = 0.12 + st.excite * 0.18 + Math.random() * 0.10;
+    const _microDir = (Math.random() < _reverseProb) ? -st.dir : st.dir;
     delta = _microDir * base * Math.min(8, mag) * st.vol * sm;
     // [MIN-PIP GUARD] বড়-magnitude দামে (যেমন ১৪০০+, যেখানে ২ দশমিক
     // ঘর হয়) base/pip অনুপাত ছোট হয়ে যেত, তাই "প্রায়-flat" tick round
@@ -331,8 +341,9 @@ function nextPrice(st, now = Date.now(), over) {
     }
   }
 
-  /* ── ৫. ভারী লেজ ── */
-  if (Math.random() * 100 < c.jump) {
+  /* ── ৫. ভারী লেজ — শুধু active movement (run/retrace) এ, rest/
+     hard-pause এ প্রযোজ্য না (ওখানে আলাদাভাবে handle হয়) ── */
+  if (st.phase !== 'rest' && Math.random() * 100 < c.jump) {
     const mag = base * (4 + Math.pow(Math.random(), -0.5) * 3) * st.vol;
     delta += (Math.random() < 0.5 ? 1 : -1) * mag;
     st.excite = Math.min(1, st.excite + 0.7);
