@@ -33,16 +33,16 @@ const num = (v, d) => (v === undefined || v === '' || isNaN(+v) ? d : +v);
 
 /* পরীক্ষার পাতার স্লাইডারের মান — হুবহু একই */
 const CFG = {
-  unit:    num(process.env.ENG_UNIT,     0.000030),  // base একক (দামের অনুপাতে)
+  unit:    num(process.env.ENG_UNIT,     0.000018),  // base একক (দামের অনুপাতে)
   volMem:  num(process.env.ENG_VOL_MEM,  0.994),    // অস্থিরতার স্মৃতি
   volAmp:  num(process.env.ENG_VOL_AMP,  0.28),     // ওঠানামার মাত্রা
-  runLen:  num(process.env.ENG_RUN_LEN,  3),        // ঝলকের গড় tick
+  runLen:  num(process.env.ENG_RUN_LEN,  8),        // ঝলকের গড় tick
   restLen: num(process.env.ENG_REST_LEN, 5),        // শ্বাসের গড় tick
   clust:   num(process.env.ENG_CLUST,    0.45),     // ঝলক গুচ্ছ হওয়া
   retr:    num(process.env.ENG_RETR,     0.40),     // ফিরতি টান
   jump:    num(process.env.ENG_JUMP,     1.8),      // হঠাৎ বড় লাফ %
   spread:  num(process.env.ENG_SPREAD,   1.0),      // bid-ask কাঁপুনি
-  gapMs:   num(process.env.ENG_GAP_MS,   1200),      // গড় tick ব্যবধান
+  gapMs:   num(process.env.ENG_GAP_MS,   500),      // গড় tick ব্যবধান
   spdVar:  num(process.env.ENG_SPD_VAR,  0.72),     // গতির তারতম্য
   bias:    num(process.env.ENG_BIAS,     0.008),     // trend পক্ষপাত
   session: num(process.env.ENG_SESSION,  0.55),     // দিনের ছন্দ
@@ -200,7 +200,14 @@ function nextPrice(st, now = Date.now(), over) {
         // এর পরেই একটা করে। তাই এটা rare event না, বরং প্রতিটা rest
         // এই এখন সময়-ভিত্তিক duration সেট হয় (নিচে nextPrice এ
         // hardPauseUntil ব্যবহার হয়)।
-        st.hardPauseUntil = now + (550 + Math.random() * 1000);
+        // [FIX] আগে প্রতিটা rest এই unconditionally hard-pause হত —
+        // GPT observation অনুযায়ী chart এ "প্রাণ কমে যাওয়ার" মতো
+        // ঘন ঘন freeze দেখাচ্ছিল। এখন শুধু ~৪৫% rest এ visible pause,
+        // duration ও কমানো (৩০০-৯০০ms), বাকি সময় rest এ থাকলেও
+        // engine স্বাভাবিক ছোট movement চালিয়ে যাবে।
+        if (Math.random() < 0.45) {
+          st.hardPauseUntil = now + (300 + Math.random() * 600);
+        }
       }
     } else if (st.phase === 'retrace') {
       // [NO FIXED SEQUENCE] আগে retrace শেষে সবসময় rest হত (১০০%) —
@@ -212,7 +219,14 @@ function nextPrice(st, now = Date.now(), over) {
         st.phase = 'rest';
         st.left = 1 + ((Math.random() * (rest + 1)) | 0);
         // [QUOTEX RHYTHM] এখানেও একই — প্রতিটা rest এই duration সেট
-        st.hardPauseUntil = now + (550 + Math.random() * 1000);
+        // [FIX] আগে প্রতিটা rest এই unconditionally hard-pause হত —
+        // GPT observation অনুযায়ী chart এ "প্রাণ কমে যাওয়ার" মতো
+        // ঘন ঘন freeze দেখাচ্ছিল। এখন শুধু ~৪৫% rest এ visible pause,
+        // duration ও কমানো (৩০০-৯০০ms), বাকি সময় rest এ থাকলেও
+        // engine স্বাভাবিক ছোট movement চালিয়ে যাবে।
+        if (Math.random() < 0.45) {
+          st.hardPauseUntil = now + (300 + Math.random() * 600);
+        }
       } else {
         st.phase = 'run';
         const u = Math.random();
