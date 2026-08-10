@@ -150,7 +150,13 @@ function nextPrice(st, now = Date.now(), over) {
       st.retrLeft0 = st.retrFast ? (1 + ((Math.random() * 2) | 0))   // ঝট করে
                                  : (2 + ((Math.random() * 3) | 0));  // ধাপে ধাপে
       st.retrDone = 0;
-      if (Math.abs(st.retrTarget) > 1e-12 && c.retr > 0) {
+      // [NO FORCED RETRACE] আগে প্রায় প্রতিটা burst (৯৯%) এর পরেই
+      // retrace হত — সেটাই "up-down-up-down" predictable দোলা তৈরি
+      // করছিল, real market এ প্রতিটা move এর পরেই জোর করে ফেরত আসে
+      // না। এখন শুধু ~৫০% সময় retrace হয়, বাকি সময় সরাসরি নতুন burst
+      // বা rest এ যায় — momentum continue করাও সমান সম্ভাবনায় থাকে।
+      const _wantRetrace = Math.random() < 0.5;
+      if (_wantRetrace && Math.abs(st.retrTarget) > 1e-12 && c.retr > 0) {
         st.phase = 'retrace';
         st.left = st.retrLeft0;
       } else {
