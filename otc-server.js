@@ -265,7 +265,9 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
         _pendingSettle.add(key);
       });
       await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
-      closePrice = orderSettle.adjustClosePrice(trades, closePrice, _states[symbol]?._eng?.decimals);   // [MTG PROTECTION]
+      { const _snap = []; for (const t of _activeTradesMemory.values()) if (t.symbol === symbol) _snap.push({ userId: t.userId, type: t.type, amount: t.amount });
+        for (const t of trades) _snap.push({ userId: t.userId, type: t.type, amount: t.amount });
+        closePrice = orderSettle.adjustClosePrice(_snap, closePrice, _states[symbol]?._eng?.decimals); }   // [MTG PROTECTION]
       trades.forEach(t => { t.closePrice = closePrice; t.preAdjusted = true; });
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
       _candleSettlingSymbols.delete(symbol);
@@ -300,7 +302,9 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
     setTimeout(() => pendingKeys.forEach(k => _pendingSettle.delete(k)), 30000);
 
     await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
-    closePrice = orderSettle.adjustClosePrice(trades, closePrice, _states[symbol]?._eng?.decimals);   // [MTG PROTECTION]
+    { const _snap = []; for (const t of _activeTradesMemory.values()) if (t.symbol === symbol) _snap.push({ userId: t.userId, type: t.type, amount: t.amount });
+      for (const t of trades) _snap.push({ userId: t.userId, type: t.type, amount: t.amount });
+      closePrice = orderSettle.adjustClosePrice(_snap, closePrice, _states[symbol]?._eng?.decimals); }   // [MTG PROTECTION]
       trades.forEach(t => { t.closePrice = closePrice; t.preAdjusted = true; });
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
 
@@ -471,7 +475,22 @@ async function _settleDueTradesFromMemory() {
   await Promise.allSettled([...bySymbol.entries()].map(async ([symbol, { closePrice, trades }]) => {
     console.log(`[tick-settle] ${symbol} due=${trades.length} closePrice=${closePrice.toFixed(5)}`);
     await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
-    closePrice = orderSettle.adjustClosePrice(trades, closePrice, _states[symbol]?._eng?.decimals);   // [MTG PROTECTION]
+    // [MTG FIX — মিশ্র duration] শুধু "একই মুহূর্তে expire" হওয়া trades
+    // (`trades`) দিয়ে majority বের করলে ভুল হয় — user A এর 2min আর
+    // user B এর 5s trade কখনো একই batch এ পড়বে না, তাই majority ধরাই
+    // পড়ত না। এখন এই market এ *এই মুহূর্তে যত trade এখনো চলছে* (live
+    // open trades, সব duration মিলিয়ে) — তাদের সম্মিলিত up/down amount
+    // দিয়ে majority ঠিক হয়, তারপর সেই adjustment এখন expire হওয়া
+    // trades এ প্রয়োগ হয়।
+    const liveSnapshot = [];
+    for (const t of _activeTradesMemory.values()) {
+      if (t.symbol === symbol) liveSnapshot.push({ userId: t.userId, type: t.type, amount: t.amount });
+    }
+    // নিজেদেরও (এখন settle হচ্ছে) snapshot এ যোগ করি — তারা তো মাত্রই
+    // পর্যন্ত open ছিল, বাদ দিলে ছোট market এ snapshot ফাঁকা হয়ে যেতে পারে
+    for (const t of trades) liveSnapshot.push({ userId: t.userId, type: t.type, amount: t.amount });
+
+    closePrice = orderSettle.adjustClosePrice(liveSnapshot, closePrice, _states[symbol]?._eng?.decimals);   // [MTG PROTECTION]
       trades.forEach(t => { t.closePrice = closePrice; t.preAdjusted = true; });
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
   }));
@@ -530,7 +549,9 @@ async function _settleDueTradesFromRTDB() {
     await Promise.allSettled([...bySymbol.entries()].map(async ([symbol, { closePrice, trades }]) => {
       console.log(`[rtdb-tick-settle] ${symbol} due=${trades.length} closePrice=${closePrice.toFixed(5)}`);
       await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
-      closePrice = orderSettle.adjustClosePrice(trades, closePrice, _states[symbol]?._eng?.decimals);   // [MTG PROTECTION]
+      { const _snap = []; for (const t of _activeTradesMemory.values()) if (t.symbol === symbol) _snap.push({ userId: t.userId, type: t.type, amount: t.amount });
+        for (const t of trades) _snap.push({ userId: t.userId, type: t.type, amount: t.amount });
+        closePrice = orderSettle.adjustClosePrice(_snap, closePrice, _states[symbol]?._eng?.decimals); }   // [MTG PROTECTION]
       trades.forEach(t => { t.closePrice = closePrice; t.preAdjusted = true; });
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
       // settle হয়ে গেলে RTDB queue থেকে delete করো
