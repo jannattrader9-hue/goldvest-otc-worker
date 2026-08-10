@@ -179,18 +179,39 @@ function nextPrice(st, now = Date.now(), over) {
         st.left = 1 + ((Math.random() * (rest + 1)) | 0);
       }
     } else if (st.phase === 'retrace') {
-      const rest = Math.max(0, c.restLen * (1 - st.excite * c.clust));
-      st.phase = 'rest';
-      st.left = 1 + ((Math.random() * (rest + 1)) | 0);
+      // [NO FIXED SEQUENCE] আগে retrace শেষে সবসময় rest হত (১০০%) —
+      // এটাও একটা predictable rhythm ছিল: "retrace থামলেই দাম থমকে
+      // যাবে"। এখন ~৬৫% সময় rest, বাকি ~৩৫% সময় সরাসরি নতুন burst
+      // শুরু হয় (কোনো বিরতি ছাড়াই) — sequence টাই আর নিশ্চিত থাকে না।
+      if (Math.random() < 0.65) {
+        const rest = Math.max(0, c.restLen * (1 - st.excite * c.clust));
+        st.phase = 'rest';
+        st.left = 1 + ((Math.random() * (rest + 1)) | 0);
+      } else {
+        st.phase = 'run';
+        const u = Math.random();
+        st.left = Math.max(2, Math.round(c.runLen * Math.pow(u, -0.45) * 0.6));
+        const b2 = c.forceDir ? c.forceDir * (0.10 + c.trendStrength * 0.22)
+                              : st.regimeDir * c.bias;
+        st.dir = Math.random() < 0.5 + b2 ? 1 : -1;
+        st.runStart = st.price;
+      }
     } else if (st.phase === 'rest') {
       // [NO WAVE] 'step' পর্ব (দিকহীন কাঁপুনি) বাদ — ওটাই ঢেউয়ের ভাব
       // দিত। শ্বাসের পর সরাসরি নতুন ঝলক।
-      st.phase = 'run';
-      st.left = 2 + ((Math.random() * 5) | 0);
-      const b1 = c.forceDir ? c.forceDir * (0.10 + c.trendStrength * 0.22)
-                            : st.regimeDir * c.bias;
-      st.dir = Math.random() < 0.5 + b1 ? 1 : -1;
-      st.runStart = st.price;
+      // [NO FIXED SEQUENCE] rest শেষে আগে সবসময় (১০০%) সরাসরি run
+      // হত। এখন ~৮৫% সময় run, বাকি ~১৫% সময় rest নিজেই আরেকটু বাড়ে
+      // (আরেকটা ছোট বিরতি) — শ্বাসের দৈর্ঘ্যও অনির্দিষ্ট থাকে।
+      if (Math.random() < 0.92) {
+        st.phase = 'run';
+        st.left = 2 + ((Math.random() * 5) | 0);
+        const b1 = c.forceDir ? c.forceDir * (0.10 + c.trendStrength * 0.22)
+                              : st.regimeDir * c.bias;
+        st.dir = Math.random() < 0.5 + b1 ? 1 : -1;
+        st.runStart = st.price;
+      } else {
+        st.left = 1 + ((Math.random() * 3) | 0);   // rest এ আরেকটু থাকা
+      }
     } else {
       st.phase = 'run';
       // দৈর্ঘ্য heavy-tail — বেশিরভাগ ছোট, কদাচিৎ অনেক লম্বা
