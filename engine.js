@@ -106,6 +106,7 @@ function createState(price, decimals = 5) {
     regimeDir: Math.random() < 0.5 ? 1 : -1,
     regimeLeft: 200 + ((Math.random() * 500) | 0),
     hardPauseUntil: 0,   // [VISIBLE PAUSE] এই timestamp পর্যন্ত সম্পূর্ণ static থাকবে
+    impulseCount: 0,      // [IMPULSE-PULLBACK] burst এর মূল দিকে টানা কতগুলো tick গেছে
   };
 }
 
@@ -300,14 +301,23 @@ function nextPrice(st, now = Date.now(), over) {
     if (_r < 0.25)      mag = 0.05 + Math.random() * 0.25;                  // প্রায়-flat
     else if (_r < 0.85) mag = 0.3 + Math.pow(Math.random(), -0.35) * 0.6;   // সাধারণ
     else                mag = 1.5 + Math.pow(Math.random(), -0.5) * 2;      // বড় লাফ
-    // [MICRO-DIRECTION] burst এর মূল দিক (st.dir) ঠিক থাকে, কিন্তু
-    // প্রতিটা tick একই দিকে গেলে (glide) সেটাই "ঢেউ এর মতো গড়িয়ে
-    // যাওয়া" ভাব দিচ্ছিল — real market এ প্রতিটা tick নিজে একটা
-    // আলাদা সিদ্ধান্ত, একঘেয়ে continuation না। তাই ~১৮% tick এ
-    // সামান্য বিপরীত micro-movement — overall trend/burst-এর গড়
-    // দিক অক্ষত থাকে (ছোট ও বিরল বলে), কিন্তু tick-to-tick pattern
-    // নয়েজি/discrete লাগে, glide লাগে না।
-    const _microDir = (Math.random() < 0.42) ? -st.dir : st.dir;
+    // [IMPULSE-PULLBACK] আগে শুধু random probability (৪২%) দিয়ে
+    // micro-reverse হত — এতে মাঝে মাঝে টানা অনেকগুলো tick একই দিকে
+    // চলে যেত (streak), সেটাই "ঢেউ এর মতো গড়িয়ে যাওয়া" ভাব দিত।
+    // এখন structured: মূল দিকে টানা ৩-৪টা tick যাওয়ার পর পরের
+    // tick জোর করে বিপরীত দিকে (pullback) — ঠিক real-market এর
+    // "impulse-then-pullback" প্যাটার্নের মতো। এরপর counter reset।
+    let _microDir;
+    if (st.impulseCount >= 3 + ((Math.random()*2)|0)) {   // ৩-৪ tick পরপর
+      _microDir = -st.dir;
+      st.impulseCount = 0;
+    } else {
+      // এই তিন-চারটার মধ্যেও সামান্য (২৫%) এলোমেলো reverse থাকবে,
+      // যাতে pattern পুরোপুরি fixed/predictable না হয়ে যায়।
+      _microDir = (Math.random() < 0.25) ? -st.dir : st.dir;
+      if (_microDir === st.dir) st.impulseCount++;
+      else st.impulseCount = 0;
+    }
     delta = _microDir * base * Math.min(8, mag) * st.vol * sm;
     // [MIN-PIP GUARD] বড়-magnitude দামে (যেমন ১৪০০+, যেখানে ২ দশমিক
     // ঘর হয়) base/pip অনুপাত ছোট হয়ে যেত, তাই "প্রায়-flat" tick round
