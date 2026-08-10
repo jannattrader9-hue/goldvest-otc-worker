@@ -230,15 +230,25 @@ function nextPrice(st, now = Date.now(), over) {
   let delta;
 
   if (st.phase === 'retrace') {
-    // প্রতিটা পা আলাদা মাপের (ঝলকের মতোই ভারী-লেজ), কিন্তু মোট ফেরত
-    // লক্ষ্য ছাড়ায় না — শেষ পায়ে বাকিটুকু মিটিয়ে দেয়।
+    // [NO GLIDE] আগে remain/st.left দিয়ে target এর দিকে সমানভাবে
+    // ভাগ হয়ে এগোত — এটাই predictable "গড়িয়ে ফিরে আসা" (glide)
+    // ভাব দিত, কারণ প্রতিটা tick নিশ্চিতভাবে target এর কাছাকাছি
+    // যেত। এখন run phase এর মতোই independent heavy-tail tick —
+    // শুধু দিক retrTarget এর দিকে, মাপ প্রতিবার নতুন এলোমেলো।
+    // শেষ পায়ে বাকিটুকু মিটিয়ে দেয়, যাতে target ঠিক মতো পৌঁছায়।
     const remain = st.retrTarget - (st.retrDone || 0);
-    if (st.left <= 1) {
+    if (st.left <= 1 || Math.sign(remain) === 0) {
       delta = remain;                                    // শেষ পা — বাকিটুকু
     } else {
-      const share = remain / st.left;
-      const mag = 0.45 + Math.pow(Math.random(), -0.42) * 0.75;
-      delta = share * Math.min(3.2, mag);
+      const retrDir = Math.sign(st.retrTarget);
+      const _r = Math.random();
+      let mag;
+      if (_r < 0.25)      mag = 0.05 + Math.random() * 0.25;
+      else if (_r < 0.85) mag = 0.3 + Math.pow(Math.random(), -0.35) * 0.6;
+      else                mag = 1.5 + Math.pow(Math.random(), -0.5) * 2;
+      // [MICRO-DIRECTION] এখানেও মাঝে মাঝে সামান্য বিপরীত micro-tick
+      const microDir = (Math.random() < 0.18) ? -retrDir : retrDir;
+      delta = microDir * base * Math.min(4, mag) * st.vol;
       // লক্ষ্য পেরিয়ে গেলে থামি
       if (Math.abs((st.retrDone || 0) + delta) > Math.abs(st.retrTarget)) delta = remain;
     }
