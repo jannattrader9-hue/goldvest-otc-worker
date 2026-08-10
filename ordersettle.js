@@ -34,10 +34,11 @@
 const num = (v, d) => (v === undefined || v === '' || isNaN(+v) ? d : +v);
 
 const CFG = {
-  // push এর সর্বোচ্চ মাত্রা — দামের কত শতাংশ পর্যন্ত সরানো যাবে।
-  // engine.js এর maxStep (০.১৫%/tick) এর কাছাকাছি রাখা হয়েছে, যাতে
-  // এক ধাক্কায় এটা একটা normal tick এর চেয়ে বড় না লাগে।
-  maxPush:     num(process.env.ORDER_MAX_PUSH,     0.0012),
+  // push এর সর্বোচ্চ মাত্রা — এখন ২-৬ pip এর মধ্যে বাঁধা (নিচে
+  // adjustClosePrice এ decimals থেকে pip হিসাব করে সীমা বসানো হয়)।
+  // আগে % ভিত্তিক ছিল, তাতে বড় দামের market এ (USD/COP) ২০০+ pip
+  // পর্যন্ত push হয়ে যেত — অস্বাভাবিক বড় candle তৈরি হতো।
+  maxPushPips: num(process.env.ORDER_MAX_PUSH_PIPS, 6),
   // কমপক্ষে কতজন আলাদা user থাকলে এই logic সক্রিয় হবে — single-trader
   // market এ ন্যায্য (৫০-৫০) থাকতে এটা ২ রাখা হয়েছে।
   minTraders:  num(process.env.ORDER_MIN_TRADERS,  2),
@@ -54,7 +55,7 @@ const CFG = {
  * @param {number} closePrice  engine থেকে আসা মূল close price
  * @returns {number}           সমন্বিত close price (imbalance না থাকলে অপরিবর্তিত)
  */
-function adjustClosePrice(trades, closePrice) {
+function adjustClosePrice(trades, closePrice, decimals) {
   if (!Array.isArray(trades) || trades.length === 0) return closePrice;
   if (!closePrice || !isFinite(closePrice) || closePrice <= 0) return closePrice;
 
@@ -76,11 +77,14 @@ function adjustClosePrice(trades, closePrice) {
   const imbalance = (upAmt - downAmt) / total;
   if (Math.abs(imbalance) < 0.02) return closePrice;   // প্রায় সমান — push দরকার নেই
 
-  // majority যদি 'up' হয় (imbalance ধনাত্মক), তাদের হারাতে close price
-  // নিচে ঠেলে দিই (নেতিবাচক push) — আর উল্টোটা।
-  const pushMag = Math.min(CFG.maxPush, Math.abs(imbalance) * CFG.sensitivity * CFG.maxPush);
+  // [PIP-BASED CAP] push এখন সরাসরি pip সংখ্যায় বাঁধা (২-৬ pip), % না —
+  // তাই USD/COP এর মত বড়-দামের market এও candle অস্বাভাবিক বড় হয় না।
+  const dec = (typeof decimals === 'number' && decimals > 0) ? decimals : 5;
+  const pip = Math.pow(10, -dec);
+  const pushPips = Math.min(CFG.maxPushPips, Math.abs(imbalance) * CFG.sensitivity * CFG.maxPushPips);
   const direction = imbalance > 0 ? -1 : 1;   // majority 'up' → নিচে ঠেলা
-  const delta = closePrice * pushMag * direction;
+
+  const delta = pip * pushPips * direction;
 
   return closePrice + delta;
 }
