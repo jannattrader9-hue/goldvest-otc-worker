@@ -309,6 +309,15 @@ function nextPrice(st, now = Date.now(), over) {
     // নয়েজি/discrete লাগে, glide লাগে না।
     const _microDir = (Math.random() < 0.42) ? -st.dir : st.dir;
     delta = _microDir * base * Math.min(8, mag) * st.vol * sm;
+    // [MIN-PIP GUARD] বড়-magnitude দামে (যেমন ১৪০০+, যেখানে ২ দশমিক
+    // ঘর হয়) base/pip অনুপাত ছোট হয়ে যেত, তাই "প্রায়-flat" tick round
+    // হয়ে প্রায়ই ০-১ pip এ নেমে আসত — সেটাই "1417.35 ↔ 1417.34" এর
+    // মতো অর্থহীন দোলা তৈরি করছিল। ন্যূনতম ২ pip নিশ্চিত করা হলো,
+    // যাতে প্রতিটা visible movement অন্তত সামান্য অর্থবহ হয়।
+    const _minPip = Math.pow(10, -st.decimals) * 2;
+    if (delta !== 0 && Math.abs(delta) < _minPip) {
+      delta = Math.sign(delta) * _minPip;
+    }
   }
 
   /* ── ৫. ভারী লেজ ── */
