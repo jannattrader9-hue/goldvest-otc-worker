@@ -265,7 +265,7 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
         _pendingSettle.add(key);
       });
       await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
-      closePrice = orderSettle.adjustClosePrice(trades, closePrice);   // [MTG PROTECTION]
+      closePrice = orderSettle.adjustClosePrice(trades, closePrice, _states[symbol]?._eng?.decimals);   // [MTG PROTECTION]
       trades.forEach(t => { t.closePrice = closePrice; t.preAdjusted = true; });
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
       _candleSettlingSymbols.delete(symbol);
@@ -300,7 +300,7 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
     setTimeout(() => pendingKeys.forEach(k => _pendingSettle.delete(k)), 30000);
 
     await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
-    closePrice = orderSettle.adjustClosePrice(trades, closePrice);   // [MTG PROTECTION]
+    closePrice = orderSettle.adjustClosePrice(trades, closePrice, _states[symbol]?._eng?.decimals);   // [MTG PROTECTION]
       trades.forEach(t => { t.closePrice = closePrice; t.preAdjusted = true; });
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
 
@@ -471,7 +471,7 @@ async function _settleDueTradesFromMemory() {
   await Promise.allSettled([...bySymbol.entries()].map(async ([symbol, { closePrice, trades }]) => {
     console.log(`[tick-settle] ${symbol} due=${trades.length} closePrice=${closePrice.toFixed(5)}`);
     await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
-    closePrice = orderSettle.adjustClosePrice(trades, closePrice);   // [MTG PROTECTION]
+    closePrice = orderSettle.adjustClosePrice(trades, closePrice, _states[symbol]?._eng?.decimals);   // [MTG PROTECTION]
       trades.forEach(t => { t.closePrice = closePrice; t.preAdjusted = true; });
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
   }));
@@ -530,7 +530,7 @@ async function _settleDueTradesFromRTDB() {
     await Promise.allSettled([...bySymbol.entries()].map(async ([symbol, { closePrice, trades }]) => {
       console.log(`[rtdb-tick-settle] ${symbol} due=${trades.length} closePrice=${closePrice.toFixed(5)}`);
       await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
-      closePrice = orderSettle.adjustClosePrice(trades, closePrice);   // [MTG PROTECTION]
+      closePrice = orderSettle.adjustClosePrice(trades, closePrice, _states[symbol]?._eng?.decimals);   // [MTG PROTECTION]
       trades.forEach(t => { t.closePrice = closePrice; t.preAdjusted = true; });
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
       // settle হয়ে গেলে RTDB queue থেকে delete করো
