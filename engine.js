@@ -33,10 +33,10 @@ const num = (v, d) => (v === undefined || v === '' || isNaN(+v) ? d : +v);
 
 /* পরীক্ষার পাতার স্লাইডারের মান — হুবহু একই */
 const CFG = {
-  unit:    num(process.env.ENG_UNIT,     0.0000075),  // base একক (দামের অনুপাতে)
+  unit:    num(process.env.ENG_UNIT,     0.000020),  // base একক (দামের অনুপাতে)
   volMem:  num(process.env.ENG_VOL_MEM,  0.994),    // অস্থিরতার স্মৃতি
   volAmp:  num(process.env.ENG_VOL_AMP,  0.28),     // ওঠানামার মাত্রা
-  runLen:  num(process.env.ENG_RUN_LEN,  6),        // ঝলকের গড় tick
+  runLen:  num(process.env.ENG_RUN_LEN,  3),        // ঝলকের গড় tick
   restLen: num(process.env.ENG_REST_LEN, 5),        // শ্বাসের গড় tick
   clust:   num(process.env.ENG_CLUST,    0.45),     // ঝলক গুচ্ছ হওয়া
   retr:    num(process.env.ENG_RETR,     0.40),     // ফিরতি টান
@@ -148,10 +148,19 @@ function nextPrice(st, now = Date.now(), over) {
   if (st.phase === 'run' && st.left > 1) {
     // প্রতি tick এ ছোট সম্ভাবনা — গড়ে burst এর কোনো এক এলোমেলো
     // মুহূর্তে ট্রিগার হবে, শেষের অপেক্ষা না করেই।
-    if (Math.random() < 0.09) _midBurstRetrace = true;
+    if (Math.random() < 0.04) _midBurstRetrace = true;
   }
 
-  if (_midBurstRetrace || --st.left <= 0) {
+  // [PAUSE TIMER FIX] rest phase এ আগে st.left (tick-count) আর
+  // hardPauseUntil (time) — দুটো independent countdown একসাথে চলত।
+  // st.left অনেক দ্রুত (মাত্র ১-৬ tick) ফুরিয়ে যেত, তাই আসল pause
+  // duration (০.৮-৪s) শেষ হওয়ার অনেক আগেই নতুন phase এ চলে যেত।
+  // এখন rest এ থাকাকালীন phase বদল শুধু hardPauseUntil সময় শেষ
+  // হলেই হবে, st.left কে বাধ্যতামূলক না রেখে।
+  const _restDone = st.phase === 'rest' && (!st.hardPauseUntil || now >= st.hardPauseUntil);
+  const _shouldTransition = st.phase === 'rest' ? _restDone : (_midBurstRetrace || --st.left <= 0);
+
+  if (_shouldTransition) {
     if (st.phase === 'run') {
       st.excite = Math.min(1, st.excite + 0.55);
       // ফিরতি টান — ঝলকে যতটা গেছে তার একাংশ ফেরত
@@ -178,28 +187,24 @@ function nextPrice(st, now = Date.now(), over) {
         const rest = Math.max(0, c.restLen * (1 - st.excite * c.clust));
         st.phase = 'rest';
         st.left = 1 + ((Math.random() * (rest + 1)) | 0);
-        // [VISIBLE PAUSE] real market এ মাঝে মাঝে দাম একদম সম্পূর্ণ
-        // থেমে যায় (১-২.৫s), এত স্পষ্টভাবে যে চোখে "থেমে গেছে" ধরা
-        // পড়ে — আগের rest (মিডিয়ান ~২৫০ms) এত ছোট যে সেটা চোখে পড়ার
-        // মতো না। ~৩% সময় (rare, কদাচিৎ) একটা সত্যিকারের দীর্ঘ,
-        // সম্পূর্ণ-static বিরতি যোগ হয়।
-        if (Math.random() < 0.01) {
-          st.hardPauseUntil = now + (1000 + Math.random() * 1500);
-        }
+        // [QUOTEX RHYTHM] Quotex এ প্রতি 1m candle এ ৩০-৪০ বার সম্পূর্ণ
+        // static pause দেখা যায় (০.৮-৪s প্রতিটা) — প্রায় প্রতিটা burst
+        // এর পরেই একটা করে। তাই এটা rare event না, বরং প্রতিটা rest
+        // এই এখন সময়-ভিত্তিক duration সেট হয় (নিচে nextPrice এ
+        // hardPauseUntil ব্যবহার হয়)।
+        st.hardPauseUntil = now + (550 + Math.random() * 1000);
       }
     } else if (st.phase === 'retrace') {
       // [NO FIXED SEQUENCE] আগে retrace শেষে সবসময় rest হত (১০০%) —
       // এটাও একটা predictable rhythm ছিল: "retrace থামলেই দাম থমকে
       // যাবে"। এখন ~৬৫% সময় rest, বাকি ~৩৫% সময় সরাসরি নতুন burst
       // শুরু হয় (কোনো বিরতি ছাড়াই) — sequence টাই আর নিশ্চিত থাকে না।
-      if (Math.random() < 0.65) {
+      if (Math.random() < 0.40) {
         const rest = Math.max(0, c.restLen * (1 - st.excite * c.clust));
         st.phase = 'rest';
         st.left = 1 + ((Math.random() * (rest + 1)) | 0);
-        // [VISIBLE PAUSE] এখানেও একই সুযোগ
-        if (Math.random() < 0.01) {
-          st.hardPauseUntil = now + (1000 + Math.random() * 1500);
-        }
+        // [QUOTEX RHYTHM] এখানেও একই — প্রতিটা rest এই duration সেট
+        st.hardPauseUntil = now + (550 + Math.random() * 1000);
       } else {
         st.phase = 'run';
         const u = Math.random();
