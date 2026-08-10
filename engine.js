@@ -175,7 +175,7 @@ function nextPrice(st, now = Date.now(), over) {
       st.retrDone = 0;
       // [NO FORCED RETRACE] শুধু ~৫০% সময় retrace হয় (mid-burst
       // ট্রিগার হলেও), বাকি সময় সরাসরি নতুন burst বা rest এ যায়।
-      const _wantRetrace = Math.random() < 0.5;
+      const _wantRetrace = Math.random() < 0.55;
       if (_wantRetrace && Math.abs(st.retrTarget) > 1e-12 && c.retr > 0) {
         st.phase = 'retrace';
         st.left = st.retrLeft0;
@@ -272,7 +272,12 @@ function nextPrice(st, now = Date.now(), over) {
       else if (_r < 0.85) mag = 0.3 + Math.pow(Math.random(), -0.35) * 0.6;
       else                mag = 1.5 + Math.pow(Math.random(), -0.5) * 2;
       // [MICRO-DIRECTION] এখানেও মাঝে মাঝে সামান্য বিপরীত micro-tick
-      const microDir = (Math.random() < 0.42) ? -retrDir : retrDir;
+      // [FIX: JITTER] retrace সাধারণত ছোট (১-৪ tick), তাই burst এর মতো
+      // ৪২% micro-reverse দিলে অল্প কয়েকটা tick এর মধ্যেই "হুদায়
+      // কাঁপুনি" (net movement প্রায় ০, শুধু এদিক-ওদিক নড়া) তৈরি হত।
+      // Retrace এ কম (২০%) রাখা হলো, যাতে target এর দিকে যথেষ্ট
+      // consistent progress থাকে।
+      const microDir = (Math.random() < 0.20) ? -retrDir : retrDir;
       delta = microDir * base * Math.min(4, mag) * st.vol;
       // লক্ষ্য পেরিয়ে গেলে থামি
       if (Math.abs((st.retrDone || 0) + delta) > Math.abs(st.retrTarget)) delta = remain;
