@@ -208,10 +208,18 @@ function nextPrice(st, now = Date.now(), over) {
     /* ── ৪. bid-ask কাঁপুনি ── */
     delta = (Math.random() - 0.5) * base * c.spread * st.vol * sm;
   } else {
-    // [JUMP] পায়ের মাপ ভারী-লেজ — বেশিরভাগ মাঝারি, কদাচিৎ অনেক বড়।
-    // সমান মাপের পা হলে চলাচল যান্ত্রিক ও অনুমানযোগ্য লাগত।
-    const mag = 0.45 + Math.pow(Math.random(), -0.42) * 0.75;
-    delta = st.dir * base * Math.min(6, mag) * st.vol * sm;
+    // [WAVE FIX] পায়ের মাপে আরও বৈচিত্র্য — আগে বেশিরভাগ tick প্রায়
+    // সমান ছোট (১-৫ pip) রেঞ্জে আটকে থাকত, যেটা "ঢেউ এর মতো গড়িয়ে
+    // চলা" ভাব দিত (real market এ tick discrete লাফায়, glide করে না)।
+    // এখন তিন ভাগে: প্রায়ই খুব ছোট (near-flat), মাঝারি সাধারণ, আর
+    // মাঝে মাঝে সত্যিকারের বড় লাফ — এই মিশ্রণটাই "লাফিয়ে লাফিয়ে"
+    // ভাব দেয়, একঘেয়ে glide না।
+    const _r = Math.random();
+    let mag;
+    if (_r < 0.25)      mag = 0.05 + Math.random() * 0.25;                  // প্রায়-flat
+    else if (_r < 0.85) mag = 0.3 + Math.pow(Math.random(), -0.35) * 0.6;   // সাধারণ
+    else                mag = 1.5 + Math.pow(Math.random(), -0.5) * 2;      // বড় লাফ
+    delta = st.dir * base * Math.min(8, mag) * st.vol * sm;
   }
 
   /* ── ৫. ভারী লেজ ── */
@@ -248,9 +256,16 @@ function nextPrice(st, now = Date.now(), over) {
 
   st.price = Math.max(st.price + delta, 1e-8);
 
-  /* ── ৬. pip ধাপ ── */
+  /* ── ৬. pip ধাপ ──
+     [CLEAN ROUND] Math.round(price*q)/q মাঝে মাঝে floating-point এ
+     সামান্য garbage রেখে দিতে পারে (যেমন 1.08551000000000002) —
+     display এ toFixed করলে সেটা দেখা যায় না, কিন্তু raw value
+     store/compare (settlement এ isTie চেক) এ mismatch তৈরি করতে
+     পারে। toFixed().Number() round-trip দিয়ে সেই garbage সম্পূর্ণ
+     সরিয়ে দেওয়া হচ্ছে — user client এ যা দেখে, server এ ঠিক
+     সেই clean সংখ্যাই store/compare হবে। */
   const q = Math.pow(10, st.decimals);
-  st.price = Math.round(st.price * q) / q;
+  st.price = Number(st.price.toFixed(st.decimals));
 
   return st.price;
 }
