@@ -107,6 +107,7 @@ function createState(price, decimals = 5) {
     regimeLeft: 200 + ((Math.random() * 500) | 0),
     hardPauseUntil: 0,   // [VISIBLE PAUSE] এই timestamp পর্যন্ত সম্পূর্ণ static থাকবে
     impulseCount: 0,      // [IMPULSE-PULLBACK] burst এর মূল দিকে টানা কতগুলো tick গেছে
+    speed: 1,              // [SPEED STATE] persistent, ধীরে বদলায় — sudden jump না
   };
 }
 
@@ -396,11 +397,24 @@ function nextDelay(st, over) {
 
   let g = c.gapMs;
 
+  // [SPEED STATE] GPT-র সুপারিশ — শুধু per-tick independent random delay
+  // দিলে "random-number-generator" এর মতো লাগে, কোনো momentum নেই।
+  // এখন একটা persistent speed state আছে যেটা প্রতি tick এ সামান্য
+  // বদলায় (কদাচিৎ হঠাৎ, বেশিরভাগ সময় ধীরে) — তাই "slow → একটু fast →
+  // burst → আবার ধীর" এই ধরনের গ্র্যাজুয়াল transition তৈরি হয়,
+  // প্রতিটা tick আলাদা dice-roll না হয়ে একটা ধারাবাহিকতা থাকে।
+  const _sr = Math.random();
+  if (_sr < 0.15) st.speed *= 0.65;         // হঠাৎ দ্রুত
+  else if (_sr < 0.30) st.speed *= 1.45;    // হঠাৎ ধীর
+  else st.speed *= 0.92 + Math.random() * 0.16;  // সামান্য drift
+  st.speed = Math.max(0.45, Math.min(2.2, st.speed));
+
   g *= st.phase === 'run' ? 0.5
      : st.phase === 'rest' ? 1.4
      : st.phase === 'retrace' ? (st.retrFast ? 0.45 : 1.05)   // দ্রুত/ধীর ফেরত
      : 1;
   g *= 1 - 0.6 * st.excite * c.spdVar;          // উত্তেজনায় দ্রুত
+  g *= st.speed;                                 // persistent speed state প্রয়োগ
 
   const roll = Math.random();
   if (roll < 0.12 * c.spdVar) g *= 0.22;        // ঝাঁক — খুব দ্রুত
@@ -408,7 +422,7 @@ function nextDelay(st, over) {
   else if (roll > 1 - 0.07 * c.spdVar) g *= 2.4; // হঠাৎ থমকে যাওয়া
 
   g *= 0.6 + Math.random() * 0.8;
-  return Math.max(35, g);
+  return Math.max(35, Math.min(2500, g));
 }
 
 module.exports = { createState, nextPrice, nextDelay, sessionMul, CFG };
