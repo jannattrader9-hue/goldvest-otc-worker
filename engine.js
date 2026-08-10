@@ -260,7 +260,15 @@ function nextPrice(st, now = Date.now(), over) {
     if (_r < 0.25)      mag = 0.05 + Math.random() * 0.25;                  // প্রায়-flat
     else if (_r < 0.85) mag = 0.3 + Math.pow(Math.random(), -0.35) * 0.6;   // সাধারণ
     else                mag = 1.5 + Math.pow(Math.random(), -0.5) * 2;      // বড় লাফ
-    delta = st.dir * base * Math.min(8, mag) * st.vol * sm;
+    // [MICRO-DIRECTION] burst এর মূল দিক (st.dir) ঠিক থাকে, কিন্তু
+    // প্রতিটা tick একই দিকে গেলে (glide) সেটাই "ঢেউ এর মতো গড়িয়ে
+    // যাওয়া" ভাব দিচ্ছিল — real market এ প্রতিটা tick নিজে একটা
+    // আলাদা সিদ্ধান্ত, একঘেয়ে continuation না। তাই ~১৮% tick এ
+    // সামান্য বিপরীত micro-movement — overall trend/burst-এর গড়
+    // দিক অক্ষত থাকে (ছোট ও বিরল বলে), কিন্তু tick-to-tick pattern
+    // নয়েজি/discrete লাগে, glide লাগে না।
+    const _microDir = (Math.random() < 0.18) ? -st.dir : st.dir;
+    delta = _microDir * base * Math.min(8, mag) * st.vol * sm;
   }
 
   /* ── ৫. ভারী লেজ ── */
