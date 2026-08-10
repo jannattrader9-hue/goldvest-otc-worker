@@ -136,8 +136,21 @@ function nextPrice(st, now = Date.now(), over) {
   /* ── ২. উত্তেজনা ধীরে শান্ত হয় ── */
   st.excite *= 0.93;
 
-  /* ── ৩. পর্ব বদল ── */
-  if (--st.left <= 0) {
+  /* ── ৩. পর্ব বদল ──
+     [RANDOM RETRACE TIMING] আগে retrace সবসময় burst এর ঠিক শেষে শুরু
+     হত — timing predictable ছিল, শুধু frequency (৫০%) এলোমেলো করাই
+     যথেষ্ট ছিল না। user burst চলতে দেখলেই বুঝত "শেষ হলেই retrace
+     আসবে কিনা"। এখন run phase এর প্রতিটা tick এ (মাঝপথেও) সামান্য
+     সম্ভাবনা থাকে retrace শুরু হওয়ার — কখনো শুরুতে, কখনো মাঝে, কখনো
+     শেষেও, কখনো একদমই না। কোনো fixed trigger-point নেই। */
+  let _midBurstRetrace = false;
+  if (st.phase === 'run' && st.left > 1) {
+    // প্রতি tick এ ছোট সম্ভাবনা — গড়ে burst এর কোনো এক এলোমেলো
+    // মুহূর্তে ট্রিগার হবে, শেষের অপেক্ষা না করেই।
+    if (Math.random() < 0.09) _midBurstRetrace = true;
+  }
+
+  if (_midBurstRetrace || --st.left <= 0) {
     if (st.phase === 'run') {
       st.excite = Math.min(1, st.excite + 0.55);
       // ফিরতি টান — ঝলকে যতটা গেছে তার একাংশ ফেরত
@@ -150,15 +163,16 @@ function nextPrice(st, now = Date.now(), over) {
       st.retrLeft0 = st.retrFast ? (1 + ((Math.random() * 2) | 0))   // ঝট করে
                                  : (2 + ((Math.random() * 3) | 0));  // ধাপে ধাপে
       st.retrDone = 0;
-      // [NO FORCED RETRACE] আগে প্রায় প্রতিটা burst (৯৯%) এর পরেই
-      // retrace হত — সেটাই "up-down-up-down" predictable দোলা তৈরি
-      // করছিল, real market এ প্রতিটা move এর পরেই জোর করে ফেরত আসে
-      // না। এখন শুধু ~৫০% সময় retrace হয়, বাকি সময় সরাসরি নতুন burst
-      // বা rest এ যায় — momentum continue করাও সমান সম্ভাবনায় থাকে।
+      // [NO FORCED RETRACE] শুধু ~৫০% সময় retrace হয় (mid-burst
+      // ট্রিগার হলেও), বাকি সময় সরাসরি নতুন burst বা rest এ যায়।
       const _wantRetrace = Math.random() < 0.5;
       if (_wantRetrace && Math.abs(st.retrTarget) > 1e-12 && c.retr > 0) {
         st.phase = 'retrace';
         st.left = st.retrLeft0;
+      } else if (_midBurstRetrace) {
+        // [FIX] mid-burst ট্রিগার হলে short-circuit (||) এর কারণে
+        // --st.left আদৌ চলেনি, তাই left অপরিবর্তিতই আছে — কিছু করার
+        // দরকার নেই, burst এমনিই তার বাকি left নিয়ে চলতে থাকবে।
       } else {
         const rest = Math.max(0, c.restLen * (1 - st.excite * c.clust));
         st.phase = 'rest';
