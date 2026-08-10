@@ -33,7 +33,7 @@ const num = (v, d) => (v === undefined || v === '' || isNaN(+v) ? d : +v);
 
 /* পরীক্ষার পাতার স্লাইডারের মান — হুবহু একই */
 const CFG = {
-  unit:    num(process.env.ENG_UNIT,     0.000023),  // base একক (দামের অনুপাতে)
+  unit:    num(process.env.ENG_UNIT,     0.000030),  // base একক (দামের অনুপাতে)
   volMem:  num(process.env.ENG_VOL_MEM,  0.994),    // অস্থিরতার স্মৃতি
   volAmp:  num(process.env.ENG_VOL_AMP,  0.28),     // ওঠানামার মাত্রা
   runLen:  num(process.env.ENG_RUN_LEN,  3),        // ঝলকের গড় tick
@@ -42,7 +42,7 @@ const CFG = {
   retr:    num(process.env.ENG_RETR,     0.40),     // ফিরতি টান
   jump:    num(process.env.ENG_JUMP,     1.8),      // হঠাৎ বড় লাফ %
   spread:  num(process.env.ENG_SPREAD,   1.0),      // bid-ask কাঁপুনি
-  gapMs:   num(process.env.ENG_GAP_MS,   170),      // গড় tick ব্যবধান
+  gapMs:   num(process.env.ENG_GAP_MS,   1200),      // গড় tick ব্যবধান
   spdVar:  num(process.env.ENG_SPD_VAR,  0.72),     // গতির তারতম্য
   bias:    num(process.env.ENG_BIAS,     0.008),     // trend পক্ষপাত
   session: num(process.env.ENG_SESSION,  0.55),     // দিনের ছন্দ
