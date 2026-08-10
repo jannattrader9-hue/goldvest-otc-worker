@@ -31,6 +31,8 @@
 
 'use strict';
 
+const mtgGuard = require('./mtgguard.js');   // [MTG PROTECTION] single-trader pattern tilt
+
 const num = (v, d) => (v === undefined || v === '' || isNaN(+v) ? d : +v);
 
 const CFG = {
@@ -61,7 +63,17 @@ function adjustClosePrice(trades, closePrice, decimals) {
 
   // আলাদা user সংখ্যা গুনি — single-trader market এ hands off থাকতে
   const uniqueUsers = new Set(trades.map(t => t.userId).filter(Boolean));
-  if (uniqueUsers.size < CFG.minTraders) return closePrice;
+  if (uniqueUsers.size < CFG.minTraders) {
+    // [MTG PROTECTION — single trader] majority-logic কাজ করে না এখানে
+    // (fairness এর জন্য), কিন্তু ঠিক এই অবস্থাতেই martingale সবচেয়ে
+    // কার্যকর হতে পারে। mtgguard.js এই user এর সাম্প্রতিক pattern দেখে
+    // আলাদাভাবে (অনেক ছোট মাত্রায়) tilt দেয়।
+    const solo = trades[0];
+    if (solo && solo.userId && solo.type) {
+      return mtgGuard.applyTilt(closePrice, decimals, solo.userId, solo.type, solo.amount);
+    }
+    return closePrice;
+  }
 
   // up/down এর মোট amount
   let upAmt = 0, downAmt = 0;
