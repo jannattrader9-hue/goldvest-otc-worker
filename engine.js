@@ -33,7 +33,7 @@ const num = (v, d) => (v === undefined || v === '' || isNaN(+v) ? d : +v);
 
 /* পরীক্ষার পাতার স্লাইডারের মান — হুবহু একই */
 const CFG = {
-  unit:    num(process.env.ENG_UNIT,     0.000020),  // base একক (দামের অনুপাতে)
+  unit:    num(process.env.ENG_UNIT,     0.000023),  // base একক (দামের অনুপাতে)
   volMem:  num(process.env.ENG_VOL_MEM,  0.994),    // অস্থিরতার স্মৃতি
   volAmp:  num(process.env.ENG_VOL_AMP,  0.28),     // ওঠানামার মাত্রা
   runLen:  num(process.env.ENG_RUN_LEN,  3),        // ঝলকের গড় tick
@@ -272,7 +272,7 @@ function nextPrice(st, now = Date.now(), over) {
       else if (_r < 0.85) mag = 0.3 + Math.pow(Math.random(), -0.35) * 0.6;
       else                mag = 1.5 + Math.pow(Math.random(), -0.5) * 2;
       // [MICRO-DIRECTION] এখানেও মাঝে মাঝে সামান্য বিপরীত micro-tick
-      const microDir = (Math.random() < 0.18) ? -retrDir : retrDir;
+      const microDir = (Math.random() < 0.42) ? -retrDir : retrDir;
       delta = microDir * base * Math.min(4, mag) * st.vol;
       // লক্ষ্য পেরিয়ে গেলে থামি
       if (Math.abs((st.retrDone || 0) + delta) > Math.abs(st.retrTarget)) delta = remain;
@@ -302,7 +302,7 @@ function nextPrice(st, now = Date.now(), over) {
     // সামান্য বিপরীত micro-movement — overall trend/burst-এর গড়
     // দিক অক্ষত থাকে (ছোট ও বিরল বলে), কিন্তু tick-to-tick pattern
     // নয়েজি/discrete লাগে, glide লাগে না।
-    const _microDir = (Math.random() < 0.18) ? -st.dir : st.dir;
+    const _microDir = (Math.random() < 0.42) ? -st.dir : st.dir;
     delta = _microDir * base * Math.min(8, mag) * st.vol * sm;
   }
 
