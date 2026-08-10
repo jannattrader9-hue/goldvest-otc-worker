@@ -105,6 +105,7 @@ function createState(price, decimals = 5) {
     retrDone: 0,
     regimeDir: Math.random() < 0.5 ? 1 : -1,
     regimeLeft: 200 + ((Math.random() * 500) | 0),
+    hardPauseUntil: 0,   // [VISIBLE PAUSE] এই timestamp পর্যন্ত সম্পূর্ণ static থাকবে
   };
 }
 
@@ -177,6 +178,14 @@ function nextPrice(st, now = Date.now(), over) {
         const rest = Math.max(0, c.restLen * (1 - st.excite * c.clust));
         st.phase = 'rest';
         st.left = 1 + ((Math.random() * (rest + 1)) | 0);
+        // [VISIBLE PAUSE] real market এ মাঝে মাঝে দাম একদম সম্পূর্ণ
+        // থেমে যায় (১-২.৫s), এত স্পষ্টভাবে যে চোখে "থেমে গেছে" ধরা
+        // পড়ে — আগের rest (মিডিয়ান ~২৫০ms) এত ছোট যে সেটা চোখে পড়ার
+        // মতো না। ~৩% সময় (rare, কদাচিৎ) একটা সত্যিকারের দীর্ঘ,
+        // সম্পূর্ণ-static বিরতি যোগ হয়।
+        if (Math.random() < 0.01) {
+          st.hardPauseUntil = now + (1000 + Math.random() * 1500);
+        }
       }
     } else if (st.phase === 'retrace') {
       // [NO FIXED SEQUENCE] আগে retrace শেষে সবসময় rest হত (১০০%) —
@@ -187,6 +196,10 @@ function nextPrice(st, now = Date.now(), over) {
         const rest = Math.max(0, c.restLen * (1 - st.excite * c.clust));
         st.phase = 'rest';
         st.left = 1 + ((Math.random() * (rest + 1)) | 0);
+        // [VISIBLE PAUSE] এখানেও একই সুযোগ
+        if (Math.random() < 0.01) {
+          st.hardPauseUntil = now + (1000 + Math.random() * 1500);
+        }
       } else {
         st.phase = 'run';
         const u = Math.random();
@@ -228,6 +241,13 @@ function nextPrice(st, now = Date.now(), over) {
 
   const sm = sessionMul(now, c.session);
   let delta;
+
+  // [VISIBLE PAUSE] hard-pause সক্রিয় থাকলে phase যাই হোক, delta
+  // জোর করে ০ — সম্পূর্ণ static, chart এ স্পষ্ট থেমে যাওয়া দেখাবে।
+  if (st.hardPauseUntil && now < st.hardPauseUntil) {
+    st.price = Number(st.price.toFixed(st.decimals));
+    return st.price;
+  }
 
   if (st.phase === 'retrace') {
     // [NO GLIDE] আগে remain/st.left দিয়ে target এর দিকে সমানভাবে
@@ -336,6 +356,15 @@ function nextPrice(st, now = Date.now(), over) {
  */
 function nextDelay(st, over) {
   const c = over ? { ...CFG, ...over } : CFG;
+
+  // [VISIBLE PAUSE] hard-pause চলাকালীন ছোট, নিয়মিত gap — দাম বদলাবে
+  // না ঠিকই (nextPrice এ static থাকে), কিন্তু UI প্রতি tick এ চেক
+  // করে যাবে যাতে pause শেষ হওয়া মাত্র normal movement সাথে সাথে
+  // আবার শুরু হয়, বাড়তি দেরি না হয়।
+  if (st.hardPauseUntil && Date.now() < st.hardPauseUntil) {
+    return 150;
+  }
+
   let g = c.gapMs;
 
   g *= st.phase === 'run' ? 0.5
