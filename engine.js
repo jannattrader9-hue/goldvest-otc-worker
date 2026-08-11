@@ -482,7 +482,14 @@ function nextDelay(st, over, now = Date.now()) {
 
   // ছোট ফ্রেম-টু-ফ্রেম variation, কিন্তু regime নিজে বদলায় না
   g *= 0.85 + Math.random() * 0.3;
-  return Math.max(35, Math.min(2500, g));
+  // [SPEED FIX] আগে floor ৩৫ms ছিল — burst-regime + run-phase একসাথে
+  // compound হয়ে effective gap মাত্র ৬০ms (~১৭ tick/সেকেন্ড) হয়ে
+  // যেত, যেটা গড় tick-rate কে টেনে অনেক নিচে নামাচ্ছিল, তাই "speed
+  // নেই, real market এর মতো লাগছে না" — কারণ real market এ কখনোই
+  // sustained ১৭/সেকেন্ড এর মতো দ্রুত ধারাবাহিকভাবে চলে না। Floor
+  // বাড়িয়ে ১২০ms করা হলো, যাতে সব regime/phase মিলিয়েও কখনো
+  // অবাস্তব দ্রুত না হয়।
+  return Math.max(120, Math.min(2500, g));
 }
 
 module.exports = { createState, nextPrice, nextDelay, sessionMul, CFG };
