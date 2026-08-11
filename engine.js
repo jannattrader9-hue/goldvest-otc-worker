@@ -185,7 +185,13 @@ function nextPrice(st, now = Date.now(), over) {
       // (trend continue করার সম্ভাবনা বেশি), বড়/দ্রুত movement এ বেশি
       // retrace (real market এর মতো "বেশি গেলে বেশি ফেরত" প্রবণতা)।
       const _movedPct = Math.min(1, Math.abs(moved) / (st.price * 0.003));
-      const _retraceProb = 0.35 + _movedPct * 0.30 + st.excite * 0.15;
+      // [REDUCED RETRACE] GPT এর real-Quotex-video analysis অনুযায়ী —
+      // burst যতদূর গিয়েছিল retrace প্রায় সেই একই মাপে ফিরে আসাটাই
+      // "যায়-তারপর-ফিরে আসে" zig-zag ভাব তৈরি করছিল, যদিও frequency
+      // এলোমেলো ছিল। এখন base probability অনেক কমানো হলো, যাতে
+      // momentum/persistent direction (continue করা) predominant হয়,
+      // retrace শুধু কদাচিৎ (বড় movement এর পরেই বেশি)।
+      const _retraceProb = 0.18 + _movedPct * 0.22 + st.excite * 0.10;
       const _wantRetrace = Math.random() < _retraceProb;
       if (_wantRetrace && Math.abs(st.retrTarget) > 1e-12 && c.retr > 0) {
         st.phase = 'retrace';
@@ -326,8 +332,11 @@ function nextPrice(st, now = Date.now(), over) {
                         : 0;
     const _r = Math.random() - _regimeBoost;
     let mag;
-    if (_r < 0.25)      mag = 0.05 + Math.random() * 0.25;                  // প্রায়-flat
-    else if (_r < 0.85) mag = 0.3 + Math.pow(Math.random(), -0.35) * 0.6;   // সাধারণ
+    // [MEDIUM DOMINANT] GPT এর video-observation — "সবচেয়ে বেশি
+    // থাকে মাঝারি জাম্প টিক টু টিক", flat/near-zero tick কে baseline
+    // বানানো উচিত না। আগে flat ২৫%, এখন ১২% — medium এখন dominant।
+    if (_r < 0.12)      mag = 0.15 + Math.random() * 0.25;                  // প্রায়-flat (কম)
+    else if (_r < 0.88) mag = 0.5 + Math.pow(Math.random(), -0.35) * 0.7;   // মাঝারি (dominant)
     else                mag = 1.5 + Math.pow(Math.random(), -0.5) * 2;      // বড় লাফ
     // সাম্প্রতিক বড় jump এর পরে সামান্য recovery bias — একটানা অনেক
     // বড় jump না হয়ে মাঝেমধ্যে ছোট হয়ে "শ্বাস" নেয়
