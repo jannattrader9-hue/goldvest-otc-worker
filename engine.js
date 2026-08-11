@@ -108,6 +108,9 @@ function createState(price, decimals = 5) {
     hardPauseUntil: 0,   // [VISIBLE PAUSE] এই timestamp পর্যন্ত সম্পূর্ণ static থাকবে
     impulseCount: 0,      // [IMPULSE-PULLBACK] burst এর মূল দিকে টানা কতগুলো tick গেছে
     speed: 1,              // [SPEED STATE] persistent, ধীরে বদলায় — sudden jump না
+    speedRegime: 'normal', // [SPEED REGIME] slow/normal/fast/burst — কয়েক tick ধরে থাকে
+    speedRegimeLeft: 8,     // এই regime এ আর কতগুলো tick বাকি
+    recentMag: 0,           // [MOMENTUM MEMORY] সাম্প্রতিক tick-magnitude এর গড় (EMA)
   };
 }
 
@@ -322,17 +325,25 @@ function nextPrice(st, now = Date.now(), over) {
     /* ── ৪. bid-ask কাঁপুনি ── */
     delta = (Math.random() - 0.5) * base * c.spread * st.vol * sm;
   } else {
-    // [WAVE FIX] পায়ের মাপে আরও বৈচিত্র্য — আগে বেশিরভাগ tick প্রায়
-    // সমান ছোট (১-৫ pip) রেঞ্জে আটকে থাকত, যেটা "ঢেউ এর মতো গড়িয়ে
-    // চলা" ভাব দিত (real market এ tick discrete লাফায়, glide করে না)।
-    // এখন তিন ভাগে: প্রায়ই খুব ছোট (near-flat), মাঝারি সাধারণ, আর
-    // মাঝে মাঝে সত্যিকারের বড় লাফ — এই মিশ্রণটাই "লাফিয়ে লাফিয়ে"
-    // ভাব দেয়, একঘেয়ে glide না।
-    const _r = Math.random();
+    // [CONTEXT-DEPENDENT MAGNITUDE] শুধু independent random draw না —
+    // speed regime আর সাম্প্রতিক magnitude (recentMag, EMA) দুটোই
+    // মিলিয়ে distribution shift হয়। burst/fast regime এ বড় jump এর
+    // সম্ভাবনা বাড়ে, slow regime এ ছোট jump এর সম্ভাবনা বাড়ে —
+    // "speed আর jump-size একসাথে couple করা" এই GPT observation
+    // অনুযায়ী।
+    const _regimeBoost = st.speedRegime === 'burst' ? 0.20
+                        : st.speedRegime === 'fast'  ? 0.10
+                        : st.speedRegime === 'slow'  ? -0.12
+                        : 0;
+    const _r = Math.random() - _regimeBoost;
     let mag;
     if (_r < 0.25)      mag = 0.05 + Math.random() * 0.25;                  // প্রায়-flat
     else if (_r < 0.85) mag = 0.3 + Math.pow(Math.random(), -0.35) * 0.6;   // সাধারণ
     else                mag = 1.5 + Math.pow(Math.random(), -0.5) * 2;      // বড় লাফ
+    // সাম্প্রতিক বড় jump এর পরে সামান্য recovery bias — একটানা অনেক
+    // বড় jump না হয়ে মাঝেমধ্যে ছোট হয়ে "শ্বাস" নেয়
+    if (st.recentMag > 3) mag *= 0.7;
+    st.recentMag = st.recentMag * 0.8 + mag * 0.2;   // EMA আপডেট
     // [MOMENTUM-DEPENDENT REVERSE] আগে দুই ধাপে ছিল — fixed ৪২% random,
     // তারপর ৩-৪ tick পর জোর করে reverse। দুটোই hard-coded sequence
     // তৈরি করছিল, real market এর মতো "emergent" লাগছিল না। এখন
@@ -422,31 +433,45 @@ function nextDelay(st, over) {
 
   let g = c.gapMs;
 
-  // [SPEED STATE] GPT-র সুপারিশ — শুধু per-tick independent random delay
-  // দিলে "random-number-generator" এর মতো লাগে, কোনো momentum নেই।
-  // এখন একটা persistent speed state আছে যেটা প্রতি tick এ সামান্য
-  // বদলায় (কদাচিৎ হঠাৎ, বেশিরভাগ সময় ধীরে) — তাই "slow → একটু fast →
-  // burst → আবার ধীর" এই ধরনের গ্র্যাজুয়াল transition তৈরি হয়,
-  // প্রতিটা tick আলাদা dice-roll না হয়ে একটা ধারাবাহিকতা থাকে।
-  const _sr = Math.random();
-  if (_sr < 0.15) st.speed *= 0.65;         // হঠাৎ দ্রুত
-  else if (_sr < 0.30) st.speed *= 1.45;    // হঠাৎ ধীর
-  else st.speed *= 0.92 + Math.random() * 0.16;  // সামান্য drift
-  st.speed = Math.max(0.45, Math.min(2.2, st.speed));
+  // [SPEED REGIME] আগে speed প্রতি tick এ নিজে থেকে multiply হত —
+  // technically persistent হলেও প্রতি tick এ নতুন probability-check
+  // হওয়ায় "SLOW SLOW SLOW → FAST FAST FAST" এর মতো কয়েক tick ধরে
+  // স্থির থাকা regime তৈরি হচ্ছিল না, বরং প্রায় প্রতি tick এই
+  // এলোমেলো ওঠানামা করত। এখন একটা discrete named regime আছে
+  // (slow/normal/fast/burst) যেটা কয়েকটা tick (৫-১৫টা) ধরে বহাল
+  // থাকে, তারপর নতুন regime এ পরিবর্তন হয় — GPT এর চাওয়া "speed
+  // state" ঠিক এই আচরণ।
+  const _SPEED_REGIMES = {
+    slow:   1.6,
+    normal: 1.0,
+    fast:   0.55,
+    burst:  0.28,
+  };
+  if (--st.speedRegimeLeft <= 0) {
+    const r = Math.random();
+    // পরের regime ঠিক করা — burst/fast এর পরে recovery/slow এর
+    // সম্ভাবনা বেশি (ক্লান্তির মতো), slow এর পরে normal এ ফেরার
+    // সম্ভাবনা বেশি — সম্পূর্ণ independent random না, সামান্য
+    // "আগের regime কী ছিল" তার উপর নির্ভরশীল।
+    const prevFast = (st.speedRegime === 'fast' || st.speedRegime === 'burst');
+    if (prevFast) {
+      st.speedRegime = r < 0.5 ? 'normal' : (r < 0.8 ? 'slow' : 'fast');
+    } else {
+      st.speedRegime = r < 0.40 ? 'normal' : (r < 0.65 ? 'slow' : (r < 0.88 ? 'fast' : 'burst'));
+    }
+    st.speedRegimeLeft = 5 + ((Math.random() * 10) | 0);   // ৫-১৪ tick ধরে থাকবে
+  }
+  st.speed = _SPEED_REGIMES[st.speedRegime];
 
   g *= st.phase === 'run' ? 0.5
      : st.phase === 'rest' ? 1.4
      : st.phase === 'retrace' ? (st.retrFast ? 0.45 : 1.05)   // দ্রুত/ধীর ফেরত
      : 1;
   g *= 1 - 0.6 * st.excite * c.spdVar;          // উত্তেজনায় দ্রুত
-  g *= st.speed;                                 // persistent speed state প্রয়োগ
+  g *= st.speed;                                 // regime-based speed প্রয়োগ
 
-  const roll = Math.random();
-  if (roll < 0.12 * c.spdVar) g *= 0.22;        // ঝাঁক — খুব দ্রুত
-  else if (roll < 0.20 * c.spdVar) g *= 0.45;
-  else if (roll > 1 - 0.07 * c.spdVar) g *= 2.4; // হঠাৎ থমকে যাওয়া
-
-  g *= 0.6 + Math.random() * 0.8;
+  // ছোট ফ্রেম-টু-ফ্রেম variation, কিন্তু regime নিজে বদলায় না
+  g *= 0.85 + Math.random() * 0.3;
   return Math.max(35, Math.min(2500, g));
 }
 
