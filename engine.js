@@ -36,13 +36,13 @@ const CFG = {
   unit:    num(process.env.ENG_UNIT,     0.000018),  // base একক (দামের অনুপাতে)
   volMem:  num(process.env.ENG_VOL_MEM,  0.994),    // অস্থিরতার স্মৃতি
   volAmp:  num(process.env.ENG_VOL_AMP,  0.28),     // ওঠানামার মাত্রা
-  runLen:  num(process.env.ENG_RUN_LEN,  6),        // ঝলকের গড় tick
+  runLen:  num(process.env.ENG_RUN_LEN,  8),        // ঝলকের গড় tick
   restLen: num(process.env.ENG_REST_LEN, 5),        // শ্বাসের গড় tick
   clust:   num(process.env.ENG_CLUST,    0.45),     // ঝলক গুচ্ছ হওয়া
   retr:    num(process.env.ENG_RETR,     0.40),     // ফিরতি টান
   jump:    num(process.env.ENG_JUMP,     1.8),      // হঠাৎ বড় লাফ %
   spread:  num(process.env.ENG_SPREAD,   1.0),      // bid-ask কাঁপুনি
-  gapMs:   num(process.env.ENG_GAP_MS,   320),      // গড় tick ব্যবধান
+  gapMs:   num(process.env.ENG_GAP_MS,   500),      // গড় tick ব্যবধান
   spdVar:  num(process.env.ENG_SPD_VAR,  0.72),     // গতির তারতম্য
   bias:    num(process.env.ENG_BIAS,     0.008),     // trend পক্ষপাত
   session: num(process.env.ENG_SESSION,  0.55),     // দিনের ছন্দ
@@ -108,9 +108,6 @@ function createState(price, decimals = 5) {
     hardPauseUntil: 0,   // [VISIBLE PAUSE] এই timestamp পর্যন্ত সম্পূর্ণ static থাকবে
     impulseCount: 0,      // [IMPULSE-PULLBACK] burst এর মূল দিকে টানা কতগুলো tick গেছে
     speed: 1,              // [SPEED STATE] persistent, ধীরে বদলায় — sudden jump না
-    speedRegime: 'normal', // [SPEED REGIME] slow/normal/fast/burst — কয়েক tick ধরে থাকে
-    speedRegimeLeft: 8,     // এই regime এ আর কতগুলো tick বাকি
-    recentMag: 0,           // [MOMENTUM MEMORY] সাম্প্রতিক tick-magnitude এর গড় (EMA)
   };
 }
 
@@ -185,13 +182,7 @@ function nextPrice(st, now = Date.now(), over) {
       // (trend continue করার সম্ভাবনা বেশি), বড়/দ্রুত movement এ বেশি
       // retrace (real market এর মতো "বেশি গেলে বেশি ফেরত" প্রবণতা)।
       const _movedPct = Math.min(1, Math.abs(moved) / (st.price * 0.003));
-      // [REDUCED RETRACE] GPT এর real-Quotex-video analysis অনুযায়ী —
-      // burst যতদূর গিয়েছিল retrace প্রায় সেই একই মাপে ফিরে আসাটাই
-      // "যায়-তারপর-ফিরে আসে" zig-zag ভাব তৈরি করছিল, যদিও frequency
-      // এলোমেলো ছিল। এখন base probability অনেক কমানো হলো, যাতে
-      // momentum/persistent direction (continue করা) predominant হয়,
-      // retrace শুধু কদাচিৎ (বড় movement এর পরেই বেশি)।
-      const _retraceProb = 0.18 + _movedPct * 0.22 + st.excite * 0.10;
+      const _retraceProb = 0.35 + _movedPct * 0.30 + st.excite * 0.15;
       const _wantRetrace = Math.random() < _retraceProb;
       if (_wantRetrace && Math.abs(st.retrTarget) > 1e-12 && c.retr > 0) {
         st.phase = 'retrace';
@@ -214,7 +205,7 @@ function nextPrice(st, now = Date.now(), over) {
         // ঘন ঘন freeze দেখাচ্ছিল। এখন শুধু ~৪৫% rest এ visible pause,
         // duration ও কমানো (৩০০-৯০০ms), বাকি সময় rest এ থাকলেও
         // engine স্বাভাবিক ছোট movement চালিয়ে যাবে।
-        if (Math.random() < 0.18) {
+        if (Math.random() < 0.45) {
           st.hardPauseUntil = now + (300 + Math.random() * 600);
         }
       }
@@ -233,7 +224,7 @@ function nextPrice(st, now = Date.now(), over) {
         // ঘন ঘন freeze দেখাচ্ছিল। এখন শুধু ~৪৫% rest এ visible pause,
         // duration ও কমানো (৩০০-৯০০ms), বাকি সময় rest এ থাকলেও
         // engine স্বাভাবিক ছোট movement চালিয়ে যাবে।
-        if (Math.random() < 0.18) {
+        if (Math.random() < 0.45) {
           st.hardPauseUntil = now + (300 + Math.random() * 600);
         }
       } else {
@@ -281,11 +272,18 @@ function nextPrice(st, now = Date.now(), over) {
   // [MICRO-MOVEMENT PAUSE] আগে hard-pause এ delta সম্পূর্ণ ০ ছিল —
   // GPT এর observation অনুযায়ী এটা "artificial" লাগতে পারে, real
   // market এ pause মানে সবসময় absolute zero না, মাঝে মাঝে খুবই ছোট
-  // [PURE STATIC PAUSE] micro-tick জিটার সরানো হলো — user চায় কোনো
-  // দোলনি না। Hard-pause এখন সম্পূর্ণ static (delta=0), যেটাই "থেমে
-  // যাওয়া" এর সবচেয়ে পরিষ্কার visual।
+  // (sub-pip) নড়াচড়া থাকে। তাই এখন ৭৫% সময় সত্যিই static (visible
+  // pause বজায় থাকে), কিন্তু ২৫% সময় এক pip এর সামান্য কম একটা
+  // micro-tick হয় — pause এর "থেমে যাওয়া" ভাব অক্ষত থাকে কিন্তু
+  // সম্পূর্ণ frozen লাগে না।
   if (st.hardPauseUntil && now < st.hardPauseUntil) {
-    st.price = Number(st.price.toFixed(st.decimals));
+    if (Math.random() < 0.25) {
+      const _pip = Math.pow(10, -st.decimals);
+      const _micro = (Math.random() < 0.5 ? 1 : -1) * _pip * 1.0;
+      st.price = Number((st.price + _micro).toFixed(st.decimals));
+    } else {
+      st.price = Number(st.price.toFixed(st.decimals));
+    }
     return st.price;
   }
 
@@ -306,10 +304,14 @@ function nextPrice(st, now = Date.now(), over) {
       if (_r < 0.25)      mag = 0.05 + Math.random() * 0.25;
       else if (_r < 0.85) mag = 0.3 + Math.pow(Math.random(), -0.35) * 0.6;
       else                mag = 1.5 + Math.pow(Math.random(), -0.5) * 2;
-      // [NO MICRO-REVERSE] এখানেও micro-reverse সরানো হলো — retrace
-      // এর প্রতিটা tick সরাসরি retrDir এর দিকে যাবে, কোনো এলোমেলো
-      // বিপরীত জিটার/দোলনি নেই।
-      delta = retrDir * base * Math.min(4, mag) * st.vol;
+      // [MICRO-DIRECTION] এখানেও মাঝে মাঝে সামান্য বিপরীত micro-tick
+      // [FIX: JITTER] retrace সাধারণত ছোট (১-৪ tick), তাই burst এর মতো
+      // ৪২% micro-reverse দিলে অল্প কয়েকটা tick এর মধ্যেই "হুদায়
+      // কাঁপুনি" (net movement প্রায় ০, শুধু এদিক-ওদিক নড়া) তৈরি হত।
+      // Retrace এ কম (২০%) রাখা হলো, যাতে target এর দিকে যথেষ্ট
+      // consistent progress থাকে।
+      const microDir = (Math.random() < 0.20) ? -retrDir : retrDir;
+      delta = microDir * base * Math.min(4, mag) * st.vol;
       // লক্ষ্য পেরিয়ে গেলে থামি
       if (Math.abs((st.retrDone || 0) + delta) > Math.abs(st.retrTarget)) delta = remain;
     }
@@ -320,35 +322,28 @@ function nextPrice(st, now = Date.now(), over) {
     /* ── ৪. bid-ask কাঁপুনি ── */
     delta = (Math.random() - 0.5) * base * c.spread * st.vol * sm;
   } else {
-    // [CONTEXT-DEPENDENT MAGNITUDE] শুধু independent random draw না —
-    // speed regime আর সাম্প্রতিক magnitude (recentMag, EMA) দুটোই
-    // মিলিয়ে distribution shift হয়। burst/fast regime এ বড় jump এর
-    // সম্ভাবনা বাড়ে, slow regime এ ছোট jump এর সম্ভাবনা বাড়ে —
-    // "speed আর jump-size একসাথে couple করা" এই GPT observation
-    // অনুযায়ী।
-    const _regimeBoost = st.speedRegime === 'burst' ? 0.20
-                        : st.speedRegime === 'fast'  ? 0.10
-                        : st.speedRegime === 'slow'  ? -0.12
-                        : 0;
-    const _r = Math.random() - _regimeBoost;
+    // [WAVE FIX] পায়ের মাপে আরও বৈচিত্র্য — আগে বেশিরভাগ tick প্রায়
+    // সমান ছোট (১-৫ pip) রেঞ্জে আটকে থাকত, যেটা "ঢেউ এর মতো গড়িয়ে
+    // চলা" ভাব দিত (real market এ tick discrete লাফায়, glide করে না)।
+    // এখন তিন ভাগে: প্রায়ই খুব ছোট (near-flat), মাঝারি সাধারণ, আর
+    // মাঝে মাঝে সত্যিকারের বড় লাফ — এই মিশ্রণটাই "লাফিয়ে লাফিয়ে"
+    // ভাব দেয়, একঘেয়ে glide না।
+    const _r = Math.random();
     let mag;
-    // [MEDIUM DOMINANT] GPT এর video-observation — "সবচেয়ে বেশি
-    // থাকে মাঝারি জাম্প টিক টু টিক", flat/near-zero tick কে baseline
-    // বানানো উচিত না। আগে flat ২৫%, এখন ১২% — medium এখন dominant।
-    if (_r < 0.12)      mag = 0.15 + Math.random() * 0.55;                  // প্রায়-flat (কম, কিন্তু আরও বৈচিত্র্যময়)
-    else if (_r < 0.88) mag = 0.5 + Math.pow(Math.random(), -0.35) * 0.7;   // মাঝারি (dominant)
+    if (_r < 0.25)      mag = 0.05 + Math.random() * 0.25;                  // প্রায়-flat
+    else if (_r < 0.85) mag = 0.3 + Math.pow(Math.random(), -0.35) * 0.6;   // সাধারণ
     else                mag = 1.5 + Math.pow(Math.random(), -0.5) * 2;      // বড় লাফ
-    // সাম্প্রতিক বড় jump এর পরে সামান্য recovery bias — একটানা অনেক
-    // বড় jump না হয়ে মাঝেমধ্যে ছোট হয়ে "শ্বাস" নেয়
-    if (st.recentMag > 3) mag *= 0.7;
-    st.recentMag = st.recentMag * 0.8 + mag * 0.2;   // EMA আপডেট
-    // [NO MICRO-REVERSE] আগে প্রতিটা tick এ কিছু সম্ভাবনায় বিপরীত
-    // দিকে যেত (micro-reverse/jitter) — এটাই "দোলনি/gorano" তৈরি
-    // করছিল (1.08489 → 1.08491 → 1.08489 এর মতো up-down-up-down)।
-    // User স্পষ্টভাবে চেয়েছে: প্রতিটা tick শুধু st.dir এর দিকেই
-    // যাক (A→Z clean jump), direction change শুধু phase-transition
-    // এ (নতুন burst/retrace শুরু) হবে, প্রতি-tick এলোমেলো না।
-    delta = st.dir * base * Math.min(8, mag) * st.vol * sm;
+    // [MOMENTUM-DEPENDENT REVERSE] আগে দুই ধাপে ছিল — fixed ৪২% random,
+    // তারপর ৩-৪ tick পর জোর করে reverse। দুটোই hard-coded sequence
+    // তৈরি করছিল, real market এর মতো "emergent" লাগছিল না। এখন
+    // reverse probability সরাসরি excite (momentum/উত্তেজনা) এর সাথে
+    // যুক্ত — শান্ত অবস্থায় কম reverse (persistent direction),
+    // উত্তেজিত/volatile অবস্থায় বেশি reverse (choppy) — কোনো fixed
+    // trigger-count নেই, প্রতিটা tick এর সিদ্ধান্ত independent কিন্তু
+    // context-aware।
+    const _reverseProb = 0.12 + st.excite * 0.18 + Math.random() * 0.10;
+    const _microDir = (Math.random() < _reverseProb) ? -st.dir : st.dir;
+    delta = _microDir * base * Math.min(8, mag) * st.vol * sm;
     // [MIN-PIP GUARD] বড়-magnitude দামে (যেমন ১৪০০+, যেখানে ২ দশমিক
     // ঘর হয়) base/pip অনুপাত ছোট হয়ে যেত, তাই "প্রায়-flat" tick round
     // হয়ে প্রায়ই ০-১ pip এ নেমে আসত — সেটাই "1417.35 ↔ 1417.34" এর
@@ -414,82 +409,45 @@ function nextPrice(st, now = Date.now(), over) {
  * ঝলকে দ্রুত, শ্বাসে ধীর, উত্তেজনায় আরও দ্রুত; মাঝে মাঝে ঝাঁক বা
  * হঠাৎ থমকে যাওয়া।
  */
-function nextDelay(st, over, now = Date.now()) {
+function nextDelay(st, over) {
   const c = over ? { ...CFG, ...over } : CFG;
 
   // [VISIBLE PAUSE] hard-pause চলাকালীন ছোট, নিয়মিত gap — দাম বদলাবে
   // না ঠিকই (nextPrice এ static থাকে), কিন্তু UI প্রতি tick এ চেক
   // করে যাবে যাতে pause শেষ হওয়া মাত্র normal movement সাথে সাথে
   // আবার শুরু হয়, বাড়তি দেরি না হয়।
-  // [FIX] আগে এখানে সরাসরি Date.now() ছিল, nextPrice() এর now
-  // parameter এর সাথে সামঞ্জস্যহীন — simulation/testing এ regime
-  // ও pause-timer ভুলভাবে stuck হয়ে যেত। এখন consistent parameter।
-  if (st.hardPauseUntil && now < st.hardPauseUntil) {
+  if (st.hardPauseUntil && Date.now() < st.hardPauseUntil) {
     return 150;
   }
 
   let g = c.gapMs;
 
-  // [SPEED REGIME] আগে speed প্রতি tick এ নিজে থেকে multiply হত —
-  // technically persistent হলেও প্রতি tick এ নতুন probability-check
-  // হওয়ায় "SLOW SLOW SLOW → FAST FAST FAST" এর মতো কয়েক tick ধরে
-  // স্থির থাকা regime তৈরি হচ্ছিল না, বরং প্রায় প্রতি tick এই
-  // এলোমেলো ওঠানামা করত। এখন একটা discrete named regime আছে
-  // (slow/normal/fast/burst) যেটা কয়েকটা tick ধরে বহাল থাকে, তারপর
-  // নতুন regime এ পরিবর্তন হয়।
-  const _SPEED_REGIMES = {
-    slow:   1.6,
-    normal: 1.0,
-    fast:   0.55,
-    burst:  0.28,
-  };
-  // [TRANSITION MATRIX] GPT এর দ্বিতীয় analysis অনুযায়ী — শুধু
-  // "fast এর পরে recovery বেশি" এই একমুখী rule যথেষ্ট না, প্রতিটা
-  // regime-pair এর নিজস্ব probability দরকার। যেমন slow→slow বেশি
-  // (persistent calm), burst→burst কম (burst বেশিক্ষণ টেকে না)।
-  const _TRANSITIONS = {
-    slow:   { slow: 0.45, normal: 0.35, fast: 0.15, burst: 0.05 },
-    normal: { slow: 0.20, normal: 0.40, fast: 0.30, burst: 0.10 },
-    fast:   { slow: 0.15, normal: 0.35, fast: 0.35, burst: 0.15 },
-    burst:  { slow: 0.10, normal: 0.30, fast: 0.35, burst: 0.25 },
-  };
-  const _DURATIONS = {
-    slow:   [8, 18],
-    normal: [6, 14],
-    fast:   [4, 10],
-    burst:  [2, 6],
-  };
-  if (--st.speedRegimeLeft <= 0) {
-    const probs = _TRANSITIONS[st.speedRegime] || _TRANSITIONS.normal;
-    const r = Math.random();
-    let acc = 0, next = 'normal';
-    for (const [name, p] of Object.entries(probs)) {
-      acc += p;
-      if (r < acc) { next = name; break; }
-    }
-    st.speedRegime = next;
-    const [lo, hi] = _DURATIONS[next] || [5, 12];
-    st.speedRegimeLeft = lo + ((Math.random() * (hi - lo + 1)) | 0);
-  }
-  st.speed = _SPEED_REGIMES[st.speedRegime];
+  // [SPEED STATE] GPT-র সুপারিশ — শুধু per-tick independent random delay
+  // দিলে "random-number-generator" এর মতো লাগে, কোনো momentum নেই।
+  // এখন একটা persistent speed state আছে যেটা প্রতি tick এ সামান্য
+  // বদলায় (কদাচিৎ হঠাৎ, বেশিরভাগ সময় ধীরে) — তাই "slow → একটু fast →
+  // burst → আবার ধীর" এই ধরনের গ্র্যাজুয়াল transition তৈরি হয়,
+  // প্রতিটা tick আলাদা dice-roll না হয়ে একটা ধারাবাহিকতা থাকে।
+  const _sr = Math.random();
+  if (_sr < 0.15) st.speed *= 0.65;         // হঠাৎ দ্রুত
+  else if (_sr < 0.30) st.speed *= 1.45;    // হঠাৎ ধীর
+  else st.speed *= 0.92 + Math.random() * 0.16;  // সামান্য drift
+  st.speed = Math.max(0.45, Math.min(2.2, st.speed));
 
   g *= st.phase === 'run' ? 0.5
      : st.phase === 'rest' ? 1.4
      : st.phase === 'retrace' ? (st.retrFast ? 0.45 : 1.05)   // দ্রুত/ধীর ফেরত
      : 1;
   g *= 1 - 0.6 * st.excite * c.spdVar;          // উত্তেজনায় দ্রুত
-  g *= st.speed;                                 // regime-based speed প্রয়োগ
+  g *= st.speed;                                 // persistent speed state প্রয়োগ
 
-  // ছোট ফ্রেম-টু-ফ্রেম variation, কিন্তু regime নিজে বদলায় না
-  g *= 0.85 + Math.random() * 0.3;
-  // [SPEED FIX] আগে floor ৩৫ms ছিল — burst-regime + run-phase একসাথে
-  // compound হয়ে effective gap মাত্র ৬০ms (~১৭ tick/সেকেন্ড) হয়ে
-  // যেত, যেটা গড় tick-rate কে টেনে অনেক নিচে নামাচ্ছিল, তাই "speed
-  // নেই, real market এর মতো লাগছে না" — কারণ real market এ কখনোই
-  // sustained ১৭/সেকেন্ড এর মতো দ্রুত ধারাবাহিকভাবে চলে না। Floor
-  // বাড়িয়ে ১২০ms করা হলো, যাতে সব regime/phase মিলিয়েও কখনো
-  // অবাস্তব দ্রুত না হয়।
-  return Math.max(120, Math.min(2500, g));
+  const roll = Math.random();
+  if (roll < 0.12 * c.spdVar) g *= 0.22;        // ঝাঁক — খুব দ্রুত
+  else if (roll < 0.20 * c.spdVar) g *= 0.45;
+  else if (roll > 1 - 0.07 * c.spdVar) g *= 2.4; // হঠাৎ থমকে যাওয়া
+
+  g *= 0.6 + Math.random() * 0.8;
+  return Math.max(35, Math.min(2500, g));
 }
 
 module.exports = { createState, nextPrice, nextDelay, sessionMul, CFG };
