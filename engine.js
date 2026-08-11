@@ -36,7 +36,7 @@ const CFG = {
   unit:    num(process.env.ENG_UNIT,     0.000018),  // base একক (দামের অনুপাতে)
   volMem:  num(process.env.ENG_VOL_MEM,  0.994),    // অস্থিরতার স্মৃতি
   volAmp:  num(process.env.ENG_VOL_AMP,  0.28),     // ওঠানামার মাত্রা
-  runLen:  num(process.env.ENG_RUN_LEN,  8),        // ঝলকের গড় tick
+  runLen:  num(process.env.ENG_RUN_LEN,  6),        // ঝলকের গড় tick
   restLen: num(process.env.ENG_REST_LEN, 5),        // শ্বাসের গড় tick
   clust:   num(process.env.ENG_CLUST,    0.45),     // ঝলক গুচ্ছ হওয়া
   retr:    num(process.env.ENG_RETR,     0.40),     // ফিরতি টান
@@ -208,7 +208,7 @@ function nextPrice(st, now = Date.now(), over) {
         // ঘন ঘন freeze দেখাচ্ছিল। এখন শুধু ~৪৫% rest এ visible pause,
         // duration ও কমানো (৩০০-৯০০ms), বাকি সময় rest এ থাকলেও
         // engine স্বাভাবিক ছোট movement চালিয়ে যাবে।
-        if (Math.random() < 0.45) {
+        if (Math.random() < 0.18) {
           st.hardPauseUntil = now + (300 + Math.random() * 600);
         }
       }
@@ -227,7 +227,7 @@ function nextPrice(st, now = Date.now(), over) {
         // ঘন ঘন freeze দেখাচ্ছিল। এখন শুধু ~৪৫% rest এ visible pause,
         // duration ও কমানো (৩০০-৯০০ms), বাকি সময় rest এ থাকলেও
         // engine স্বাভাবিক ছোট movement চালিয়ে যাবে।
-        if (Math.random() < 0.45) {
+        if (Math.random() < 0.18) {
           st.hardPauseUntil = now + (300 + Math.random() * 600);
         }
       } else {
