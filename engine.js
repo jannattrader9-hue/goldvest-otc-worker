@@ -420,14 +420,17 @@ function nextPrice(st, now = Date.now(), over) {
  * ঝলকে দ্রুত, শ্বাসে ধীর, উত্তেজনায় আরও দ্রুত; মাঝে মাঝে ঝাঁক বা
  * হঠাৎ থমকে যাওয়া।
  */
-function nextDelay(st, over) {
+function nextDelay(st, over, now = Date.now()) {
   const c = over ? { ...CFG, ...over } : CFG;
 
   // [VISIBLE PAUSE] hard-pause চলাকালীন ছোট, নিয়মিত gap — দাম বদলাবে
   // না ঠিকই (nextPrice এ static থাকে), কিন্তু UI প্রতি tick এ চেক
   // করে যাবে যাতে pause শেষ হওয়া মাত্র normal movement সাথে সাথে
   // আবার শুরু হয়, বাড়তি দেরি না হয়।
-  if (st.hardPauseUntil && Date.now() < st.hardPauseUntil) {
+  // [FIX] আগে এখানে সরাসরি Date.now() ছিল, nextPrice() এর now
+  // parameter এর সাথে সামঞ্জস্যহীন — simulation/testing এ regime
+  // ও pause-timer ভুলভাবে stuck হয়ে যেত। এখন consistent parameter।
+  if (st.hardPauseUntil && now < st.hardPauseUntil) {
     return 150;
   }
 
@@ -438,28 +441,41 @@ function nextDelay(st, over) {
   // হওয়ায় "SLOW SLOW SLOW → FAST FAST FAST" এর মতো কয়েক tick ধরে
   // স্থির থাকা regime তৈরি হচ্ছিল না, বরং প্রায় প্রতি tick এই
   // এলোমেলো ওঠানামা করত। এখন একটা discrete named regime আছে
-  // (slow/normal/fast/burst) যেটা কয়েকটা tick (৫-১৫টা) ধরে বহাল
-  // থাকে, তারপর নতুন regime এ পরিবর্তন হয় — GPT এর চাওয়া "speed
-  // state" ঠিক এই আচরণ।
+  // (slow/normal/fast/burst) যেটা কয়েকটা tick ধরে বহাল থাকে, তারপর
+  // নতুন regime এ পরিবর্তন হয়।
   const _SPEED_REGIMES = {
     slow:   1.6,
     normal: 1.0,
     fast:   0.55,
     burst:  0.28,
   };
+  // [TRANSITION MATRIX] GPT এর দ্বিতীয় analysis অনুযায়ী — শুধু
+  // "fast এর পরে recovery বেশি" এই একমুখী rule যথেষ্ট না, প্রতিটা
+  // regime-pair এর নিজস্ব probability দরকার। যেমন slow→slow বেশি
+  // (persistent calm), burst→burst কম (burst বেশিক্ষণ টেকে না)।
+  const _TRANSITIONS = {
+    slow:   { slow: 0.45, normal: 0.35, fast: 0.15, burst: 0.05 },
+    normal: { slow: 0.20, normal: 0.40, fast: 0.30, burst: 0.10 },
+    fast:   { slow: 0.15, normal: 0.35, fast: 0.35, burst: 0.15 },
+    burst:  { slow: 0.10, normal: 0.30, fast: 0.35, burst: 0.25 },
+  };
+  const _DURATIONS = {
+    slow:   [8, 18],
+    normal: [6, 14],
+    fast:   [4, 10],
+    burst:  [2, 6],
+  };
   if (--st.speedRegimeLeft <= 0) {
+    const probs = _TRANSITIONS[st.speedRegime] || _TRANSITIONS.normal;
     const r = Math.random();
-    // পরের regime ঠিক করা — burst/fast এর পরে recovery/slow এর
-    // সম্ভাবনা বেশি (ক্লান্তির মতো), slow এর পরে normal এ ফেরার
-    // সম্ভাবনা বেশি — সম্পূর্ণ independent random না, সামান্য
-    // "আগের regime কী ছিল" তার উপর নির্ভরশীল।
-    const prevFast = (st.speedRegime === 'fast' || st.speedRegime === 'burst');
-    if (prevFast) {
-      st.speedRegime = r < 0.5 ? 'normal' : (r < 0.8 ? 'slow' : 'fast');
-    } else {
-      st.speedRegime = r < 0.40 ? 'normal' : (r < 0.65 ? 'slow' : (r < 0.88 ? 'fast' : 'burst'));
+    let acc = 0, next = 'normal';
+    for (const [name, p] of Object.entries(probs)) {
+      acc += p;
+      if (r < acc) { next = name; break; }
     }
-    st.speedRegimeLeft = 5 + ((Math.random() * 10) | 0);   // ৫-১৪ tick ধরে থাকবে
+    st.speedRegime = next;
+    const [lo, hi] = _DURATIONS[next] || [5, 12];
+    st.speedRegimeLeft = lo + ((Math.random() * (hi - lo + 1)) | 0);
   }
   st.speed = _SPEED_REGIMES[st.speedRegime];
 
