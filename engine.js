@@ -275,18 +275,11 @@ function nextPrice(st, now = Date.now(), over) {
   // [MICRO-MOVEMENT PAUSE] আগে hard-pause এ delta সম্পূর্ণ ০ ছিল —
   // GPT এর observation অনুযায়ী এটা "artificial" লাগতে পারে, real
   // market এ pause মানে সবসময় absolute zero না, মাঝে মাঝে খুবই ছোট
-  // (sub-pip) নড়াচড়া থাকে। তাই এখন ৭৫% সময় সত্যিই static (visible
-  // pause বজায় থাকে), কিন্তু ২৫% সময় এক pip এর সামান্য কম একটা
-  // micro-tick হয় — pause এর "থেমে যাওয়া" ভাব অক্ষত থাকে কিন্তু
-  // সম্পূর্ণ frozen লাগে না।
+  // [PURE STATIC PAUSE] micro-tick জিটার সরানো হলো — user চায় কোনো
+  // দোলনি না। Hard-pause এখন সম্পূর্ণ static (delta=0), যেটাই "থেমে
+  // যাওয়া" এর সবচেয়ে পরিষ্কার visual।
   if (st.hardPauseUntil && now < st.hardPauseUntil) {
-    if (Math.random() < 0.25) {
-      const _pip = Math.pow(10, -st.decimals);
-      const _micro = (Math.random() < 0.5 ? 1 : -1) * _pip * 1.0;
-      st.price = Number((st.price + _micro).toFixed(st.decimals));
-    } else {
-      st.price = Number(st.price.toFixed(st.decimals));
-    }
+    st.price = Number(st.price.toFixed(st.decimals));
     return st.price;
   }
 
@@ -307,14 +300,10 @@ function nextPrice(st, now = Date.now(), over) {
       if (_r < 0.25)      mag = 0.05 + Math.random() * 0.25;
       else if (_r < 0.85) mag = 0.3 + Math.pow(Math.random(), -0.35) * 0.6;
       else                mag = 1.5 + Math.pow(Math.random(), -0.5) * 2;
-      // [MICRO-DIRECTION] এখানেও মাঝে মাঝে সামান্য বিপরীত micro-tick
-      // [FIX: JITTER] retrace সাধারণত ছোট (১-৪ tick), তাই burst এর মতো
-      // ৪২% micro-reverse দিলে অল্প কয়েকটা tick এর মধ্যেই "হুদায়
-      // কাঁপুনি" (net movement প্রায় ০, শুধু এদিক-ওদিক নড়া) তৈরি হত।
-      // Retrace এ কম (২০%) রাখা হলো, যাতে target এর দিকে যথেষ্ট
-      // consistent progress থাকে।
-      const microDir = (Math.random() < 0.20) ? -retrDir : retrDir;
-      delta = microDir * base * Math.min(4, mag) * st.vol;
+      // [NO MICRO-REVERSE] এখানেও micro-reverse সরানো হলো — retrace
+      // এর প্রতিটা tick সরাসরি retrDir এর দিকে যাবে, কোনো এলোমেলো
+      // বিপরীত জিটার/দোলনি নেই।
+      delta = retrDir * base * Math.min(4, mag) * st.vol;
       // লক্ষ্য পেরিয়ে গেলে থামি
       if (Math.abs((st.retrDone || 0) + delta) > Math.abs(st.retrTarget)) delta = remain;
     }
@@ -344,17 +333,13 @@ function nextPrice(st, now = Date.now(), over) {
     // বড় jump না হয়ে মাঝেমধ্যে ছোট হয়ে "শ্বাস" নেয়
     if (st.recentMag > 3) mag *= 0.7;
     st.recentMag = st.recentMag * 0.8 + mag * 0.2;   // EMA আপডেট
-    // [MOMENTUM-DEPENDENT REVERSE] আগে দুই ধাপে ছিল — fixed ৪২% random,
-    // তারপর ৩-৪ tick পর জোর করে reverse। দুটোই hard-coded sequence
-    // তৈরি করছিল, real market এর মতো "emergent" লাগছিল না। এখন
-    // reverse probability সরাসরি excite (momentum/উত্তেজনা) এর সাথে
-    // যুক্ত — শান্ত অবস্থায় কম reverse (persistent direction),
-    // উত্তেজিত/volatile অবস্থায় বেশি reverse (choppy) — কোনো fixed
-    // trigger-count নেই, প্রতিটা tick এর সিদ্ধান্ত independent কিন্তু
-    // context-aware।
-    const _reverseProb = 0.12 + st.excite * 0.18 + Math.random() * 0.10;
-    const _microDir = (Math.random() < _reverseProb) ? -st.dir : st.dir;
-    delta = _microDir * base * Math.min(8, mag) * st.vol * sm;
+    // [NO MICRO-REVERSE] আগে প্রতিটা tick এ কিছু সম্ভাবনায় বিপরীত
+    // দিকে যেত (micro-reverse/jitter) — এটাই "দোলনি/gorano" তৈরি
+    // করছিল (1.08489 → 1.08491 → 1.08489 এর মতো up-down-up-down)।
+    // User স্পষ্টভাবে চেয়েছে: প্রতিটা tick শুধু st.dir এর দিকেই
+    // যাক (A→Z clean jump), direction change শুধু phase-transition
+    // এ (নতুন burst/retrace শুরু) হবে, প্রতি-tick এলোমেলো না।
+    delta = st.dir * base * Math.min(8, mag) * st.vol * sm;
     // [MIN-PIP GUARD] বড়-magnitude দামে (যেমন ১৪০০+, যেখানে ২ দশমিক
     // ঘর হয়) base/pip অনুপাত ছোট হয়ে যেত, তাই "প্রায়-flat" tick round
     // হয়ে প্রায়ই ০-১ pip এ নেমে আসত — সেটাই "1417.35 ↔ 1417.34" এর
