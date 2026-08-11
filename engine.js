@@ -42,7 +42,7 @@ const CFG = {
   retr:    num(process.env.ENG_RETR,     0.40),     // ফিরতি টান
   jump:    num(process.env.ENG_JUMP,     1.8),      // হঠাৎ বড় লাফ %
   spread:  num(process.env.ENG_SPREAD,   1.0),      // bid-ask কাঁপুনি
-  gapMs:   num(process.env.ENG_GAP_MS,   500),      // গড় tick ব্যবধান
+  gapMs:   num(process.env.ENG_GAP_MS,   320),      // গড় tick ব্যবধান
   spdVar:  num(process.env.ENG_SPD_VAR,  0.72),     // গতির তারতম্য
   bias:    num(process.env.ENG_BIAS,     0.008),     // trend পক্ষপাত
   session: num(process.env.ENG_SESSION,  0.55),     // দিনের ছন্দ
@@ -335,7 +335,7 @@ function nextPrice(st, now = Date.now(), over) {
     // [MEDIUM DOMINANT] GPT এর video-observation — "সবচেয়ে বেশি
     // থাকে মাঝারি জাম্প টিক টু টিক", flat/near-zero tick কে baseline
     // বানানো উচিত না। আগে flat ২৫%, এখন ১২% — medium এখন dominant।
-    if (_r < 0.12)      mag = 0.15 + Math.random() * 0.25;                  // প্রায়-flat (কম)
+    if (_r < 0.12)      mag = 0.15 + Math.random() * 0.55;                  // প্রায়-flat (কম, কিন্তু আরও বৈচিত্র্যময়)
     else if (_r < 0.88) mag = 0.5 + Math.pow(Math.random(), -0.35) * 0.7;   // মাঝারি (dominant)
     else                mag = 1.5 + Math.pow(Math.random(), -0.5) * 2;      // বড় লাফ
     // সাম্প্রতিক বড় jump এর পরে সামান্য recovery bias — একটানা অনেক
