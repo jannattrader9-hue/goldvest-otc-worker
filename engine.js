@@ -206,7 +206,7 @@ function nextPrice(st, now = Date.now(), over) {
         // duration ও কমানো (৩০০-৯০০ms), বাকি সময় rest এ থাকলেও
         // engine স্বাভাবিক ছোট movement চালিয়ে যাবে।
         if (Math.random() < 0.45) {
-          st.hardPauseUntil = now + (300 + Math.random() * 600);
+          st.hardPauseUntil = now + 700;   // [DEMO-MATCH] fixed 700ms, demo এর সাথে হুবহু
         }
       }
     } else if (st.phase === 'retrace') {
@@ -225,7 +225,7 @@ function nextPrice(st, now = Date.now(), over) {
         // duration ও কমানো (৩০০-৯০০ms), বাকি সময় rest এ থাকলেও
         // engine স্বাভাবিক ছোট movement চালিয়ে যাবে।
         if (Math.random() < 0.45) {
-          st.hardPauseUntil = now + (300 + Math.random() * 600);
+          st.hardPauseUntil = now + 700;   // [DEMO-MATCH] fixed 700ms, demo এর সাথে হুবহু
         }
       } else {
         st.phase = 'run';
@@ -299,19 +299,15 @@ function nextPrice(st, now = Date.now(), over) {
       delta = remain;                                    // শেষ পা — বাকিটুকু
     } else {
       const retrDir = Math.sign(st.retrTarget);
+      // [DEMO-MATCHED — EXACT] burst এর মতোই একই demo-distribution,
+      // কোনো micro-direction/vol-multiplier ছাড়া সরাসরি pip।
       const _r = Math.random();
       let mag;
-      if (_r < 0.25)      mag = 0.05 + Math.random() * 0.25;
-      else if (_r < 0.85) mag = 0.3 + Math.pow(Math.random(), -0.35) * 0.6;
-      else                mag = 1.5 + Math.pow(Math.random(), -0.5) * 2;
-      // [MICRO-DIRECTION] এখানেও মাঝে মাঝে সামান্য বিপরীত micro-tick
-      // [FIX: JITTER] retrace সাধারণত ছোট (১-৪ tick), তাই burst এর মতো
-      // ৪২% micro-reverse দিলে অল্প কয়েকটা tick এর মধ্যেই "হুদায়
-      // কাঁপুনি" (net movement প্রায় ০, শুধু এদিক-ওদিক নড়া) তৈরি হত।
-      // Retrace এ কম (২০%) রাখা হলো, যাতে target এর দিকে যথেষ্ট
-      // consistent progress থাকে।
-      const microDir = (Math.random() < 0.20) ? -retrDir : retrDir;
-      delta = microDir * base * Math.min(4, mag) * st.vol;
+      if (_r < 0.45)      mag = 1 + Math.random()*2;
+      else if (_r < 0.75) mag = 3 + Math.random()*5;
+      else                mag = 8 + Math.random()*12;
+      const pip = Math.pow(10, -st.decimals);
+      delta = retrDir * pip * mag;
       // লক্ষ্য পেরিয়ে গেলে থামি
       if (Math.abs((st.retrDone || 0) + delta) > Math.abs(st.retrTarget)) delta = remain;
     }
@@ -322,28 +318,19 @@ function nextPrice(st, now = Date.now(), over) {
     /* ── ৪. bid-ask কাঁপুনি ── */
     delta = (Math.random() - 0.5) * base * c.spread * st.vol * sm;
   } else {
-    // [WAVE FIX] পায়ের মাপে আরও বৈচিত্র্য — আগে বেশিরভাগ tick প্রায়
-    // সমান ছোট (১-৫ pip) রেঞ্জে আটকে থাকত, যেটা "ঢেউ এর মতো গড়িয়ে
-    // চলা" ভাব দিত (real market এ tick discrete লাফায়, glide করে না)।
-    // এখন তিন ভাগে: প্রায়ই খুব ছোট (near-flat), মাঝারি সাধারণ, আর
-    // মাঝে মাঝে সত্যিকারের বড় লাফ — এই মিশ্রণটাই "লাফিয়ে লাফিয়ে"
-    // ভাব দেয়, একঘেয়ে glide না।
+    // [DEMO-MATCHED] User approved demo (tick-pause-timestamp.html) এর
+    // exact distribution — ৪৫% ছোট (১-৩ pip), ৩০% মাঝারি (৩-৮ pip),
+    // ২৫% বড় (৮-২০ pip)। base ≈ ২ pip, তাই mag = pip/2 করে convert।
     const _r = Math.random();
     let mag;
-    if (_r < 0.25)      mag = 0.05 + Math.random() * 0.25;                  // প্রায়-flat
-    else if (_r < 0.85) mag = 0.3 + Math.pow(Math.random(), -0.35) * 0.6;   // সাধারণ
-    else                mag = 1.5 + Math.pow(Math.random(), -0.5) * 2;      // বড় লাফ
-    // [MOMENTUM-DEPENDENT REVERSE] আগে দুই ধাপে ছিল — fixed ৪২% random,
-    // তারপর ৩-৪ tick পর জোর করে reverse। দুটোই hard-coded sequence
-    // তৈরি করছিল, real market এর মতো "emergent" লাগছিল না। এখন
-    // reverse probability সরাসরি excite (momentum/উত্তেজনা) এর সাথে
-    // যুক্ত — শান্ত অবস্থায় কম reverse (persistent direction),
-    // উত্তেজিত/volatile অবস্থায় বেশি reverse (choppy) — কোনো fixed
-    // trigger-count নেই, প্রতিটা tick এর সিদ্ধান্ত independent কিন্তু
-    // context-aware।
-    const _reverseProb = 0.12 + st.excite * 0.18 + Math.random() * 0.10;
-    const _microDir = (Math.random() < _reverseProb) ? -st.dir : st.dir;
-    delta = _microDir * base * Math.min(8, mag) * st.vol * sm;
+    if (_r < 0.45)      mag = 1 + Math.random()*2;                    // ছোট: ১-৩ pip
+    else if (_r < 0.75) mag = 3 + Math.random()*5;                    // মাঝারি: ৩-৮ pip
+    else                mag = 8 + Math.random()*12;                   // বড়: ৮-২০ pip
+    // [DEMO-MATCHED — EXACT] User approved demo এর সাথে হুবহু মেলাতে,
+    // reverse-probability/vol/session multiplier ছাড়া সরাসরি pip
+    // প্রয়োগ — demo তেও ঠিক এভাবেই ছিল, শুধু dir আর pip, অন্য কিছু না।
+    const pip = Math.pow(10, -st.decimals);
+    delta = st.dir * pip * mag;
     // [MIN-PIP GUARD] বড়-magnitude দামে (যেমন ১৪০০+, যেখানে ২ দশমিক
     // ঘর হয়) base/pip অনুপাত ছোট হয়ে যেত, তাই "প্রায়-flat" tick round
     // হয়ে প্রায়ই ০-১ pip এ নেমে আসত — সেটাই "1417.35 ↔ 1417.34" এর
@@ -355,14 +342,9 @@ function nextPrice(st, now = Date.now(), over) {
     }
   }
 
-  /* ── ৫. ভারী লেজ — শুধু active movement (run/retrace) এ, rest/
-     hard-pause এ প্রযোজ্য না (ওখানে আলাদাভাবে handle হয়) ── */
-  if (st.phase !== 'rest' && Math.random() * 100 < c.jump) {
-    const mag = base * (4 + Math.pow(Math.random(), -0.5) * 3) * st.vol;
-    delta += (Math.random() < 0.5 ? 1 : -1) * mag;
-    st.excite = Math.min(1, st.excite + 0.7);
-    st.vol = Math.min(4.5, st.vol * 1.25);
-  }
+  /* ── ৫. ভারী লেজ — [DEMO-MATCH] user approved demo তে এই আলাদা
+     jump-event নেই, শুধু ৩-ভাগের mag-distribution ই যথেষ্ট ছিল।
+     "একদম সেম" চাওয়া অনুযায়ী এই layer disable করা হলো। ── */
 
   /* ── ৭. regime — কয়েক মিনিট পরপর ঝোঁক বদলায় ── */
   if (--st.regimeLeft <= 0) {
