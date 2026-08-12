@@ -335,11 +335,17 @@ function nextPrice(st, now = Date.now(), over) {
     // দ্রুত speed এ মারে (main movement এ), শুধু retrace ছোট। আগে
     // বড় লাফ মাত্র ১৫% ছিল, flat/সাধারণ মিলিয়ে ৮৫% ছোট-মাঝারি
     // ছিল — সেটাই এখন উল্টে দেওয়া হলো, বড় লাফ এখন dominant।
+    // [FIX: TOO FREQUENT] আগের tune এ "বড় লাফ dominant" ভুলভাবে
+    // "৬৫% সময় বড়" করে ফেলেছিল — তাতে প্রায় প্রতি ৩য় tick-ই বড়
+    // হয়ে যাচ্ছিল, যেটা "হুদায় কদাচিৎ লাফালাফি" এর বদলে "সবসময়
+    // লাফালাফি" বানিয়ে দিচ্ছিল। এখন বড় লাফ সত্যিই কদাচিৎ (~১৫%),
+    // বেশিরভাগ সময় (৬৫%) normal/flat — কিন্তু যখন বড় হয়, তখন
+    // সত্যিই বড় (magnitude না কমিয়ে)।
     const _r = Math.random();
     let mag;
-    if (_r < 0.10)      mag = 0.10 + Math.random() * 0.30;                  // প্রায়-flat (বিরল)
-    else if (_r < 0.35) mag = 0.4 + Math.pow(Math.random(), -0.35) * 0.6;   // মাঝারি (কম)
-    else                mag = 1.8 + Math.pow(Math.random(), -0.55) * 3;     // বড় লাফ (dominant, ৬৫%)
+    if (_r < 0.40)      mag = 0.1 + Math.random() * 0.4;                    // প্রায়-flat (dominant, ৪০%)
+    else if (_r < 0.85) mag = 0.4 + Math.pow(Math.random(), -0.35) * 0.7;   // মাঝারি (৪৫%)
+    else                mag = 2 + Math.pow(Math.random(), -0.55) * 3.5;     // বড় লাফ (কদাচিৎ, ১৫%)
     // [MOMENTUM-DEPENDENT REVERSE] আগে দুই ধাপে ছিল — fixed ৪২% random,
     // তারপর ৩-৪ tick পর জোর করে reverse। দুটোই hard-coded sequence
     // তৈরি করছিল, real market এর মতো "emergent" লাগছিল না। এখন
