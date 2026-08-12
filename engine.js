@@ -3,32 +3,60 @@
 /**
  * engine.js — Fair Synthetic OTC Price Engine
  *
- * Features:
- *   1. Volatility memory / clustering
- *   2. Fish-tail rhythmic movement
- *   3. Persistent speed state
- *   4. Run / retrace / rest phases
- *   5. Heavy-tail price jumps
- *   6. Session-based volatility
- *   7. Pip-aware rounding
- *   8. Natural micro movement
+ * FIXED-SPEED VERSION
  *
- * IMPORTANT:
- *   - No trade-direction manipulation
- *   - No payout targeting
- *   - No hidden win-rate targeting
- *   - No settlement-specific bias
+ * ---------------------------------------------------------------
+ * Tick timing
+ * ---------------------------------------------------------------
  *
- * API:
- *   createState(price, decimals)
- *   nextPrice(state, now, overrides)
- *   nextDelay(state, overrides)
- *   sessionMul(timestamp, amount)
- *   CFG
+ * Every tick happens at exactly the same interval.
+ *
+ * Default:
+ *
+ *     500ms = 2 ticks / second
+ *     120 ticks / minute
+ *
+ * No random speed.
+ * No burst acceleration.
+ * No random delay.
+ *
+ * ---------------------------------------------------------------
+ * Fish-tail movement
+ * ---------------------------------------------------------------
+ *
+ * The price moves forward while oscillating with a fixed-frequency
+ * fish-tail pattern.
+ *
+ * Frequency and amplitude remain constant.
+ *
+ * ---------------------------------------------------------------
+ * API
+ * ---------------------------------------------------------------
+ *
+ * createState(price, decimals)
+ * nextPrice(state, now, overrides)
+ * nextDelay(state, overrides)
+ * sessionMul(timestamp, amount)
+ * CFG
+ *
+ * ---------------------------------------------------------------
+ * IMPORTANT
+ * ---------------------------------------------------------------
+ *
+ * This is a synthetic/fair price model.
+ * It contains no payout targeting, trade-result targeting,
+ * hidden win-rate targeting, or settlement manipulation.
+ *
  */
 
 const num = (v, d) =>
-  (v === undefined || v === '' || isNaN(+v)) ? d : +v;
+  (
+    v === undefined ||
+    v === '' ||
+    isNaN(+v)
+  )
+    ? d
+    : +v;
 
 
 /* ================================================================
@@ -37,70 +65,197 @@ const num = (v, d) =>
 
 const CFG = {
 
-  // Base movement relative to current price
-  unit: num(process.env.ENG_UNIT, 0.000018),
+  /*
+   * Base price movement.
+   */
+  unit:
+    num(
+      process.env.ENG_UNIT,
+      0.000018
+    ),
 
-  // Volatility memory
-  volMem: num(process.env.ENG_VOL_MEM, 0.994),
-  volAmp: num(process.env.ENG_VOL_AMP, 0.28),
 
-  // Movement phases
-  runLen: num(process.env.ENG_RUN_LEN, 8),
-  restLen: num(process.env.ENG_REST_LEN, 5),
+  /*
+   * Volatility memory.
+   */
+  volMem:
+    num(
+      process.env.ENG_VOL_MEM,
+      0.994
+    ),
 
-  // Retracement
-  retr: num(process.env.ENG_RETR, 0.40),
+  volAmp:
+    num(
+      process.env.ENG_VOL_AMP,
+      0.28
+    ),
 
-  // Large jump probability (%)
-  jump: num(process.env.ENG_JUMP, 1.8),
 
-  // Tick timing
-  gapMs: num(process.env.ENG_GAP_MS, 500),
-  spdVar: num(process.env.ENG_SPD_VAR, 0.72),
+  /*
+   * Movement phases.
+   */
+  runLen:
+    num(
+      process.env.ENG_RUN_LEN,
+      8
+    ),
 
-  // Session volatility
-  session: num(process.env.ENG_SESSION, 0.55),
+  restLen:
+    num(
+      process.env.ENG_REST_LEN,
+      5
+    ),
 
-  // Maximum single-tick movement
-  maxStep: num(process.env.ENG_MAX_STEP, 0.0015),
 
-  // Fish-tail settings
+  /*
+   * Retracement strength.
+   */
+  retr:
+    num(
+      process.env.ENG_RETR,
+      0.40
+    ),
+
+
+  /*
+   * Occasional large movement.
+   */
+  jump:
+    num(
+      process.env.ENG_JUMP,
+      1.8
+    ),
+
+
+  /*
+   * ============================================================
+   * FIXED TICK SPEED
+   * ============================================================
+   *
+   * 500ms:
+   *
+   * 2 ticks / second
+   * 120 ticks / minute
+   *
+   * Change this ONE value if you want another fixed speed.
+   */
+
+  gapMs:
+    num(
+      process.env.ENG_GAP_MS,
+      500
+    ),
+
+
+  /*
+   * Session volatility.
+   */
+  session:
+    num(
+      process.env.ENG_SESSION,
+      0.55
+    ),
+
+
+  /*
+   * Maximum movement per tick.
+   */
+  maxStep:
+    num(
+      process.env.ENG_MAX_STEP,
+      0.0015
+    ),
+
+
+  /*
+   * ============================================================
+   * FIXED FISH-TAIL SETTINGS
+   * ============================================================
+   *
+   * These values DO NOT change randomly.
+   */
+
   tailEnabled:
-    String(process.env.ENG_TAIL_ENABLED ?? 'true') !== 'false',
+    String(
+      process.env.ENG_TAIL_ENABLED ?? 'true'
+    ) !== 'false',
 
-  tailAmpMin:
-    num(process.env.ENG_TAIL_AMP_MIN, 0.20),
 
-  tailAmpMax:
-    num(process.env.ENG_TAIL_AMP_MAX, 1.00),
+  /*
+   * Fixed oscillation frequency.
+   */
+  tailFreq:
+    num(
+      process.env.ENG_TAIL_FREQ,
+      0.85
+    ),
 
-  tailFreqMin:
-    num(process.env.ENG_TAIL_FREQ_MIN, 0.55),
 
-  tailFreqMax:
-    num(process.env.ENG_TAIL_FREQ_MAX, 1.40),
+  /*
+   * Fixed amplitude.
+   */
+  tailAmp:
+    num(
+      process.env.ENG_TAIL_AMP,
+      0.65
+    ),
 
+
+  /*
+   * Overall strength of tail.
+   */
   tailStrength:
-    num(process.env.ENG_TAIL_STRENGTH, 0.85),
+    num(
+      process.env.ENG_TAIL_STRENGTH,
+      0.85
+    ),
 
-  // Visible pause
+
+  /*
+   * Pause is also disabled by default.
+   *
+   * The clock NEVER stops.
+   */
+  pauseEnabled:
+    String(
+      process.env.ENG_PAUSE_ENABLED ?? 'false'
+    ) === 'true',
+
+
   pauseChance:
-    num(process.env.ENG_PAUSE_CHANCE, 0.30),
+    num(
+      process.env.ENG_PAUSE_CHANCE,
+      0.30
+    ),
+
 
   pauseMinMs:
-    num(process.env.ENG_PAUSE_MIN_MS, 250),
+    num(
+      process.env.ENG_PAUSE_MIN_MS,
+      250
+    ),
+
 
   pauseMaxMs:
-    num(process.env.ENG_PAUSE_MAX_MS, 800),
+    num(
+      process.env.ENG_PAUSE_MAX_MS,
+      800
+    ),
 
-  // Natural micro movement
+
+  /*
+   * Tiny natural movement during rest.
+   */
   microMove:
-    num(process.env.ENG_MICRO_MOVE, 0.18),
+    num(
+      process.env.ENG_MICRO_MOVE,
+      0.18
+    )
 };
 
 
 /* ================================================================
-   DECIMAL / PIP HELPERS
+   DECIMAL / PIP
 ================================================================ */
 
 function _fitDecimals(price, given) {
@@ -110,203 +265,275 @@ function _fitDecimals(price, given) {
 
 function _tickScale(price, decimals) {
 
-  const step = Math.pow(10, -decimals);
+  const step =
+    Math.pow(
+      10,
+      -decimals
+    );
 
-  const want = price * 0.000012;
 
-  if (want >= step * 0.9) {
+  const want =
+    price * 0.000012;
+
+
+  if (
+    want >=
+    step * 0.9
+  ) {
+
     return 1;
   }
 
+
   return Math.min(
     3,
-    (step * 0.9) / Math.max(want, 1e-12)
+    (
+      step * 0.9
+    ) /
+    Math.max(
+      want,
+      1e-12
+    )
   );
 }
 
 
 /* ================================================================
-   STATE
+   CREATE STATE
 ================================================================ */
 
-function createState(price, decimals = 5) {
+function createState(
+  price,
+  decimals = 5
+) {
 
   return {
 
     price,
+
     decimals,
 
     tickScale:
-      _tickScale(price, decimals),
+      _tickScale(
+        price,
+        decimals
+      ),
 
-    // Volatility
+
+    /*
+     * Volatility.
+     */
     vol: 1,
 
-    // Phase
-    phase: 'rest',
+
+    /*
+     * Phase.
+     */
+    phase: 'run',
+
     left: 3,
 
-    // Natural directional momentum
-    dir: Math.random() < 0.5 ? 1 : -1,
 
-    // Excitement / momentum
+    /*
+     * Direction.
+     */
+    dir:
+      Math.random() < 0.5
+        ? 1
+        : -1,
+
+
+    /*
+     * Excitement.
+     */
     excite: 0,
 
-    // Retracement
-    runStart: price,
+
+    /*
+     * Run information.
+     */
+    runStart:
+      price,
+
+
+    /*
+     * Retracement.
+     */
     retrTarget: 0,
+
     retrDone: 0,
+
     retrLeft0: 1,
+
     retrFast: false,
 
-    // Long-term local regime
+
+    /*
+     * Local regime.
+     */
     regimeDir:
-      Math.random() < 0.5 ? 1 : -1,
+      Math.random() < 0.5
+        ? 1
+        : -1,
+
 
     regimeLeft:
-      200 + ((Math.random() * 500) | 0),
+      200 +
+      (
+        Math.random() *
+        500
+      ) | 0,
 
-    // Pause
+
+    /*
+     * Optional pause.
+     */
     hardPauseUntil: 0,
 
-    // Persistent speed
-    speed: 1,
 
-    // ============================================================
-    // FISH TAIL STATE
-    // ============================================================
+    /*
+     * ============================================================
+     * FIXED FISH TAIL
+     * ============================================================
+     */
 
     tailPhase:
-      Math.random() * Math.PI * 2,
+      Math.random() *
+      Math.PI *
+      2,
 
+
+    /*
+     * NEVER changes.
+     */
     tailFreq:
-      CFG.tailFreqMin +
-      Math.random() *
-      (CFG.tailFreqMax - CFG.tailFreqMin),
+      CFG.tailFreq,
 
+
+    /*
+     * NEVER changes.
+     */
     tailAmp:
-      CFG.tailAmpMin +
-      Math.random() *
-      (CFG.tailAmpMax - CFG.tailAmpMin),
+      CFG.tailAmp,
 
-    tailTargetAmp:
-      CFG.tailAmpMin +
-      Math.random() *
-      (CFG.tailAmpMax - CFG.tailAmpMin),
 
-    tailStrength: 0,
+    /*
+     * NEVER changes.
+     */
+    tailStrength:
+      CFG.tailStrength,
 
-    lastNow: Date.now(),
+
+    /*
+     * Fixed clock reference.
+     */
+    lastNow:
+      Date.now()
   };
 }
 
 
 /* ================================================================
-   SESSION VOLATILITY
+   SESSION MULTIPLIER
 ================================================================ */
 
-function sessionMul(t, amt) {
+function sessionMul(
+  t,
+  amt
+) {
 
-  const d = new Date(t);
+  const d =
+    new Date(t);
+
 
   const h =
     d.getUTCHours() +
-    d.getUTCMinutes() / 60;
+    d.getUTCMinutes() /
+    60;
+
 
   const curve =
     0.55 +
 
     0.75 *
     Math.exp(
-      -Math.pow((h - 13) / 5.5, 2)
+      -Math.pow(
+        (h - 13) /
+        5.5,
+        2
+      )
     ) +
 
     0.35 *
     Math.exp(
-      -Math.pow((h - 8.5) / 2.2, 2)
+      -Math.pow(
+        (h - 8.5) /
+        2.2,
+        2
+      )
     );
 
-  return 1 + (curve - 1) * amt;
+
+  return (
+    1 +
+    (
+      curve - 1
+    ) *
+    amt
+  );
 }
 
 
 /* ================================================================
-   FISH TAIL
+   FIXED FISH TAIL
 ================================================================ */
 
-function updateFishTail(st, now) {
+function updateFishTail(
+  st,
+  now
+) {
 
-  if (!CFG.tailEnabled) {
-    st.tailStrength = 0;
+  if (
+    !CFG.tailEnabled
+  ) {
+
     return 0;
   }
 
+
+  /*
+   * ============================================================
+   * FIXED TIME STEP
+   * ============================================================
+   *
+   * The tail advances according to elapsed time.
+   *
+   * Frequency is fixed.
+   *
+   * There is NO random frequency change.
+   */
+
   const previous =
-    st.lastNow || now;
+    st.lastNow ||
+    now;
+
 
   const dt =
     Math.max(
-      0.01,
-      Math.min(
-        0.5,
-        (now - previous) / 1000
-      )
-    );
-
-  st.lastNow = now;
-
-
-  /*
-   * Slowly change amplitude.
-   *
-   * This prevents:
-   *
-   *     strong
-   *     weak
-   *     strong
-   *     weak
-   *
-   * on every single tick.
-   */
-
-  if (Math.random() < 0.035) {
-
-    st.tailTargetAmp =
-      CFG.tailAmpMin +
-      Math.random() *
-      (CFG.tailAmpMax - CFG.tailAmpMin);
-  }
-
-
-  st.tailAmp +=
-    (
-      st.tailTargetAmp -
-      st.tailAmp
-    ) *
-    Math.min(
-      1,
-      dt * 1.8
-    );
-
-
-  /*
-   * Frequency changes slowly too.
-   */
-
-  if (Math.random() < 0.025) {
-
-    st.tailFreq =
-      CFG.tailFreqMin +
-      Math.random() *
+      0.001,
       (
-        CFG.tailFreqMax -
-        CFG.tailFreqMin
-      );
-  }
+        now -
+        previous
+      ) / 1000
+    );
+
+
+  st.lastNow =
+    now;
 
 
   /*
-   * Main phase.
+   * Main fish-tail wave.
    */
 
   st.tailPhase +=
@@ -316,7 +543,14 @@ function updateFishTail(st, now) {
     dt;
 
 
-  if (st.tailPhase > Math.PI * 2) {
+  /*
+   * Keep phase small.
+   */
+
+  if (
+    st.tailPhase >
+    Math.PI * 2
+  ) {
 
     st.tailPhase -=
       Math.PI * 2;
@@ -324,27 +558,39 @@ function updateFishTail(st, now) {
 
 
   /*
-   * Three waves combined.
+   * ============================================================
+   * MULTI-WAVE FISH TAIL
+   * ============================================================
    *
-   * wave1 = primary tail
-   * wave2 = asymmetric secondary motion
-   * wave3 = slow body drift
+   * Primary wave
+   * Secondary wave
+   * Body movement
+   *
+   * All frequencies are fixed.
    */
 
   const wave1 =
-    Math.sin(st.tailPhase);
+    Math.sin(
+      st.tailPhase
+    );
+
 
   const wave2 =
     Math.sin(
-      st.tailPhase * 2.07 +
+      st.tailPhase *
+      2.07 +
       0.8
-    ) * 0.28;
+    ) *
+    0.28;
+
 
   const wave3 =
     Math.sin(
-      st.tailPhase * 0.47 -
+      st.tailPhase *
+      0.47 -
       1.2
-    ) * 0.12;
+    ) *
+    0.12;
 
 
   const wave =
@@ -357,32 +603,37 @@ function updateFishTail(st, now) {
 
 
   /*
-   * Different phase = different tail intensity.
+   * Phase intensity.
+   *
+   * The speed remains fixed.
+   * Only the contribution to price differs.
    */
 
-  const desiredStrength =
+  let phaseStrength;
+
+
+  if (
     st.phase === 'run'
-      ? 1.0
-      : st.phase === 'retrace'
-        ? 0.70
-        : 0.12;
+  ) {
 
+    phaseStrength = 1.0;
 
-  st.tailStrength +=
-    (
-      desiredStrength -
-      st.tailStrength
-    ) *
-    Math.min(
-      1,
-      dt * 3
-    );
+  } else if (
+    st.phase === 'retrace'
+  ) {
+
+    phaseStrength = 0.70;
+
+  } else {
+
+    phaseStrength = 0.12;
+  }
 
 
   return (
     wave *
-    st.tailStrength *
-    CFG.tailStrength
+    phaseStrength *
+    st.tailStrength
   );
 }
 
@@ -393,13 +644,18 @@ function updateFishTail(st, now) {
 
 function randomRunLength(c) {
 
-  const u = Math.random();
+  const u =
+    Math.random();
+
 
   return Math.max(
     2,
     Math.round(
       c.runLen *
-      Math.pow(u, -0.45) *
+      Math.pow(
+        u,
+        -0.45
+      ) *
       0.6
     )
   );
@@ -407,26 +663,27 @@ function randomRunLength(c) {
 
 
 /* ================================================================
-   START NEW RUN
+   START RUN
 ================================================================ */
 
-function startRun(st, c) {
+function startRun(
+  st,
+  c
+) {
 
-  st.phase = 'run';
+  st.phase =
+    'run';
+
 
   st.left =
     randomRunLength(c);
 
-  /*
-   * Natural local direction.
-   *
-   * This is not connected to any trade.
-   */
 
   st.dir =
     Math.random() < 0.5
       ? 1
       : -1;
+
 
   st.runStart =
     st.price;
@@ -437,17 +694,33 @@ function startRun(st, c) {
    START REST
 ================================================================ */
 
-function startRest(st, now, c) {
+function startRest(
+  st,
+  now,
+  c
+) {
 
-  st.phase = 'rest';
+  st.phase =
+    'rest';
+
 
   st.left =
     1 +
-    ((Math.random() *
-      (c.restLen + 1)) | 0);
+    (
+      Math.random() *
+      (c.restLen + 1)
+    ) | 0;
 
+
+  /*
+   * Pause disabled by default.
+   *
+   * Even if enabled, this does NOT affect
+   * nextDelay(). The clock remains fixed.
+   */
 
   if (
+    c.pauseEnabled &&
     Math.random() <
     c.pauseChance
   ) {
@@ -460,30 +733,32 @@ function startRest(st, now, c) {
         c.pauseMinMs
       );
 
+
     st.hardPauseUntil =
-      now + duration;
+      now +
+      duration;
 
   } else {
 
-    st.hardPauseUntil = 0;
+    st.hardPauseUntil =
+      0;
   }
 }
 
 
 /* ================================================================
-   RETRACE SETUP
+   START RETRACE
 ================================================================ */
 
-function startRetrace(st, c) {
+function startRetrace(
+  st,
+  c
+) {
 
   const moved =
     st.price -
     st.runStart;
 
-  /*
-   * Retracement is based on actual movement.
-   * It does not know anything about trades.
-   */
 
   st.retrTarget =
     -moved *
@@ -491,22 +766,34 @@ function startRetrace(st, c) {
       c.retr *
       (
         0.55 +
-        Math.random() * 0.85
+        Math.random() *
+        0.85
       )
     );
 
 
-  st.retrDone = 0;
+  st.retrDone =
+    0;
 
 
   st.retrFast =
-    Math.random() < 0.5;
+    Math.random() <
+    0.5;
 
 
   st.retrLeft0 =
     st.retrFast
-      ? 1 + ((Math.random() * 2) | 0)
-      : 2 + ((Math.random() * 3) | 0);
+      ? 1 +
+        (
+          Math.random() *
+          2
+        ) | 0
+
+      : 2 +
+        (
+          Math.random() *
+          3
+        ) | 0;
 
 
   st.left =
@@ -514,132 +801,182 @@ function startRetrace(st, c) {
 
 
   if (
-    Math.abs(st.retrTarget) >
+    Math.abs(
+      st.retrTarget
+    ) >
     1e-12
   ) {
 
-    st.phase = 'retrace';
+    st.phase =
+      'retrace';
 
   } else {
 
-    startRest(st, Date.now(), c);
+    startRest(
+      st,
+      Date.now(),
+      c
+    );
   }
 }
 
 
 /* ================================================================
-   PHASE TRANSITIONS
+   PHASE UPDATE
 ================================================================ */
 
-function updatePhase(st, now, c) {
+function updatePhase(
+  st,
+  now,
+  c
+) {
 
   /*
+   * ------------------------------------------------------------
    * REST
+   * ------------------------------------------------------------
    */
 
-  if (st.phase === 'rest') {
+  if (
+    st.phase === 'rest'
+  ) {
 
     const restDone =
       !st.hardPauseUntil ||
-      now >= st.hardPauseUntil;
+      now >=
+      st.hardPauseUntil;
+
 
     if (!restDone) {
+
       return;
     }
 
-    st.hardPauseUntil = 0;
+
+    st.hardPauseUntil =
+      0;
 
 
     /*
-     * Sometimes extend the rest.
+     * Small chance of another rest.
      */
 
-    if (Math.random() < 0.08) {
+    if (
+      Math.random() <
+      0.08
+    ) {
 
       st.left =
         1 +
-        ((Math.random() * 3) | 0);
+        (
+          Math.random() *
+          3
+        ) | 0;
+
 
       return;
     }
 
 
-    startRun(st, c);
+    startRun(
+      st,
+      c
+    );
+
 
     return;
   }
 
 
   /*
+   * ------------------------------------------------------------
    * RETRACE
+   * ------------------------------------------------------------
    */
 
-  if (st.phase === 'retrace') {
+  if (
+    st.phase === 'retrace'
+  ) {
 
-    if (--st.left > 0) {
+    st.left--;
+
+
+    if (
+      st.left > 0
+    ) {
+
       return;
     }
 
 
-    /*
-     * Sometimes immediately continue into
-     * another run. Sometimes breathe first.
-     */
+    if (
+      Math.random() <
+      0.60
+    ) {
 
-    if (Math.random() < 0.60) {
-
-      startRun(st, c);
+      startRun(
+        st,
+        c
+      );
 
     } else {
 
-      startRest(st, now, c);
+      startRest(
+        st,
+        now,
+        c
+      );
     }
+
 
     return;
   }
 
 
   /*
+   * ------------------------------------------------------------
    * RUN
+   * ------------------------------------------------------------
    */
 
-  if (st.phase === 'run') {
-
-    /*
-     * Small probability of early retracement.
-     */
+  if (
+    st.phase === 'run'
+  ) {
 
     const earlyRetrace =
       st.left > 1 &&
-      Math.random() < 0.035;
+      Math.random() <
+      0.035;
+
+
+    st.left--;
 
 
     if (
       earlyRetrace ||
-      --st.left <= 0
+      st.left <= 0
     ) {
 
       st.excite =
         Math.min(
           1,
-          st.excite + 0.55
+          st.excite +
+          0.55
         );
 
-
-      /*
-       * Not every run must retrace.
-       */
 
       const moved =
         st.price -
         st.runStart;
+
 
       const movedPct =
         Math.min(
           1,
           Math.abs(moved) /
           Math.max(
-            st.price * 0.003,
+            st.price *
+            0.003,
             1e-12
           )
         );
@@ -647,7 +984,8 @@ function updatePhase(st, now, c) {
 
       const retraceProbability =
         0.25 +
-        movedPct * 0.35;
+        movedPct *
+        0.35;
 
 
       if (
@@ -656,11 +994,18 @@ function updatePhase(st, now, c) {
         c.retr > 0
       ) {
 
-        startRetrace(st, c);
+        startRetrace(
+          st,
+          c
+        );
 
       } else {
 
-        startRest(st, now, c);
+        startRest(
+          st,
+          now,
+          c
+        );
       }
     }
   }
@@ -668,7 +1013,7 @@ function updatePhase(st, now, c) {
 
 
 /* ================================================================
-   MAIN PRICE FUNCTION
+   NEXT PRICE
 ================================================================ */
 
 function nextPrice(
@@ -679,14 +1024,15 @@ function nextPrice(
 
   const c =
     over
-      ? { ...CFG, ...over }
+      ? {
+          ...CFG,
+          ...over
+        }
       : CFG;
 
 
   /*
-   * --------------------------------------------------------------
-   * VOLATILITY MEMORY
-   * --------------------------------------------------------------
+   * Volatility memory.
    */
 
   const shock =
@@ -698,14 +1044,17 @@ function nextPrice(
 
 
   st.vol =
-    st.vol * c.volMem +
+    st.vol *
+    c.volMem +
+
     (
       1 -
       c.volMem
     ) *
     (
       1 +
-      shock * 3
+      shock *
+      3
     );
 
 
@@ -720,14 +1069,15 @@ function nextPrice(
 
 
   /*
-   * Excitement decays.
+   * Excitement decay.
    */
 
-  st.excite *= 0.93;
+  st.excite *=
+    0.93;
 
 
   /*
-   * Update phase.
+   * Phase.
    */
 
   updatePhase(
@@ -738,7 +1088,7 @@ function nextPrice(
 
 
   /*
-   * Fish-tail wave.
+   * Fixed fish-tail.
    */
 
   const tailWave =
@@ -749,7 +1099,7 @@ function nextPrice(
 
 
   /*
-   * Base tick size.
+   * Base price movement.
    */
 
   const base =
@@ -769,21 +1119,24 @@ function nextPrice(
     );
 
 
-  let delta = 0;
+  let delta =
+    0;
 
 
   /* ==============================================================
-     HARD PAUSE
+     PAUSE
   ============================================================== */
 
   if (
     st.hardPauseUntil &&
-    now < st.hardPauseUntil
+    now <
+    st.hardPauseUntil
   ) {
 
     /*
-     * Most pause ticks are static.
-     * Some contain tiny natural movement.
+     * Clock is still fixed.
+     *
+     * Price may remain unchanged.
      */
 
     if (
@@ -800,7 +1153,8 @@ function nextPrice(
 
       const micro =
         (
-          Math.random() < 0.5
+          Math.random() <
+          0.5
             ? -1
             : 1
         ) *
@@ -868,14 +1222,18 @@ function nextPrice(
       let mag;
 
 
-      if (r < 0.25) {
+      if (
+        r < 0.25
+      ) {
 
         mag =
           0.05 +
           Math.random() *
           0.25;
 
-      } else if (r < 0.85) {
+      } else if (
+        r < 0.85
+      ) {
 
         mag =
           0.30 +
@@ -897,12 +1255,9 @@ function nextPrice(
       }
 
 
-      /*
-       * Small amount of counter movement.
-       */
-
       const reverse =
-        Math.random() < 0.18;
+        Math.random() <
+        0.18;
 
 
       const direction =
@@ -922,25 +1277,24 @@ function nextPrice(
 
 
       /*
-       * Fish-tail component.
+       * Fixed fish-tail.
        */
 
       delta +=
         base *
         tailWave *
+        st.vol *
+        sm *
         0.65;
 
 
       /*
-       * Do not overshoot retracement target.
+       * Target guard.
        */
 
       if (
         Math.abs(
-          (
-            st.retrDone ||
-            0
-          ) +
+          st.retrDone +
           delta
         ) >
         Math.abs(
@@ -954,11 +1308,7 @@ function nextPrice(
     }
 
 
-    st.retrDone =
-      (
-        st.retrDone ||
-        0
-      ) +
+    st.retrDone +=
       delta;
   }
 
@@ -972,7 +1322,7 @@ function nextPrice(
   ) {
 
     /*
-     * Very small breathing movement.
+     * Small breathing movement.
      */
 
     delta =
@@ -996,24 +1346,18 @@ function nextPrice(
     let mag;
 
 
-    /*
-     * Very small
-     */
-
-    if (r < 0.25) {
+    if (
+      r < 0.25
+    ) {
 
       mag =
         0.05 +
         Math.random() *
         0.25;
 
-    }
-
-    /*
-     * Normal
-     */
-
-    else if (r < 0.85) {
+    } else if (
+      r < 0.85
+    ) {
 
       mag =
         0.30 +
@@ -1023,13 +1367,7 @@ function nextPrice(
         ) *
         0.60;
 
-    }
-
-    /*
-     * Larger movement
-     */
-
-    else {
+    } else {
 
       mag =
         1.5 +
@@ -1047,8 +1385,10 @@ function nextPrice(
 
     const reverseProbability =
       0.12 +
-      st.excite * 0.18 +
-      Math.random() * 0.10;
+      st.excite *
+      0.18 +
+      Math.random() *
+      0.10;
 
 
     const direction =
@@ -1070,12 +1410,9 @@ function nextPrice(
 
 
     /*
-     * ============================================================
+     * ==========================================================
      * FISH TAIL
-     * ============================================================
-     *
-     * Main directional movement remains intact.
-     * Tail produces lateral oscillation around it.
+     * ==========================================================
      */
 
     delta +=
@@ -1086,14 +1423,15 @@ function nextPrice(
 
 
     /*
-     * Minimum visible pip.
+     * Minimum visible movement.
      */
 
     const minPip =
       Math.pow(
         10,
         -st.decimals
-      ) * 2;
+      ) *
+      2;
 
 
     if (
@@ -1110,7 +1448,7 @@ function nextPrice(
 
 
   /* ==============================================================
-     HEAVY-TAIL JUMP
+     HEAVY TAIL
   ============================================================== */
 
   if (
@@ -1134,7 +1472,8 @@ function nextPrice(
 
     delta +=
       (
-        Math.random() < 0.5
+        Math.random() <
+        0.5
           ? -1
           : 1
       ) *
@@ -1144,14 +1483,16 @@ function nextPrice(
     st.excite =
       Math.min(
         1,
-        st.excite + 0.7
+        st.excite +
+        0.7
       );
 
 
     st.vol =
       Math.min(
         4.5,
-        st.vol * 1.25
+        st.vol *
+        1.25
       );
   }
 
@@ -1160,36 +1501,35 @@ function nextPrice(
      REGIME
   ============================================================== */
 
-  if (--st.regimeLeft <= 0) {
+  if (
+    --st.regimeLeft <= 0
+  ) {
 
     st.regimeDir =
-      Math.random() < 0.5
+      Math.random() <
+      0.5
         ? 1
         : -1;
 
 
     st.regimeLeft =
       200 +
-      ((Math.random() * 500) | 0);
+      (
+        Math.random() *
+        500
+      ) | 0;
   }
 
 
   /*
-   * Small natural directional drift from the current regime.
-   *
-   * This is a market model characteristic, not a trade-direction
-   * control.
+   * Small natural regime drift.
    */
 
-  const regimeDrift =
+  delta +=
     st.regimeDir *
     base *
     0.008 *
     sm;
-
-
-  delta +=
-    regimeDrift;
 
 
   /* ==============================================================
@@ -1212,18 +1552,19 @@ function nextPrice(
 
 
   /*
-   * Apply price.
+   * Apply.
    */
 
   st.price =
     Math.max(
-      st.price + delta,
+      st.price +
+      delta,
       1e-8
     );
 
 
   /*
-   * Clean decimal representation.
+   * Exact market decimals.
    */
 
   st.price =
@@ -1239,8 +1580,24 @@ function nextPrice(
 
 
 /* ================================================================
-   NEXT TICK DELAY
+   FIXED NEXT DELAY
 ================================================================ */
+
+/**
+ * IMPORTANT:
+ *
+ * This function NEVER generates a random delay.
+ *
+ * If gapMs = 500:
+ *
+ * 500ms
+ * 500ms
+ * 500ms
+ * 500ms
+ * ...
+ *
+ * forever.
+ */
 
 function nextDelay(
   st,
@@ -1249,166 +1606,21 @@ function nextDelay(
 
   const c =
     over
-      ? { ...CFG, ...over }
+      ? {
+          ...CFG,
+          ...over
+        }
       : CFG;
 
 
   /*
-   * Pause polling.
+   * Fixed speed.
    */
-
-  if (
-    st.hardPauseUntil &&
-    Date.now() <
-    st.hardPauseUntil
-  ) {
-
-    return 150;
-  }
-
-
-  let g =
-    c.gapMs;
-
-
-  /*
-   * Persistent speed.
-   *
-   * This creates:
-   *
-   * slow
-   *   ↓
-   * medium
-   *   ↓
-   * fast
-   *   ↓
-   * burst
-   *   ↓
-   * slow
-   */
-
-  const sr =
-    Math.random();
-
-
-  if (sr < 0.08) {
-
-    st.speed *= 0.72;
-
-  } else if (sr < 0.16) {
-
-    st.speed *= 1.28;
-
-  } else {
-
-    st.speed *=
-      0.94 +
-      Math.random() *
-      0.12;
-  }
-
-
-  st.speed =
-    Math.max(
-      0.45,
-      Math.min(
-        2.2,
-        st.speed
-      )
-    );
-
-
-  /*
-   * Phase speed.
-   */
-
-  if (st.phase === 'run') {
-
-    g *= 0.55;
-
-  } else if (
-    st.phase === 'rest'
-  ) {
-
-    g *= 1.35;
-
-  } else if (
-    st.phase === 'retrace'
-  ) {
-
-    g *=
-      st.retrFast
-        ? 0.50
-        : 1.05;
-  }
-
-
-  /*
-   * Excitement speeds up ticks.
-   */
-
-  g *=
-    1 -
-    0.60 *
-    st.excite *
-    c.spdVar;
-
-
-  /*
-   * Persistent speed.
-   */
-
-  g *=
-    st.speed;
-
-
-  /*
-   * Occasional burst clusters.
-   */
-
-  const roll =
-    Math.random();
-
-
-  if (
-    roll <
-    0.08 * c.spdVar
-  ) {
-
-    g *= 0.35;
-
-  } else if (
-    roll <
-    0.15 * c.spdVar
-  ) {
-
-    g *= 0.55;
-
-  } else if (
-    roll >
-    1 -
-    0.05 * c.spdVar
-  ) {
-
-    g *= 1.8;
-  }
-
-
-  /*
-   * Small natural timing variation.
-   */
-
-  g *=
-    0.75 +
-    Math.random() *
-    0.50;
-
 
   return Math.max(
-    35,
-    Math.min(
-      2500,
-      g
+    1,
+    Math.round(
+      c.gapMs
     )
   );
 }
