@@ -33,7 +33,7 @@ const num = (v, d) => (v === undefined || v === '' || isNaN(+v) ? d : +v);
 
 /* পরীক্ষার পাতার স্লাইডারের মান — হুবহু একই */
 const CFG = {
-  unit:    num(process.env.ENG_UNIT,     0.000018),  // base একক (দামের অনুপাতে)
+  unit:    num(process.env.ENG_UNIT,     0.000011),  // base একক (দামের অনুপাতে)
   volMem:  num(process.env.ENG_VOL_MEM,  0.994),    // অস্থিরতার স্মৃতি
   volAmp:  num(process.env.ENG_VOL_AMP,  0.28),     // ওঠানামার মাত্রা
   runLen:  num(process.env.ENG_RUN_LEN,  8),        // ঝলকের গড় tick
@@ -299,11 +299,14 @@ function nextPrice(st, now = Date.now(), over) {
       delta = remain;                                    // শেষ পা — বাকিটুকু
     } else {
       const retrDir = Math.sign(st.retrTarget);
+      // [SMALL RETRACE] user চেয়েছেন retrace ছোট tick এ হবে (main
+      // movement বড়, retrace ছোট) — আগে এটা main-burst এর মতোই
+      // distribution ছিল, এখন flat/ছোট dominant।
       const _r = Math.random();
       let mag;
-      if (_r < 0.25)      mag = 0.05 + Math.random() * 0.25;
-      else if (_r < 0.85) mag = 0.3 + Math.pow(Math.random(), -0.35) * 0.6;
-      else                mag = 1.5 + Math.pow(Math.random(), -0.5) * 2;
+      if (_r < 0.55)      mag = 0.1 + Math.random() * 0.35;
+      else if (_r < 0.90) mag = 0.3 + Math.pow(Math.random(), -0.35) * 0.4;
+      else                mag = 0.9 + Math.pow(Math.random(), -0.4) * 1;
       // [MICRO-DIRECTION] এখানেও মাঝে মাঝে সামান্য বিপরীত micro-tick
       // [FIX: JITTER] retrace সাধারণত ছোট (১-৪ tick), তাই burst এর মতো
       // ৪২% micro-reverse দিলে অল্প কয়েকটা tick এর মধ্যেই "হুদায়
@@ -328,11 +331,15 @@ function nextPrice(st, now = Date.now(), over) {
     // এখন তিন ভাগে: প্রায়ই খুব ছোট (near-flat), মাঝারি সাধারণ, আর
     // মাঝে মাঝে সত্যিকারের বড় লাফ — এই মিশ্রণটাই "লাফিয়ে লাফিয়ে"
     // ভাব দেয়, একঘেয়ে glide না।
+    // [BIG-JUMP DOMINANT] user স্পষ্ট বলেছে — Quotex এ বড় বড় tick
+    // দ্রুত speed এ মারে (main movement এ), শুধু retrace ছোট। আগে
+    // বড় লাফ মাত্র ১৫% ছিল, flat/সাধারণ মিলিয়ে ৮৫% ছোট-মাঝারি
+    // ছিল — সেটাই এখন উল্টে দেওয়া হলো, বড় লাফ এখন dominant।
     const _r = Math.random();
     let mag;
-    if (_r < 0.25)      mag = 0.05 + Math.random() * 0.25;                  // প্রায়-flat
-    else if (_r < 0.85) mag = 0.3 + Math.pow(Math.random(), -0.35) * 0.6;   // সাধারণ
-    else                mag = 1.5 + Math.pow(Math.random(), -0.5) * 2;      // বড় লাফ
+    if (_r < 0.10)      mag = 0.10 + Math.random() * 0.30;                  // প্রায়-flat (বিরল)
+    else if (_r < 0.35) mag = 0.4 + Math.pow(Math.random(), -0.35) * 0.6;   // মাঝারি (কম)
+    else                mag = 1.8 + Math.pow(Math.random(), -0.55) * 3;     // বড় লাফ (dominant, ৬৫%)
     // [MOMENTUM-DEPENDENT REVERSE] আগে দুই ধাপে ছিল — fixed ৪২% random,
     // তারপর ৩-৪ tick পর জোর করে reverse। দুটোই hard-coded sequence
     // তৈরি করছিল, real market এর মতো "emergent" লাগছিল না। এখন
@@ -436,7 +443,9 @@ function nextDelay(st, over) {
 
   g *= st.phase === 'run' ? 0.5
      : st.phase === 'rest' ? 1.4
-     : st.phase === 'retrace' ? (st.retrFast ? 0.45 : 1.05)   // দ্রুত/ধীর ফেরত
+     // [FAST RETRACE] user চেয়েছেন retrace ছোট tick এ কিন্তু দ্রুত —
+     // আগে ৫০% সময় ধীর (1.05x) ছিল, এখন সবসময় দ্রুত (0.4x)।
+     : st.phase === 'retrace' ? 0.4
      : 1;
   g *= 1 - 0.6 * st.excite * c.spdVar;          // উত্তেজনায় দ্রুত
   g *= st.speed;                                 // persistent speed state প্রয়োগ
