@@ -303,9 +303,9 @@ function nextPrice(st, now = Date.now(), over) {
       // কোনো micro-direction/vol-multiplier ছাড়া সরাসরি pip।
       const _r = Math.random();
       let mag;
-      if (_r < 0.45)      mag = 1 + Math.random()*2;
-      else if (_r < 0.75) mag = 3 + Math.random()*5;
-      else                mag = 8 + Math.random()*12;
+      if (_r < 0.45)      mag = 1 + Math.random()*2;              // ছোট: ১-৩ pip
+      else if (_r < 0.75) mag = 3 + Math.random()*9;              // মাঝারি: ৩-১২ pip
+      else                mag = 12 + Math.random()*10;            // বড়: ১২-২২ pip
       const pip = Math.pow(10, -st.decimals);
       delta = retrDir * pip * mag;
       // লক্ষ্য পেরিয়ে গেলে থামি
@@ -324,8 +324,8 @@ function nextPrice(st, now = Date.now(), over) {
     const _r = Math.random();
     let mag;
     if (_r < 0.45)      mag = 1 + Math.random()*2;                    // ছোট: ১-৩ pip
-    else if (_r < 0.75) mag = 3 + Math.random()*5;                    // মাঝারি: ৩-৮ pip
-    else                mag = 8 + Math.random()*12;                   // বড়: ৮-২০ pip
+    else if (_r < 0.75) mag = 3 + Math.random()*9;                    // মাঝারি: ৩-১২ pip
+    else                mag = 12 + Math.random()*10;                  // বড়: ১২-২২ pip
     // [DEMO-MATCHED — EXACT] User approved demo এর সাথে হুবহু মেলাতে,
     // reverse-probability/vol/session multiplier ছাড়া সরাসরি pip
     // প্রয়োগ — demo তেও ঠিক এভাবেই ছিল, শুধু dir আর pip, অন্য কিছু না।
