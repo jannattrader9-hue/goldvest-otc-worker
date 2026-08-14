@@ -443,3 +443,4 @@ function nextDelay(st, over) {
 }
 
 module.exports = { createState, nextPrice, nextDelay, sessionMul, CFG };
+
