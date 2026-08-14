@@ -687,6 +687,12 @@ function saveLiveCandle(id, candle) {
       l: candle.low,
       c: candle.close,       // current price
       n: candle.nextCandle,  // next candle boundary
+      // [TICK IDENTITY] এই WebSocket path (goldvest-ws service) দিয়েই
+      // আসলে frontend price পাচ্ছিল (RTDB না) — এতদিন এখানে tickId
+      // ছিল না বলেই chartengine.js কখনো visibleTickId capture করতে
+      // পারেনি, যদিও RTDB-broadcast এ ঠিকই ছিল। এটাই root cause ছিল
+      // "trade ভুল জায়গায় পড়া" সমস্যার।
+      k: candle.tickId,      // tickId — ছোট payload রাখতে সংক্ষিপ্ত key
     });
     // fire-and-forget — publish ব্যর্থ হলেও RTDB path অক্ষত, দাম বন্ধ হয় না
     redisPub.publish(`px:${id}`, msg).catch(() => {});
