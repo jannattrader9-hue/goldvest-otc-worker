@@ -412,27 +412,37 @@ async function _recoverLiveTradesFromRTDB() {
 // trigger এর পাশাপাশি/parallel — duplicate-safe, কারণ _doSettle এ
 // status !== 'live' guard আছে)
 /**
- * [TICK HISTORY] প্রতিটা trade এর closePrice কে তার নিজের expiry এর
- * সঠিক মুহূর্তের দাম দিয়ে বদলে দেয়।
+ * [TICK IDENTITY] প্রতিটা trade এর closePrice কে তার নিজের expiry এর
+ * সঠিক মুহূর্তের canonical দাম দিয়ে বদলে দেয় — tickhistory.js এর
+ * in-memory, tickId-consistent history থেকে (আগে Redis-based
+ * _histPriceAt/HIST_ON flag নির্ভর ছিল, এখন entry-price lookup এর
+ * সাথে একই canonical source ব্যবহার হয়, দুটো সমান্তরাল system থাকল
+ * না)।
  *
  * কেন: settle চলে প্রতি ৫০০ms এ, তাই ৫s এর trade ৫.৩s এ settle হলে
- * আগে ০.৩ সেকেন্ড পরের দাম ধরা হত। এখন expiry এর ঠিক মুহূর্তের দাম
- * নেওয়া হয় — settle কখন চলল তাতে কিছু যায় আসে না, ফল সবসময় একই।
+ * আগে ০.৩ সেকেন্ড পরের দাম ধরা হত। এখন expiry এর ঠিক আগের/সমান শেষ
+ * canonical tick নেওয়া হয় — settle কখন চলল তাতে কিছু যায় আসে না,
+ * ফল সবসময় deterministic।
  *
  * ইতিহাসে না পেলে আগের দামই থাকে (trade কখনো আটকায় না)।
  */
 async function _applyExpiryPrices(symbol, trades) {
-  if (!HIST_ON) return;
-  await Promise.allSettled(trades.map(async (t) => {
+  for (const t of trades) {
     // [PRECISION FIX] আগে expSec * 1000 করলে sub-second (0-999ms) অংশ
     // হারিয়ে যেত, ৫s trade এ যা duration এর ~২০% পর্যন্ত ভুল সময়ের দাম
     // ধরিয়ে দিত। এখন ms-নির্ভুল expiry থাকলে সেটাই ব্যবহার হয়; পুরনো
     // client (যাদের এই field নেই) এর জন্য সেকেন্ড-fallback অক্ষত রইল।
     const expMs = t.expiryTimestampMs > 0 ? t.expiryTimestampMs : (t.expiryTimestamp ? t.expiryTimestamp * 1000 : 0);
-    if (!expMs) return;
-    const p = await _histPriceAt(symbol, expMs);
-    if (p) t.closePrice = p;
-  }));
+    if (!expMs) continue;
+    const tick = tickHistory.findLatestTickAtOrBefore(symbol, expMs);
+    if (tick) t.closePrice = tick.price;
+    // [FALLBACK] tickHistory তে না পেলে (server সদ্য restart হয়েছে,
+    // history এখনো জমেনি) পুরনো Redis-based lookup fallback হিসেবে।
+    else if (HIST_ON) {
+      const p = await _histPriceAt(symbol, expMs);
+      if (p) t.closePrice = p;
+    }
+  }
 }
 
 async function _settleDueTradesFromMemory() {
