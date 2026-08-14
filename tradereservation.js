@@ -48,7 +48,8 @@ function registerReservationCommands(redisPub) {
   redisPub.defineCommand('gvReserveBalance', {
     numberOfKeys: 2,
     // KEYS[1] = balance key, KEYS[2] = reservation key
-    // ARGV[1] = amount, ARGV[2] = reservation TTL (sec), ARGV[3] = entryPrice, ARGV[4] = entryTimeMs
+    // ARGV[1] = amount, ARGV[2] = reservation TTL (sec), ARGV[3] = entryPrice,
+    // ARGV[4] = entryTimeMs, ARGV[5] = balKey (string, sweep এর জন্য সংরক্ষণ)
     lua: `
       local bal = redis.call('GET', KEYS[1])
       if bal == false then return {-1, '0'} end
@@ -57,8 +58,10 @@ function registerReservationCommands(redisPub) {
       if b < amt then return {0, bal} end
       local nb = redis.call('INCRBYFLOAT', KEYS[1], -amt)
       redis.call('EXPIRE', KEYS[1], 3600)
-      -- reservation hash এ trade এর বিস্তারিত জমা রাখি
-      redis.call('HSET', KEYS[2], 'amount', ARGV[1], 'entryPrice', ARGV[3], 'entryTimeMs', ARGV[4], 'status', 'pending')
+      -- reservation hash এ trade এর বিস্তারিত জমা রাখি — balKey ও রাখা
+      -- হলো, যাতে sweep (orphan-cleanup) নিজে থেকেই সঠিক balance এ
+      -- ফেরত দিতে পারে, আলাদা lookup ছাড়াই।
+      redis.call('HSET', KEYS[2], 'amount', ARGV[1], 'entryPrice', ARGV[3], 'entryTimeMs', ARGV[4], 'balKey', ARGV[5], 'status', 'pending')
       redis.call('EXPIRE', KEYS[2], ARGV[2])
       return {1, nb}
     `,
@@ -109,7 +112,7 @@ async function reserveTradeBalance(redisPub, balKey, amount, entryPrice, entryTi
 
   const [ok, newBalRaw] = await redisPub.gvReserveBalance(
     balKey, resKey, String(amount), String(RESERVATION_TTL_SEC),
-    String(entryPrice), String(entryTimeMs)
+    String(entryPrice), String(entryTimeMs), balKey
   );
 
   return {
@@ -169,12 +172,11 @@ async function sweepExpiredReservations(redisPub) {
       // TTL প্রায় শেষের দিকে (২ সেকেন্ডের কম বাকি) মানে সম্ভবত orphaned —
       // এখনই release করে দিই, TTL দিয়ে key নিজে expire হওয়ার অপেক্ষা না করে
       if (ttl >= 0 && ttl < 2) {
-        const amount = await redisPub.hget(key, 'amount');
-        // balKey জানা নেই এখান থেকে (শুধু reservation-key আছে) — তাই
-        // এখানে সরাসরি balance ফেরত দেওয়া যাচ্ছে না। এই limitation এর
-        // কারণে reservation-hash এ userId ও রাখা উচিত production এ,
-        // যাতে sweep নিজেই balKey বানিয়ে ফেরত দিতে পারে।
-        cleaned++;
+        const balKey = await redisPub.hget(key, 'balKey');
+        if (balKey) {
+          const released = await redisPub.gvReleaseReservation(key, balKey);
+          if (released === 1) cleaned++;
+        }
       }
     }
   } while (cursor !== '0');
