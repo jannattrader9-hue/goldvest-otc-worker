@@ -96,6 +96,7 @@ const TICK_MS   = 500;
 // [ENGINE] দামের physics আলাদা ফাইলে (engine.js) — otc-server ছোট রাখতে।
 // ENGINE_MODE=off দিলে পুরনো inline physics চলবে (তাৎক্ষণিক rollback)।
 const engine      = require('./engine.js');
+const tickHistory = require('./tickhistory.js');   // [TICK IDENTITY] entry/settlement এর জন্য canonical tick lookup
 const ENGINE_MODE = (process.env.ENGINE_MODE || 'on').toLowerCase() !== 'off';
 const CANDLE_MS = 60 * 1000;
 const TD_KEY    = '392fa09f669c4cd7843f958e0fbbca36';
@@ -1073,6 +1074,11 @@ function tickOTC(id) {
     trendStrength: ctrl.trendStrength ?? 0.6,
   });
 
+  // [TICK IDENTITY] প্রতিটা tick এর canonical price/timestamp সংরক্ষণ —
+  // entry (visible tickId lookup) ও settlement (expiry-এর আগের শেষ tick)
+  // দুটোই এই একই history থেকে resolve হবে।
+  tickHistory.recordTick(id, state._eng.tickId, Date.now(), state.price);
+
   _tickTail(id, state);
 }
 
@@ -1292,6 +1298,13 @@ function tickForex(id) {
     else if (down>up*1.2) price = realPrice + v*(0.5+Math.random()*0.5);
   }
   state.price = price;
+
+  // [TICK IDENTITY] forex market এ engine.js নেই (real broker-price
+  // ব্যবহার হয়), তাই এখানে state এর নিজস্ব সাধারণ monotonic counter —
+  // OTC এর engine-tickId এর সমতুল্য ভূমিকা পালন করে।
+  state._forexTickId = (state._forexTickId || 0) + 1;
+  tickHistory.recordTick(id, state._forexTickId, now, price);
+
   if (price > state.candleHigh) state.candleHigh = price;
   if (price < state.candleLow)  state.candleLow  = price;
   if (now >= state.nextCandle) {
@@ -1507,13 +1520,31 @@ http.createServer(async (req, res) => {
       const _serverState = _states[trade.symbol];
       const _serverPrice = (_serverState && typeof _serverState.price === 'number')
                            ? _serverState.price : 0;
-      // [TICK HISTORY] client ক্লিকের সঠিক সময় পাঠালে সেই মুহূর্তের দাম
-      // ইতিহাস থেকে নিই — নেটওয়ার্কে ১০০-৩০০ms দেরির কারণে দাম বদলে
-      // যাওয়ার সমস্যা এতে মেটে। সময় যাচাই: server সময়ের ±২ সেকেন্ডের
-      // মধ্যে হতে হবে, নইলে কেউ পুরনো সময় পাঠিয়ে সুবিধা নিতে পারত।
+
+      // [TICK IDENTITY — exact match, সর্বোচ্চ priority] client যদি ঠিক
+      // কোন tickId visually দেখে click করেছে সেটা পাঠায়, backend এর
+      // tick-history তে সেই exact tick খুঁজে তার canonical price নেওয়া
+      // হয় — এটা approximate timestamp-lookup এর চেয়ে বেশি নির্ভুল,
+      // কারণ network-delay/animation-delay যাই হোক না কেন, ঠিক সেই
+      // visible tick-ই ব্যবহার হবে। tickId history-window এর বাইরে চলে
+      // গেলে (খুব পুরনো/tampered) এখানে null আসবে, fallback নিচে।
+      let _tickIdEntry = 0;
+      const _visibleTickId = trade.visibleTickId;
+      if (_visibleTickId !== undefined && _visibleTickId !== null) {
+        const _tick = tickHistory.findTickById(trade.symbol, _visibleTickId);
+        if (_tick) _tickIdEntry = _tick.price;
+        else console.warn(`[place-trade] visibleTickId=${_visibleTickId} history তে পাওয়া যায়নি (userId=${userId}) — fallback ব্যবহার হবে`);
+      }
+
+      // [TICK HISTORY — fallback] client tickId না পাঠালে (পুরনো client)
+      // বা tickId history তে না পেলে, আগের timestamp-based approximate
+      // lookup fallback হিসেবে থাকে। নেটওয়ার্কে ১০০-৩০০ms দেরির কারণে
+      // দাম বদলে যাওয়ার সমস্যা এতে আংশিক মেটে। সময় যাচাই: server
+      // সময়ের ±২ সেকেন্ডের মধ্যে হতে হবে, নইলে কেউ পুরনো সময় পাঠিয়ে
+      // সুবিধা নিতে পারত।
       let _histEntry = 0;
       const _clickTs = parseInt(trade.clickTs) || 0;
-      if (_clickTs > 0) {
+      if (_tickIdEntry === 0 && _clickTs > 0) {
         const _drift = Math.abs(Date.now() - _clickTs);
         if (_drift <= 2000) {
           const _hp = await _histPriceAt(trade.symbol, _clickTs);
@@ -1523,8 +1554,9 @@ http.createServer(async (req, res) => {
         }
       }
 
-      const entryPrice = _histEntry > 0 ? _histEntry
-                       : (_serverPrice > 0 ? _serverPrice : _clientEntry);
+      const entryPrice = _tickIdEntry > 0 ? _tickIdEntry
+                       : (_histEntry > 0 ? _histEntry
+                       : (_serverPrice > 0 ? _serverPrice : _clientEntry));
       if (_serverPrice > 0 && _clientEntry > 0) {
         const _diffPct = Math.abs(_serverPrice - _clientEntry) / _serverPrice * 100;
         if (_diffPct > 0.5) {
