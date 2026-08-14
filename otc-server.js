@@ -405,18 +405,6 @@ async function _recoverLiveTradesFromRTDB() {
 // তাই listener এর "confirm" এর দরকার নেই। RTDB path (_settleDueTradesFromRTDB)
 // সব ক্ষেত্রেই catch-all হিসেবে কাজ করে।
 
-// প্রতি tick এ shadow map থেকে কতগুলো trade "due" (expiryTimestamp <= now) তা log করো — observational only
-function _logShadowDueTrades() {
-  const nowSec = Math.floor(Date.now() / 1000);
-  let due = 0;
-  for (const t of _activeTradesMemory.values()) {
-    if (t.expiryTimestamp <= nowSec) due++;
-  }
-  if (due > 0) {
-    console.log(`[shadow-tracking] active=${_activeTradesMemory.size} due=${due}`);
-  }
-}
-
 // ── [ধাপ ২] In-memory map থেকে tick-based settlement ──────
 // প্রতি tick এ — যেসব live trade এর expiryTimestamp <= now, তাদের সেই
 // symbol এর current state.price দিয়ে সাথে সাথে settle করো (candle-close
@@ -746,23 +734,6 @@ function randomTrend() {
   return r < 0.38 ? 1 : r < 0.76 ? -1 : 0;
 }
 
-// ── Smooth correlated noise (Perlin-style) — pure random না ──────────────
-// Real market এ প্রতি tick সম্পূর্ণ independent হয় না, একটু আগের সাথে
-// সম্পর্কিত থাকে। এটা সেই "smooth randomness" দেয়।
-function _hash(seed, i) {
-  let h = seed + i * 374761393;
-  h = (h ^ (h >>> 13)) * 1274126177;
-  h = h ^ (h >>> 16);
-  return h >>> 0;
-}
-function _smoothNoise(seed, x) {
-  const x0 = Math.floor(x), x1 = x0 + 1, dx = x - x0;
-  const g0 = ((_hash(seed, x0) & 1) === 0 ? dx : -dx);
-  const g1 = ((_hash(seed, x1) & 1) === 0 ? (dx - 1) : -(dx - 1));
-  const fade = dx * dx * dx * (dx * (dx * 6 - 15) + 10);
-  return (g0 + fade * (g1 - g0)) * 2; // ~-1..1
-}
-
 // ── REGIME — market এর বর্তমান "মেজাজ" ───────────────────────────────────
 // trending: এক দিকে জোরালো চলে (বড় body), ranging: এলোমেলো (ছোট body),
 // calm: শান্ত ধীর, breakout: হঠাৎ শক্তিশালী move।
@@ -775,73 +746,6 @@ const _REGIMES = {
 function _regimeDur(name) {
   const [lo, hi] = _REGIMES[name].dur;
   return lo + (Math.random() * (hi - lo) | 0);
-}
-
-// ── SYNTHETIC VOLUME — market কে সবসময় জীবন্ত রাখে (real user না থাকলেও) ─
-// হাজার হাজার virtual trader trade করছে এমন ভাব দেয়। activity cycle
-// (busy/quiet period) + random spike (news event এর মতো) তৈরি করে।
-
-function _updateLevels(state) {
-  if (!state._levels) state._levels = [];
-  state._swingTick = (state._swingTick || 0) + 1;
-  const p = state.price;
-  if (!state._recentHigh || p > state._recentHigh) state._recentHigh = p;
-  if (!state._recentLow  || p < state._recentLow)  state._recentLow  = p;
-  if (state._swingTick % 45 === 0) {
-    // swing high = resistance (উপরে বাধা), swing low = support (নিচে ভিত্তি)
-    if (state._recentHigh) state._levels.push({ price: state._recentHigh, s: 1.0, type: 'r' });
-    if (state._recentLow)  state._levels.push({ price: state._recentLow,  s: 1.0, type: 's' });
-    state._recentHigh = p; state._recentLow = p;
-    state._levels.forEach(l => l.s *= 0.9);
-    state._levels = state._levels.filter(l => l.s > 0.25).slice(-10);
-  }
-}
-function _levelForce(state, v) {
-  if (!state._levels || state._levels.length === 0) return 0;
-  const p = state.price;
-  let force = 0;
-
-  // ── fake breakout চলমান থাকলে — level এর ওপারে গিয়ে ফিরে আসা ──────────
-  if (state._fakeBreakTicks > 0) {
-    state._fakeBreakTicks--;
-    // ফিরে আসার দিকে জোরালো push (যে level ভেঙেছিল তার উল্টো দিকে)
-    force += state._fakeBreakDir * v * 1.2;
-    return force;
-  }
-
-  for (const l of state._levels) {
-    const distPct = Math.abs(l.price - p) / p;
-    if (distPct < 0.0012) {
-      // level এর খুব কাছে — এখন সিদ্ধান্ত: bounce / real break / fake break
-      if (!state._lastLevelHit || Math.abs(state._lastLevelHit - l.price) > p * 0.0006) {
-        state._lastLevelHit = l.price;
-        const roll = Math.random();
-        const towardLevel = Math.sign(l.price - p); // price level এর দিকে যাচ্ছে
-
-        if (roll < 0.55) {
-          // BOUNCE (৫৫%) — level থেকে ফিরে আসে (support/resistance ধরে রাখে)
-          force += -towardLevel * v * 0.9 * l.s;
-          l.s = Math.min(1.2, l.s + 0.1); // bounce করলে level শক্তিশালী হয়
-        } else if (roll < 0.75) {
-          // REAL BREAKOUT (২০%) — level ভেঙে ওপারে চলে যায়
-          force += towardLevel * v * 1.1;
-          l.s *= 0.4; // ভাঙা level দুর্বল হয়
-          // [S/R FLIP] support ভাঙলে resistance হয়, resistance ভাঙলে
-          // support — real market এর মূল নিয়ম। ভাঙার পর price ফিরে এলে
-          // এই level এখন উল্টো ভূমিকায় বাধা দেবে।
-          l.type = (l.type === 's') ? 'r' : 's';
-          l.s = Math.max(l.s, 0.6); // flip হওয়া level নতুন ভূমিকায় কার্যকর
-          l.flipped = true;
-        } else {
-          // FAKE BREAKOUT (২৫%) — সামান্য ভেঙে ঢোকে, পরে ফিরে আসে (stop hunt)
-          state._fakeBreakTicks = 3 + (Math.random() * 4 | 0); // কয়েক tick পরে reverse
-          state._fakeBreakDir = -towardLevel; // ফিরে আসার দিক
-          force += towardLevel * v * 0.9; // প্রথমে সামান্য ভেঙে ঢোকে (trap)
-        }
-      }
-    }
-  }
-  return force;
 }
 
 async function backfillOTC(id, lastTime, lastPrice) {
