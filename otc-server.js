@@ -199,6 +199,13 @@ async function _batchSettleAndBroadcast(symbol, trades, closePrice) {
         preAdjusted: t.preAdjusted || false,   // [MTG PROTECTION] true হলে settler নিজে থেকে দাম আবার খুঁজবে না
         symbol,
         settledBy:  'redis-settler',
+        // [AUDIT TRAIL] settlement কোন canonical tick থেকে এসেছে তার
+        // traceability — redis-settler.js এই field গুলো trade-record
+        // এ persist করবে (যদি সেই ফাইলে support থাকে, না থাকলে এই
+        // extra field harmless ভাবে ignored হবে)।
+        settlementTickId: t.settlementTickId ?? null,
+        settlementTimestamp: t.settlementTimestamp ?? null,
+        settlementSource: t.settlementSource ?? 'legacy',
       }));
       // LPUSH — settler blpop করে instantly process করবে
       await redisPub.lpush('gv:settle_queue', ...jobs);
@@ -435,12 +442,27 @@ async function _applyExpiryPrices(symbol, trades) {
     const expMs = t.expiryTimestampMs > 0 ? t.expiryTimestampMs : (t.expiryTimestamp ? t.expiryTimestamp * 1000 : 0);
     if (!expMs) continue;
     const tick = tickHistory.findLatestTickAtOrBefore(symbol, expMs);
-    if (tick) t.closePrice = tick.price;
+    if (tick) {
+      t.closePrice = tick.price;
+      // [AUDIT TRAIL] পরে dispute/debugging এ কোন tick, কখন, কোন
+      // source থেকে settlement হয়েছে তা traceable রাখা — financial
+      // system এ ছোট এই metadata-ই পরে সবচেয়ে বেশি কাজে লাগে।
+      t.settlementTickId = tick.tickId;
+      t.settlementTimestamp = tick.timestamp;
+      t.settlementSource = 'tickhistory';
+    }
     // [FALLBACK] tickHistory তে না পেলে (server সদ্য restart হয়েছে,
     // history এখনো জমেনি) পুরনো Redis-based lookup fallback হিসেবে।
+    // দুটো source ভিন্ন ফল দিতে পারে বলে audit trail এ source লিখে
+    // রাখা হয়, যাতে পরে trade-history দেখে বোঝা যায় কোনটা ব্যবহার হয়েছে।
     else if (HIST_ON) {
       const p = await _histPriceAt(symbol, expMs);
-      if (p) t.closePrice = p;
+      if (p) {
+        t.closePrice = p;
+        t.settlementTickId = null;
+        t.settlementTimestamp = expMs;
+        t.settlementSource = 'redis-fallback';
+      }
     }
   }
 }
