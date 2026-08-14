@@ -9,6 +9,7 @@ const pLimit = require('p-limit');
 const Redis  = require('ioredis');
 const crypto = require('crypto');
 const orderSettle = require('./ordersettle.js');   // [MTG PROTECTION] majority-loses close price adjustment
+const tradeReservation = require('./tradereservation.js');   // [BALANCE RESERVATION] click-time reserve, animation-sync execute
 const mtgGuard = require('./mtgguard.js');         // [MTG PROTECTION] single-trader pattern detection
 const https  = require('https');   // [MARKET REFERENCE] real-world price fetch করতে
 
@@ -41,6 +42,9 @@ if (REDIS_URL) {
         redisReady = true;
         console.log('[Redis] connected ✅');
     });
+
+    // [BALANCE RESERVATION] tradereservation.js এর Lua-commands register
+    tradeReservation.registerReservationCommands(redisPub);
 
     // [SECURITY ১.২] balance যাচাই + কাটা — একটাই অবিভাজ্য (atomic) কাজ।
     // আগে get() তারপর incrbyfloat() — দুই ধাপ। ১ লাখ user এ কেউ দ্রুত দুবার
@@ -1624,31 +1628,36 @@ http.createServer(async (req, res) => {
         }
       }
 
-      // 3. Redis balance — atomic check + deduct (Lua, race-safe)
+      // 3. [BALANCE RESERVATION] atomic reserve — সাথে সাথেই deduct হয়
+      // (double-spend প্রতিরোধ, ১০০টা click একসাথে এলেও Redis
+      // sequentially process করে), কিন্তু trade "pending" থাকে যতক্ষণ
+      // না frontend জানায় chart visually এই entryPrice এ পৌঁছেছে।
       const balKey = BAL_KEY_OTC(userId);
 
-      // প্রথম চেষ্টা — key না থাকলে Lua -1 ফেরত দেয়, তখন Firestore থেকে load
-      let [ok, newBalRaw] = await redisPub.gvDeductBalance(balKey, String(amount));
+      let { ok, newBalance, reservationId } = await tradeReservation.reserveTradeBalance(
+        redisPub, balKey, amount, entryPrice, Date.now()
+      );
 
       if (ok === -1) {
-        // Redis miss — Firestore থেকে load করে cache, তারপর আবার atomic deduct
+        // Redis miss — Firestore থেকে load করে cache, তারপর আবার atomic reserve
         const snap = await firestore.collection('users').doc(userId).get();
         const bal  = snap.exists ? (snap.data().liveBalance || 0) : 0;
-        // NX: এই ফাঁকে অন্য request already set করে থাকলে সেটাই থাকবে (double-load এড়ানো)
         await redisPub.set(balKey, bal.toString(), 'EX', 3600, 'NX');
-        [ok, newBalRaw] = await redisPub.gvDeductBalance(balKey, String(amount));
+        ({ ok, newBalance, reservationId } = await tradeReservation.reserveTradeBalance(
+          redisPub, balKey, amount, entryPrice, Date.now()
+        ));
       }
 
       if (ok !== 1) {
         res.writeHead(400);
-        res.end(JSON.stringify({ error: 'Insufficient balance', balance: parseFloat(newBalRaw) || 0 }));
+        res.end(JSON.stringify({ error: 'Insufficient balance', balance: newBalance }));
         return;
       }
 
-      const newBal = newBalRaw;
+      const newBal = newBalance;
       await redisPub.set(`gv:bal:dirty:${userId}`, '1', 'EX', 3600);
 
-      console.log(`[place-trade] userId=${userId} tradeId=${tradeId} amount=${amount} newBal=${newBal}`);
+      console.log(`[place-trade] userId=${userId} tradeId=${tradeId} amount=${amount} newBal=${newBal} reservationId=${reservationId}`);
 
       // 4. Redis Hash এ trade data save — settler <1ms এ পাবে
       await redisPub.hset(TRADE_KEY_OTC(tradeId),
@@ -1720,10 +1729,88 @@ http.createServer(async (req, res) => {
       }).catch(e => console.error('[place-trade] Firestore save failed:', e.message));
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: true, newBalance: parseFloat(newBal) }));
+      res.end(JSON.stringify({ success: true, newBalance: parseFloat(newBal), reservationId, entryPrice }));
 
     } catch(e) {
       console.error('[place-trade] error:', e.message);
+      res.writeHead(500); res.end(JSON.stringify({ error: 'Internal error' }));
+    }
+    return;
+  }
+
+  // [BALANCE RESERVATION — EXECUTE] frontend যখন জানায় chart visually
+  // reserved entryPrice এ পৌঁছেছে (queue-based animation শেষ), তখন এই
+  // endpoint কল হয় — reservation কে চূড়ান্ত করে, trade "live" করে দেয়।
+  // Balance ইতিমধ্যেই reserve-time এ deduct হয়ে গেছে, এখানে শুধু trade
+  // এর RTDB hash এ status/visibility আপডেট হয়।
+  if (req.method === 'POST' && req.url === '/execute-trade') {
+    try {
+      let body;
+      try { body = await _readBody(req); }
+      catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid body' })); return; }
+
+      const { idToken, reservationId, tradeId } = body;
+      if (!idToken || !reservationId || !tradeId) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Missing fields' })); return;
+      }
+
+      let decoded;
+      try { decoded = await admin.auth().verifyIdToken(idToken); }
+      catch(e) {
+        res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
+      }
+
+      const executed = await tradeReservation.executeReservation(redisPub, reservationId);
+      if (!executed) {
+        // ইতিমধ্যে executed/released/expired — duplicate call বা timeout
+        res.writeHead(409);
+        res.end(JSON.stringify({ error: 'Reservation not pending (already executed, released, or expired)' }));
+        return;
+      }
+
+      console.log(`[execute-trade] userId=${decoded.uid} tradeId=${tradeId} reservationId=${reservationId} executed`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true }));
+
+    } catch(e) {
+      console.error('[execute-trade] error:', e.message);
+      res.writeHead(500); res.end(JSON.stringify({ error: 'Internal error' }));
+    }
+    return;
+  }
+
+  // [BALANCE RESERVATION — RELEASE] client trade বাতিল করলে (submit-এর
+  // পরে কিন্তু execute-এর আগে user app বন্ধ করলো ইত্যাদি) balance ফেরত।
+  // TTL (১০s) এমনিতেই safety-net হিসেবে আছে, কিন্তু explicit release
+  // হলে user সাথে সাথে balance ফেরত দেখতে পায়, ১০ সেকেন্ড অপেক্ষা না করে।
+  if (req.method === 'POST' && req.url === '/release-trade') {
+    try {
+      let body;
+      try { body = await _readBody(req); }
+      catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid body' })); return; }
+
+      const { idToken, reservationId } = body;
+      if (!idToken || !reservationId) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Missing fields' })); return;
+      }
+
+      let decoded;
+      try { decoded = await admin.auth().verifyIdToken(idToken); }
+      catch(e) {
+        res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return;
+      }
+
+      const balKey = BAL_KEY_OTC(decoded.uid);
+      const released = await tradeReservation.releaseReservation(redisPub, reservationId, balKey);
+      if (released) {
+        await redisPub.set(`gv:bal:dirty:${decoded.uid}`, '1', 'EX', 3600);
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: released }));
+
+    } catch(e) {
+      console.error('[release-trade] error:', e.message);
       res.writeHead(500); res.end(JSON.stringify({ error: 'Internal error' }));
     }
     return;
@@ -2216,3 +2303,17 @@ setInterval(() => {
     .then(() => console.log('[ping] OK'))
     .catch(() => {});
 }, 8*60*1000);
+
+// [BALANCE RESERVATION — CLEANUP] periodic sweep — যদি কোনো reservation
+// এর frontend কখনো execute/release signal না পাঠায় (network issue, tab
+// বন্ধ ইত্যাদি), TTL শেষের দিকে চলে আসা reservation-গুলো খুঁজে balance
+// ফেরত দেয়। প্রতি ৩০ সেকেন্ডে একবার চলে (Redis SCAN খরচ কম রাখতে)।
+setInterval(async () => {
+  if (!redisReady) return;
+  try {
+    const cleaned = await tradeReservation.sweepExpiredReservations(redisPub);
+    if (cleaned > 0) console.log(`[reservation-sweep] ${cleaned} টা orphaned reservation পরিষ্কার হলো`);
+  } catch (e) {
+    console.error('[reservation-sweep] error:', e.message);
+  }
+}, 30*1000);
