@@ -1100,7 +1100,7 @@ function _tickTail(id, state) {
     const _dec = state._eng ? state._eng.decimals : 5;   // [SAFETY] undefined RTDB write ব্যর্থ করে দেয়, তাই ৫ (আগের default) fallback
     saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, decimals:_dec });
     // /live কে সাথে সাথে closed candle-এর final value দিয়ে আপডেট করো (null না) — client তাৎক্ষণিকভাবে সঠিক close পাবে
-    db.ref(`otc_candles/${id}/live`).set({ time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle, decimals:_dec }).catch(()=>{});
+    db.ref(`otc_candles/${id}/live`).set({ time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle, decimals:_dec, tickId: (state._eng ? state._eng.tickId : 0) }).catch(()=>{});
 
     // ── candle just closed — এই মুহূর্তের close price দিয়ে matching live trades settle করো ──
     // Synchronously mark — একই tick-এ _settleDueTradesFromMemory এই symbol skip করবে
@@ -1124,7 +1124,7 @@ function _tickTail(id, state) {
       state.nextCandle += CANDLE_MS;
     }
   } else {
-    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle, decimals: (state._eng ? state._eng.decimals : 5) });
+    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle, decimals: (state._eng ? state._eng.decimals : 5), tickId: (state._eng ? state._eng.tickId : 0) });
   }
 
   for (const { label } of SUB_INTERVALS) {
@@ -1313,7 +1313,7 @@ function tickForex(id) {
     const closedCandleClose = price;
     saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price });
     // /live কে সাথে সাথে closed candle-এর final value দিয়ে আপডেট করো (null না) — client তাৎক্ষণিকভাবে সঠিক close পাবে
-    db.ref(`otc_candles/${id}/live`).set({ time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle }).catch(()=>{});
+    db.ref(`otc_candles/${id}/live`).set({ time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle, tickId: (state._forexTickId || 0) }).catch(()=>{});
 
     // ── candle just closed — এই মুহূর্তের close price দিয়ে matching live trades settle করো ──
     // Synchronously mark — একই tick-এ _settleDueTradesFromMemory এই symbol skip করবে
@@ -1327,7 +1327,7 @@ function tickForex(id) {
     state.nextCandle += CANDLE_MS;
     while (state.nextCandle <= now) { state.candleTime = state.nextCandle/1000; state.nextCandle += CANDLE_MS; }
   } else {
-    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle });
+    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle, tickId: (state._forexTickId || 0) });
   }
   for (const { label } of SUB_INTERVALS) {
     const ss = state.subStates[label];
