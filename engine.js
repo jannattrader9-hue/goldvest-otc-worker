@@ -108,6 +108,14 @@ function createState(price, decimals = 5) {
     hardPauseUntil: 0,   // [VISIBLE PAUSE] এই timestamp পর্যন্ত সম্পূর্ণ static থাকবে
     impulseCount: 0,      // [IMPULSE-PULLBACK] burst এর মূল দিকে টানা কতগুলো tick গেছে
     speed: 1,              // [SPEED STATE] persistent, ধীরে বদলায় — sudden jump না
+    // [TICK IDENTITY] প্রতিটা tick এর জন্য monotonic, unique id — entry/
+    // settlement এর জন্য tick-history তে lookup করতে দরকার (tickhistory.js)।
+    // এখানে state এর property হিসেবে রাখা হলো, nextPrice() এর return-value
+    // (শুধু number) অপরিবর্তিত রেখে — caller (otc-server.js) প্রতিটা
+    // nextPrice() কলের পরে st.tickId পড়ে নিজে history তে record করবে,
+    // তাই এই ফাইলে return-signature বদলাতে হলো না, otc-server.js এর
+    // existing call-site গুলোও ভাঙল না।
+    tickId: 0,
   };
 }
 
@@ -284,6 +292,7 @@ function nextPrice(st, now = Date.now(), over) {
     } else {
       st.price = Number(st.price.toFixed(st.decimals));
     }
+    st.tickId++;   // [TICK IDENTITY] pause-এও এটা একটা broadcast-able tick
     return st.price;
   }
 
@@ -383,6 +392,7 @@ function nextPrice(st, now = Date.now(), over) {
   const q = Math.pow(10, st.decimals);
   st.price = Number(st.price.toFixed(st.decimals));
 
+  st.tickId++;   // [TICK IDENTITY] প্রতিটা নতুন price generate এ monotonic বৃদ্ধি
   return st.price;
 }
 
