@@ -1161,6 +1161,20 @@ function _tickTail(id, state) {
       state.candleLow  = state.price;
       state.nextCandle += CANDLE_MS;
     }
+
+    // [GAP-CONSISTENCY FIX] আগে candle-boundary পার হওয়ার এই একই cycle এ
+    // saveLiveCandle() (running-candle broadcast) কল হতো না — শুধু else
+    // branch এ (normal, non-boundary tick) হতো। ফলে নতুন candle এর
+    // candleOpen set হওয়ার সাথে সাথেই frontend সেটা পেত না — পরের tick
+    // পর্যন্ত অপেক্ষা করতে হতো, যতক্ষণে state.price ইতিমধ্যে একটু এগিয়ে
+    // যেত। এই এক-tick miss-ই ছিল live chart-এ যে gap দেখা যাচ্ছিল,
+    // RTDB-persisted candle এ সেটা reflect না হওয়ার root cause — কারণ
+    // otcengine.js এর live-merge (_mergeIntoHTF) নতুন HTF candle শুরুর
+    // সময় ঠিক এই broadcast এর candle.open ব্যবহার করে, যেটা miss হলে
+    // সঠিক gap-open কখনো broadcast-ই হতো না। এখন candle-boundary পার
+    // হওয়ার সাথে সাথেই (এই একই cycle এ) নতুন candleOpen দিয়ে broadcast
+    // করা হচ্ছে — কোনো tick miss নেই।
+    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.candleOpen, nextCandle:state.nextCandle, decimals: (state._eng ? state._eng.decimals : 5), tickId: (state._eng ? state._eng.tickId : 0) });
   } else {
     saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle, decimals: (state._eng ? state._eng.decimals : 5), tickId: (state._eng ? state._eng.tickId : 0) });
   }
