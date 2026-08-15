@@ -439,8 +439,10 @@ function nextDelay(st, over) {
   else if (roll > 1 - 0.07 * c.spdVar) g *= 2.4; // হঠাৎ থমকে যাওয়া
 
   g *= 0.6 + Math.random() * 0.8;
-  return Math.max(35, Math.min(2500, g));
+  // [DEMO-MATCH] user এর চাওয়া অনুযায়ী tick-generation delay ২০০-১০০০ms
+  // এর মধ্যেই bound করা হলো (আগে ৩৫-২৫০০ms ছিল, অনেক বেশি বিস্তৃত)।
+  // এটাই perfict-engine.html demo তে verified natural backend-rhythm।
+  return Math.max(200, Math.min(1000, g));
 }
 
 module.exports = { createState, nextPrice, nextDelay, sessionMul, CFG };
-
