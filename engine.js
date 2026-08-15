@@ -160,7 +160,19 @@ function nextPrice(st, now = Date.now(), over) {
  * করছিল (গড় ২০০ms এর কাছে, uniform না)।
  */
 function nextDelay(st, over) {
-  return 200 + Math.random() * 800;
+  // [DEMO CADENCE MATCH] আগে এখানে ২০০-১০০০ms ছিল, কিন্তু সেটা
+  // tick-থেকে-tick ব্যবধান — আর chartengine.js এর ৩৫০ms glide ওই
+  // ব্যবধানের *ভেতরেই* চলত। ফলে ~১৯% ক্ষেত্রে (delay < ৩৫০ms)
+  // animation মাঝপথে interrupt হতো, কোনো স্থির pause দেখা যেত না।
+  // Demo (Finallyengine.html) এ ক্রম ছিল: delay(২০০-১০০০) → tick →
+  // animate(৩৫০) → আবার delay — অর্থাৎ প্রকৃত inter-tick ৫৫০-১৩৫০ms,
+  // আর প্রতিটা glide শেষে সবসময় ২০০-১০০০ms একদম স্থির pause।
+  // এখানে ৩৫০ যোগ করে ঠিক সেই cadence ফেরানো হলো — এখন সর্বনিম্ন
+  // ব্যবধানও (৫৫০ms) animation duration এর চেয়ে বড়, তাই glide
+  // কখনো interrupt হয় না (animation compromise হওয়ার সুযোগই নেই)।
+  // দিক-নির্বাচন (nextPrice এর ৫০/৫০) এখানে অপরিবর্তিত — তাই সব
+  // expiry তেই দাম আগের মতোই সম্পূর্ণ unpredictable থাকে।
+  return 550 + Math.random() * 800;
 }
 
 
