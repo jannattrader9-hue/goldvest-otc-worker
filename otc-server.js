@@ -1137,6 +1137,14 @@ function _tickTail(id, state) {
     // যেত (যেমন AUD/USD 0.7042 এ ছোট নড়াচড়া display এ হারিয়ে যেত)।
     const _dec = state._eng ? state._eng.decimals : 5;   // [SAFETY] undefined RTDB write ব্যর্থ করে দেয়, তাই ৫ (আগের default) fallback
     saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, decimals:_dec });
+    // [GAP FIX] closed candle-এর final close (এই tick-এর দাম) WS/Redis এ
+    // কখনো broadcast হতো না। ফলে frontend candle N কে আগের tick-এর দামে
+    // finalize করত, আর candle N+1 খুলত এই tick-এর দামে → ঠিক এক tick-এর
+    // gap। RTDB-তে candle N-এর close সঠিক থাকায় reload দিলে gap উধাও হতো।
+    // এখানে state mutate হওয়ার আগেই closed candle-এর final state publish
+    // করা হচ্ছে — এর ঠিক পরেই (নিচে) candle N+1 broadcast হবে, order
+    // preserved (একই Redis connection)।
+    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle, decimals:_dec, tickId: (state._eng ? state._eng.tickId : 0) });
     // /live কে সাথে সাথে closed candle-এর final value দিয়ে আপডেট করো (null না) — client তাৎক্ষণিকভাবে সঠিক close পাবে
     db.ref(`otc_candles/${id}/live`).set({ time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle, decimals:_dec, tickId: (state._eng ? state._eng.tickId : 0) }).catch(()=>{});
 
