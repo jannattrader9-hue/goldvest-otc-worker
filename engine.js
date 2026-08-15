@@ -404,45 +404,14 @@ function nextPrice(st, now = Date.now(), over) {
 function nextDelay(st, over) {
   const c = over ? { ...CFG, ...over } : CFG;
 
-  // [VISIBLE PAUSE] hard-pause চলাকালীন ছোট, নিয়মিত gap — দাম বদলাবে
-  // না ঠিকই (nextPrice এ static থাকে), কিন্তু UI প্রতি tick এ চেক
-  // করে যাবে যাতে pause শেষ হওয়া মাত্র normal movement সাথে সাথে
-  // আবার শুরু হয়, বাড়তি দেরি না হয়।
-  if (st.hardPauseUntil && Date.now() < st.hardPauseUntil) {
-    return 150;
-  }
-
-  let g = c.gapMs;
-
-  // [SPEED STATE] GPT-র সুপারিশ — শুধু per-tick independent random delay
-  // দিলে "random-number-generator" এর মতো লাগে, কোনো momentum নেই।
-  // এখন একটা persistent speed state আছে যেটা প্রতি tick এ সামান্য
-  // বদলায় (কদাচিৎ হঠাৎ, বেশিরভাগ সময় ধীরে) — তাই "slow → একটু fast →
-  // burst → আবার ধীর" এই ধরনের গ্র্যাজুয়াল transition তৈরি হয়,
-  // প্রতিটা tick আলাদা dice-roll না হয়ে একটা ধারাবাহিকতা থাকে।
-  const _sr = Math.random();
-  if (_sr < 0.15) st.speed *= 0.65;         // হঠাৎ দ্রুত
-  else if (_sr < 0.30) st.speed *= 1.45;    // হঠাৎ ধীর
-  else st.speed *= 0.92 + Math.random() * 0.16;  // সামান্য drift
-  st.speed = Math.max(0.45, Math.min(2.2, st.speed));
-
-  g *= st.phase === 'run' ? 0.5
-     : st.phase === 'rest' ? 1.4
-     : st.phase === 'retrace' ? (st.retrFast ? 0.45 : 1.05)   // দ্রুত/ধীর ফেরত
-     : 1;
-  g *= 1 - 0.6 * st.excite * c.spdVar;          // উত্তেজনায় দ্রুত
-  g *= st.speed;                                 // persistent speed state প্রয়োগ
-
-  const roll = Math.random();
-  if (roll < 0.12 * c.spdVar) g *= 0.22;        // ঝাঁক — খুব দ্রুত
-  else if (roll < 0.20 * c.spdVar) g *= 0.45;
-  else if (roll > 1 - 0.07 * c.spdVar) g *= 2.4; // হঠাৎ থমকে যাওয়া
-
-  g *= 0.6 + Math.random() * 0.8;
-  // [DEMO-MATCH] user এর চাওয়া অনুযায়ী tick-generation delay ২০০-১০০০ms
-  // এর মধ্যেই bound করা হলো (আগে ৩৫-২৫০০ms ছিল, অনেক বেশি বিস্তৃত)।
-  // এটাই perfict-engine.html demo তে verified natural backend-rhythm।
-  return Math.max(200, Math.min(1000, g));
+  // [DEMO-MATCH — SIMPLIFIED] আগে phase/speed-regime/burst-roll —
+  // multiplier এর অনেকগুলো স্তর ছিল, যেগুলো একসাথে মিলিয়ে গড় delay
+  // কে ২০০ms floor এর কাছে চেপে ধরছিল (compressed distribution,
+  // uniform-random না) — তাই demo এর মতো লাগছিল না। এখন সরাসরি
+  // perfict-engine.html demo এর সাথে হুবহু মিলিয়ে uniform-random
+  // ২০০-১০০০ms — কোনো multiplier-chain নেই, hard-pause ও নেই
+  // (demo তেও কোনো artificial pause নেই)।
+  return 200 + Math.random() * 800;
 }
 
 module.exports = { createState, nextPrice, nextDelay, sessionMul, CFG };
