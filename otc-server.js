@@ -1778,7 +1778,6 @@ http.createServer(async (req, res) => {
         createdAt:  admin.firestore.FieldValue.serverTimestamp(),
       }).catch(e => console.error('[place-trade] Firestore save failed:', e.message));
 
-      res.writeHead(200, { 'Content-Type': 'application/json' });
       // ══════════════════════════════════════════════════════════════
       // [ORPHAN GUARD] trade এখন সব জায়গায় লেখা হয়ে গেছে (Redis hash,
       // settlement queue, memory, Firestore) — অর্থাৎ /place-trade
