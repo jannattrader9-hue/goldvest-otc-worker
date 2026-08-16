@@ -1626,6 +1626,53 @@ http.createServer(async (req, res) => {
         }
       }
 
+      // ══════════════════════════════════════════════════════════════
+      // [SECURITY — EXPIRY] trade কখন শেষ হবে সেটা client এর হাতে
+      // ছেড়ে দেওয়া যায় না।
+      //
+      // আগে expiryTimestamp / expiryTimestampMs দুটোই client যা পাঠাত
+      // তাই যাচাই ছাড়া Redis এ বসে যেত। অর্থাৎ কেউ browser থেকে অতীতের
+      // একটা মুহূর্ত পাঠালে trade সাথে সাথেই settle হতো — এমন দামের
+      // বিপরীতে যেটা সে আগেই জেনে গেছে। পুরনো visibleTickId এর সাথে
+      // মিলিয়ে দিলে entry ও close দুটোই বেছে নেওয়া যেত = নিশ্চিত জয়।
+      //
+      // এখানে server নিজে duration থেকে expiry হিসাব করে। client এর
+      // মান তখনই মানা হয় যখন সেটা server এর হিসাবের কাছাকাছি — এতে
+      // 'time' mode এর ঘড়ি-মিলানো expiry (যেটা ঠিক মিনিটের মাথায়
+      // পড়ে) অক্ষত থাকে।
+      //
+      // [LIVE SAFETY] এখানে কোনো trade *reject* করা হয় না — সীমার
+      // বাইরে গেলে শুধু server এর মান ব্যবহার হয় ও log হয়। তাই
+      // timesync drift বা ধীর নেটওয়ার্কে কারও trade আটকাবে না।
+      // সহনশীলতা ৫ সেকেন্ড রাখা হয়েছে কারণ মাপা clockOffset ২ সেকেন্ড
+      // পর্যন্ত ওঠানামা করে (timesyncmanager.js এর আলাদা issue)।
+      // ══════════════════════════════════════════════════════════════
+      const _EXP_TOLERANCE_MS = 5000;
+      const _nowMs    = Date.now();
+      const _duration = parseInt(trade.duration) || 0;
+      let _expiryMs   = parseInt(trade.expiryTimestampMs) || 0;
+
+      if (_duration > 0) {
+        const _serverExpiryMs = _nowMs + _duration * 1000;
+        if (_expiryMs <= _nowMs || Math.abs(_expiryMs - _serverExpiryMs) > _EXP_TOLERANCE_MS) {
+          console.warn(`[place-trade] expiry সংশোধন userId=${userId} client=${_expiryMs} server=${_serverExpiryMs} duration=${_duration}s`);
+          _expiryMs = _serverExpiryMs;
+        }
+      } else if (_expiryMs <= _nowMs) {
+        // duration নেই (পুরনো client) অথচ expiry অতীতে — একমাত্র যে
+        // ক্ষেত্রে duration ছাড়া কিছু করার নেই, সেখানে client এর
+        // সেকেন্ড-field থেকে নেওয়া হয়, নইলে 0 (পুরনো fallback path)।
+        const _secMs = (parseInt(trade.expiryTimestamp) || 0) * 1000;
+        _expiryMs = _secMs > _nowMs ? _secMs : 0;
+      }
+
+      // settlement-queue এর সেকেন্ড-bucket সবসময় প্রকৃত expiry এর
+      // সমান বা পরে থাকতে হবে — নইলে queue আগে চলে গিয়ে এমন tick
+      // খুঁজত যেটা তখনো তৈরি হয়নি।
+      const _expirySec = _expiryMs > 0
+        ? Math.ceil(_expiryMs / 1000)
+        : (parseInt(trade.expiryTimestamp) || 0);
+
       // 3. [BALANCE RESERVATION] atomic reserve — সাথে সাথেই deduct হয়
       // (double-spend প্রতিরোধ, ১০০টা click একসাথে এলেও Redis
       // sequentially process করে), কিন্তু trade "pending" থাকে যতক্ষণ
@@ -1667,10 +1714,10 @@ http.createServer(async (req, res) => {
         'payoutPercent',   String(trade.payoutPercent || 92),
         'status',          'live',
         'accountType',     'live',
-        'expiryTimestamp', String(trade.expiryTimestamp || 0),
+        'expiryTimestamp', String(_expirySec || 0),   // [SECURITY] server-যাচাই করা
         // [PRECISION FIX] settlement এর সময় ms-নির্ভুল দাম খুঁজতে —
         // না থাকলে (পুরনো client) 0, তখন fallback সেকেন্ড-ভিত্তিক path
-        'expiryTimestampMs', String(trade.expiryTimestampMs || 0),
+        'expiryTimestampMs', String(_expiryMs || 0),   // [SECURITY] server-যাচাই করা
         'currency',        trade.currency || 'USD',
       );
       // [MAX DURATION] সর্বোচ্চ ৪ ঘণ্টার trade + ১ ঘণ্টা নিরাপত্তা মার্জিন।
@@ -1679,7 +1726,7 @@ http.createServer(async (req, res) => {
       await redisPub.expire(TRADE_KEY_OTC(tradeId), 18000); // 5h TTL
 
       // 5. RTDB settlement_queue write — otc-server candle close এ এখান থেকে পাবে
-      db.ref(`settlement_queue/${trade.expiryTimestamp}/${userId}/${tradeId}`).set({
+      db.ref(`settlement_queue/${_expirySec}/${userId}/${tradeId}`).set({
         userId, tradeId,
         symbol:      trade.symbol || '',
         accountType: 'live',
@@ -1689,7 +1736,7 @@ http.createServer(async (req, res) => {
         entryPrice,   // [SECURITY] server এর দাম
         // [PRECISION FIX] path key (সেকেন্ড) অপরিবর্তিত রাখা হলো — শুধু
         // data এর ভেতরে ms-নির্ভুল expiry যোগ, settlement এ ব্যবহার হবে
-        expiryTimestampMs: trade.expiryTimestampMs || 0,
+        expiryTimestampMs: _expiryMs || 0,   // [SECURITY] server-যাচাই করা
       }).catch(e => console.error('[place-trade] RTDB queue failed:', e.message));
 
       // [SCALE ২.১] in-memory map এ যোগ — আগে Firestore listener এটা করত।
@@ -1697,8 +1744,8 @@ http.createServer(async (req, res) => {
       _activeTradesMemory.set(`${userId}/${tradeId}`, {
         userId, tradeId,
         symbol:            trade.symbol || '',
-        expiryTimestamp:   parseInt(trade.expiryTimestamp) || 0,
-        expiryTimestampMs: parseInt(trade.expiryTimestampMs) || 0,   // [PRECISION FIX]
+        expiryTimestamp:   _expirySec || 0,   // [SECURITY] server-যাচাই করা
+        expiryTimestampMs: _expiryMs || 0,   // [PRECISION FIX] + server-যাচাই করা
         accountType:       'live',
         status:            'live',
         type:              trade.type || '',
@@ -1718,6 +1765,11 @@ http.createServer(async (req, res) => {
       firestore.collection('users').doc(userId).collection('trades').doc(tradeId).set({
         ...trade,
         entryPrice,   // [SECURITY] client এর মান override — server এর দামই নথিতে
+        // [SECURITY] expiry ও server-যাচাই করা মান দিয়ে override — নইলে
+        // Redis/queue এ এক সময় আর Firestore নথিতে অন্য সময় থাকত, এবং
+        // পরে বিতর্ক হলে নথিটাই ভুল প্রমাণ দিত।
+        expiryTimestamp:   _expirySec || 0,
+        expiryTimestampMs: _expiryMs   || 0,
         decimals:   _tradeDecimals || 5,   // [DECIMALS SYNC] fallback ৫ — undefined Firestore write ব্যর্থ করে না, কিন্তু নিরাপত্তার জন্য সংখ্যা রাখা ভালো
         redisDeducted: true,   // [১.৩] Redis এ balance কাটা হয়েছে — settler TTL miss
                                // এ এটা দেখেই বুঝবে জিতলে credit দেওয়া নিরাপদ
