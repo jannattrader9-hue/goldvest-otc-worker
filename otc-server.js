@@ -1779,6 +1779,29 @@ http.createServer(async (req, res) => {
       }).catch(e => console.error('[place-trade] Firestore save failed:', e.message));
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
+      // ══════════════════════════════════════════════════════════════
+      // [ORPHAN GUARD] trade এখন সব জায়গায় লেখা হয়ে গেছে (Redis hash,
+      // settlement queue, memory, Firestore) — অর্থাৎ /place-trade
+      // সম্পূর্ণ সফল। তাই reservation কে 'executed' করে pending-index
+      // থেকে সরিয়ে দিই।
+      //
+      // কেন জরুরি: frontend কখনোই /execute-trade কল করে না
+      // (tradeengine.js এ এর কোনো caller নেই), অথচ trade এখানেই
+      // চূড়ান্ত হয়ে যায়। ফলে প্রতিটা reservation 'pending' থেকে যেত,
+      // আর orphan-sweep সেটা দেখে টাকা ফেরত দিয়ে দিত — অথচ trade
+      // বাতিল হতো না, settle হয়ে payout ও দিত। user stake ফেরত পেত
+      // আর trade ও চালাত। ৫s trade এ ঝুঁকি সবচেয়ে বেশি ছিল, কারণ
+      // সেটা reservation এর আয়ুর ভেতরেই settle হয়ে যায়।
+      //
+      // এখন status ই প্রমাণ: 'executed' = trade সত্যিই বসেছে, টাকা
+      // ন্যায্যভাবে কাটা। আর server এই লাইনে পৌঁছানোর আগে মরে গেলে
+      // status 'pending' থেকে যাবে ও sweep কয়েক সেকেন্ডেই টাকা ফেরত
+      // দেবে — দুই পক্ষই ন্যায্য।
+      // ══════════════════════════════════════════════════════════════
+      tradeReservation.executeReservation(redisPub, reservationId)
+        .catch(e => console.error('[place-trade] reservation execute failed:', e.message));
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true, newBalance: parseFloat(newBal), reservationId, entryPrice }));
 
     } catch(e) {
@@ -2354,16 +2377,26 @@ setInterval(() => {
     .catch(() => {});
 }, 8*60*1000);
 
-// [BALANCE RESERVATION — CLEANUP] periodic sweep — যদি কোনো reservation
-// এর frontend কখনো execute/release signal না পাঠায় (network issue, tab
-// বন্ধ ইত্যাদি), TTL শেষের দিকে চলে আসা reservation-গুলো খুঁজে balance
-// ফেরত দেয়। প্রতি ৩০ সেকেন্ডে একবার চলে (Redis SCAN খরচ কম রাখতে)।
+// [BALANCE RESERVATION — ORPHAN RECOVERY] যদি /place-trade মাঝপথে
+// ব্যর্থ হয় (server crash, Redis hiccup) — টাকা কেটে গেছে কিন্তু trade
+// কোথাও লেখা হয়নি — তখন reservation 'pending' থেকে যায়। এই কাজটা
+// সেগুলো খুঁজে user কে টাকা ফেরত দেয়।
+//
+// আগে এটা প্রতি ৩০ সেকেন্ডে SCAN দিয়ে চলত, অথচ reservation বাঁচত
+// মাত্র ১০ সেকেন্ড — তাই বেশির ভাগ orphan ধরাই পড়ত না, টাকা হারিয়ে
+// যেত। এখন pending-index (ZSET) থেকে একটাই কলে মেয়াদোত্তীর্ণদের পাওয়া
+// যায়, খরচ প্রায় স্থির — তাই প্রতি ২ সেকেন্ডে চালানো নিরাপদ, আর
+// প্রতিটা orphan ৩-৫ সেকেন্ডের মধ্যেই ফেরত হয়।
 setInterval(async () => {
   if (!redisReady) return;
   try {
-    const cleaned = await tradeReservation.sweepExpiredReservations(redisPub);
-    if (cleaned > 0) console.log(`[reservation-sweep] ${cleaned} টা orphaned reservation পরিষ্কার হলো`);
+    const { released, lost } = await tradeReservation.sweepExpiredReservations(redisPub);
+    if (released > 0) console.log(`[reservation-sweep] ${released} টা orphaned reservation এর টাকা ফেরত দেওয়া হলো`);
+    // lost > 0 মানে reservation-hash TTL এ মুছে গিয়েছিল sweep পৌঁছানোর
+    // আগেই — টাকা ফেরত দেওয়া যায়নি। এটা কখনো দেখা গেলে interval বা
+    // hash TTL বাড়াতে হবে, তাই আলাদা করে চিহ্নিত করা হলো।
+    if (lost > 0) console.error(`[reservation-sweep] ⚠️ ${lost} টা reservation এর তথ্য পাওয়া যায়নি — টাকা ফেরত দেওয়া যায়নি`);
   } catch (e) {
     console.error('[reservation-sweep] error:', e.message);
   }
-}, 30*1000);
+}, 2*1000);
