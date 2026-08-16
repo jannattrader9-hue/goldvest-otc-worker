@@ -35,6 +35,21 @@ const crypto = require('crypto');
 const RESERVATION_TTL_SEC = 10;   // এই সময়ের মধ্যে execute না হলে auto-release
 const RES_KEY = (reservationId) => `gv:reserve:${reservationId}`;
 
+// [PENDING INDEX] সব pending reservation এর একটাই sorted-set index।
+// score = কখন এটাকে orphan ধরে ফেরত দেওয়া যাবে (ms epoch)।
+//
+// কেন index দরকার: আগে sweep প্রতি বার Redis SCAN দিয়ে পুরো keyspace
+// ঘুরে প্রতিটা key তে HGET+TTL করত — user সংখ্যার সাথে খরচ রৈখিকভাবে
+// বাড়ত, তাই sweep কে বিরল (৩০s) রাখতে হয়েছিল, আর সেই কারণেই বেশির
+// ভাগ orphan ধরাই পড়ত না। ZSET এ সরাসরি "কারা মেয়াদোত্তীর্ণ" জানা
+// যায় একটা কলেই — তাই ঘন ঘন (২s) চালানো যায়, খরচ প্রায় স্থির।
+const PENDING_ZSET = 'gv:reserve:pending';
+
+// Reservation-hash এর TTL এর চেয়ে index এন্ট্রি একটু বেশি সময় রাখি,
+// নইলে hash মুছে যাওয়ার পর টাকা ফেরত দেওয়ার আর কোনো উপায় থাকে না।
+// (নিচে reserve এর সময় hash এর TTL ও এই মার্জিন ধরে বসানো হয়।)
+const ORPHAN_GRACE_SEC = 5;
+
 /**
  * Redis client এ প্রয়োজনীয় Lua-script গুলো register করে। otc-server.js
  * এর startup এ একবার কল করতে হবে (অন্য defineCommand কলগুলোর পাশে)।
@@ -46,10 +61,11 @@ function registerReservationCommands(redisPub) {
   // এখনো "pending" — আলাদা reservation-hash এ track হয়, যেটা পরে
   // execute (confirm) বা release (বাতিল/timeout) হতে পারে।
   redisPub.defineCommand('gvReserveBalance', {
-    numberOfKeys: 2,
-    // KEYS[1] = balance key, KEYS[2] = reservation key
+    numberOfKeys: 3,
+    // KEYS[1] = balance key, KEYS[2] = reservation key, KEYS[3] = pending index
     // ARGV[1] = amount, ARGV[2] = reservation TTL (sec), ARGV[3] = entryPrice,
-    // ARGV[4] = entryTimeMs, ARGV[5] = balKey (string, sweep এর জন্য সংরক্ষণ)
+    // ARGV[4] = entryTimeMs, ARGV[5] = balKey (string, sweep এর জন্য সংরক্ষণ),
+    // ARGV[6] = reservationId, ARGV[7] = orphanAt (ms epoch — এর পরে sweep ফেরত দেবে)
     lua: `
       local bal = redis.call('GET', KEYS[1])
       if bal == false then return {-1, '0'} end
@@ -63,6 +79,10 @@ function registerReservationCommands(redisPub) {
       -- ফেরত দিতে পারে, আলাদা lookup ছাড়াই।
       redis.call('HSET', KEYS[2], 'amount', ARGV[1], 'entryPrice', ARGV[3], 'entryTimeMs', ARGV[4], 'balKey', ARGV[5], 'status', 'pending')
       redis.call('EXPIRE', KEYS[2], ARGV[2])
+      -- pending index এ যোগ — sweep এখান থেকেই সরাসরি orphan খুঁজে পাবে,
+      -- SCAN ছাড়াই। reserve, index-এন্ট্রি ও balance-deduct তিনটাই একই
+      -- Lua তে, তাই মাঝপথে server মরলেও অসম্পূর্ণ অবস্থা তৈরি হয় না।
+      redis.call('ZADD', KEYS[3], ARGV[7], ARGV[6])
       return {1, nb}
     `,
   });
@@ -73,12 +93,17 @@ function registerReservationCommands(redisPub) {
   // execute হলো, duplicate-execute (frontend দুইবার confirm পাঠালে)
   // থেকে রক্ষা পাওয়া যায়।
   redisPub.defineCommand('gvExecuteReservation', {
-    numberOfKeys: 1,
+    numberOfKeys: 2,
+    // KEYS[1] = reservation key, KEYS[2] = pending index
+    // ARGV[1] = reservationId
     lua: `
       local st = redis.call('HGET', KEYS[1], 'status')
       if st == false then return 0 end        -- reservation নেই/expire হয়ে গেছে
       if st ~= 'pending' then return 0 end     -- আগেই executed/released
       redis.call('HSET', KEYS[1], 'status', 'executed')
+      -- index থেকে সরিয়ে দিই — trade সফলভাবে বসে গেছে, sweep এর আর
+      -- কোনো কাজ নেই। এটাই ভুয়া refund ঠেকানোর মূল লাইন।
+      redis.call('ZREM', KEYS[2], ARGV[1])
       return 1
     `,
   });
@@ -87,16 +112,27 @@ function registerReservationCommands(redisPub) {
   // balance ফেরত দেওয়া। শুধু 'pending' status এ থাকলেই ফেরত হবে, ইতিমধ্যে
   // executed হলে ফেরত দেওয়া ভুল হবে (টাকা তখন legitimately deducted)।
   redisPub.defineCommand('gvReleaseReservation', {
-    numberOfKeys: 2,
-    // KEYS[1] = reservation key, KEYS[2] = balance key
+    numberOfKeys: 3,
+    // KEYS[1] = reservation key, KEYS[2] = balance key, KEYS[3] = pending index
+    // ARGV[1] = reservationId
     lua: `
       local st = redis.call('HGET', KEYS[1], 'status')
-      if st == false then return 0 end
-      if st ~= 'pending' then return 0 end
+      if st == false then
+        -- hash মুছে গেছে (TTL) কিন্তু index এ রয়ে গেছে — টাকা ফেরত
+        -- দেওয়ার তথ্য আর নেই, তাই index পরিষ্কার করে 0 ফেরত দিই।
+        -- এমনটা ঘটলে sweep interval খুব বড়, log এ ধরা পড়বে।
+        redis.call('ZREM', KEYS[3], ARGV[1])
+        return -1
+      end
+      if st ~= 'pending' then
+        redis.call('ZREM', KEYS[3], ARGV[1])
+        return 0
+      end
       local amt = redis.call('HGET', KEYS[1], 'amount')
       redis.call('INCRBYFLOAT', KEYS[2], amt)
       redis.call('EXPIRE', KEYS[2], 3600)
       redis.call('HSET', KEYS[1], 'status', 'released')
+      redis.call('ZREM', KEYS[3], ARGV[1])
       return 1
     `,
   });
@@ -110,9 +146,23 @@ async function reserveTradeBalance(redisPub, balKey, amount, entryPrice, entryTi
   const reservationId = crypto.randomBytes(16).toString('hex');   // client guess করতে পারবে না
   const resKey = RES_KEY(reservationId);
 
+  // orphanAt — এই মুহূর্তের পরে reservation টা এখনো 'pending' থাকলে
+  // ধরে নেওয়া হবে /place-trade কখনো সম্পূর্ণ হয়নি, তাই টাকা ফেরত।
+  // ৩ সেকেন্ড রাখা হয়েছে: একটা সফল /place-trade মিলিসেকেন্ডেই execute
+  // পর্যন্ত পৌঁছে যায়, তাই ৩ সেকেন্ড যথেষ্ট উদার — ধীর নেটওয়ার্কেও
+  // বৈধ trade ভুল করে refund হবে না।
+  const orphanAt = Date.now() + 3000;
+
+  // hash এর TTL index এর সময়সীমার চেয়ে বেশি — নইলে sweep যখন orphan
+  // ধরতে যাবে তখন hash উধাও থাকতে পারে, আর amount না জানলে টাকা ফেরত
+  // দেওয়াই সম্ভব হতো না।
+  const hashTtl = RESERVATION_TTL_SEC + ORPHAN_GRACE_SEC;
+
   const [ok, newBalRaw] = await redisPub.gvReserveBalance(
-    balKey, resKey, String(amount), String(RESERVATION_TTL_SEC),
-    String(entryPrice), String(entryTimeMs), balKey
+    balKey, resKey, PENDING_ZSET,
+    String(amount), String(hashTtl),
+    String(entryPrice), String(entryTimeMs), balKey,
+    reservationId, String(orphanAt)
   );
 
   return {
@@ -130,7 +180,7 @@ async function reserveTradeBalance(redisPub, balKey, amount, entryPrice, entryTi
 async function executeReservation(redisPub, reservationId) {
   if (!reservationId || typeof reservationId !== 'string') return false;
   const resKey = RES_KEY(reservationId);
-  const result = await redisPub.gvExecuteReservation(resKey);
+  const result = await redisPub.gvExecuteReservation(resKey, PENDING_ZSET, reservationId);
   return result === 1;
 }
 
@@ -143,44 +193,53 @@ async function executeReservation(redisPub, reservationId) {
 async function releaseReservation(redisPub, reservationId, balKey) {
   if (!reservationId || typeof reservationId !== 'string') return false;
   const resKey = RES_KEY(reservationId);
-  const result = await redisPub.gvReleaseReservation(resKey, balKey);
+  const result = await redisPub.gvReleaseReservation(resKey, balKey, PENDING_ZSET, reservationId);
   return result === 1;
 }
 
 /**
- * [CLEANUP SAFETY NET] TTL দিয়ে reservation-hash নিজে থেকেই মুছে যায়,
- * কিন্তু সেই সময় balance ফেরত দেওয়ার কেউ থাকে না যদি frontend
- * execute/release কখনোই না পাঠায় (যেমন user tab বন্ধ করে দিলো)।
- * এই function periodic ভাবে চালিয়ে সেই "orphaned" reservation গুলো
- * খুঁজে balance ফেরত দেওয়া যায়। otc-server.js এ প্রতি কয়েক সেকেন্ডে
- * cron/interval দিয়ে চালানো উচিত।
+ * [ORPHAN RECOVERY] pending-index থেকে মেয়াদোত্তীর্ণ reservation খুঁজে
+ * টাকা ফেরত দেয়।
  *
- * নোট: এটা Redis SCAN দিয়ে reservation-key খোঁজে, production এ বড়
- * key-space এ এটা costly হতে পারে — তাই বিরল, low-frequency তে চালানো
- * উচিত (যেমন প্রতি ৩০ সেকেন্ডে একবার)।
+ * কেন এটা দরকার (এবং আগের SCAN-ভিত্তিক sweep কেন যথেষ্ট ছিল না):
+ *   • আগে প্রতি বার পুরো keyspace SCAN হতো, প্রতিটা key তে HGET+TTL —
+ *     user বাড়ার সাথে খরচ রৈখিকভাবে বাড়ত। তাই sweep কে ৩০ সেকেন্ডে
+ *     একবার রাখতে হয়েছিল, অথচ reservation বাঁচে মাত্র ১০ সেকেন্ড —
+ *     ফলে বেশির ভাগ orphan ধরাই পড়ত না, user এর টাকা হারিয়ে যেত।
+ *   • এখন একটাই ZRANGEBYSCORE কল বলে দেয় কারা মেয়াদোত্তীর্ণ। খরচ
+ *     প্রায় স্থির, তাই কয়েক সেকেন্ড পর পর চালানো যায় এবং প্রতিটা
+ *     orphan নিশ্চিতভাবে ধরা পড়ে।
+ *
+ * ন্যায্যতা দুই দিকেই রক্ষা পায়:
+ *   • trade সফলভাবে বসে গেলে status 'executed' — index এ আর থাকে না,
+ *     তাই টাকা ভুল করে ফেরত যায় না (প্ল্যাটফর্মের সুরক্ষা)।
+ *   • /place-trade মাঝপথে ব্যর্থ হলে status 'pending' থেকে যায় —
+ *     কয়েক সেকেন্ডের মধ্যেই টাকা ফেরত (user এর সুরক্ষা)।
+ *
+ * @returns {Promise<{released:number, lost:number}>}
+ *          released = ফেরত দেওয়া হয়েছে, lost = hash উধাও ছিল বলে
+ *          ফেরত দেওয়া যায়নি (এটা ০ এর বেশি হলে interval বড্ড বড়)।
  */
-async function sweepExpiredReservations(redisPub) {
-  let cursor = '0';
-  let cleaned = 0;
-  do {
-    const [nextCursor, keys] = await redisPub.scan(cursor, 'MATCH', 'gv:reserve:*', 'COUNT', 100);
-    cursor = nextCursor;
-    for (const key of keys) {
-      const status = await redisPub.hget(key, 'status');
-      if (status !== 'pending') continue;
-      const ttl = await redisPub.ttl(key);
-      // TTL প্রায় শেষের দিকে (২ সেকেন্ডের কম বাকি) মানে সম্ভবত orphaned —
-      // এখনই release করে দিই, TTL দিয়ে key নিজে expire হওয়ার অপেক্ষা না করে
-      if (ttl >= 0 && ttl < 2) {
-        const balKey = await redisPub.hget(key, 'balKey');
-        if (balKey) {
-          const released = await redisPub.gvReleaseReservation(key, balKey);
-          if (released === 1) cleaned++;
-        }
-      }
+async function sweepExpiredReservations(redisPub, batchLimit = 500) {
+  const now = Date.now();
+  const ids = await redisPub.zrangebyscore(
+    PENDING_ZSET, 0, now, 'LIMIT', 0, batchLimit
+  );
+  let released = 0, lost = 0;
+  for (const reservationId of ids) {
+    const resKey = RES_KEY(reservationId);
+    const balKey = await redisPub.hget(resKey, 'balKey');
+    if (!balKey) {
+      // hash নেই — index এন্ট্রি পরিষ্কার করে দিই, নইলে চিরকাল জমতে থাকত
+      await redisPub.zrem(PENDING_ZSET, reservationId);
+      lost++;
+      continue;
     }
-  } while (cursor !== '0');
-  return cleaned;
+    const r = await redisPub.gvReleaseReservation(resKey, balKey, PENDING_ZSET, reservationId);
+    if (r === 1) released++;
+    else if (r === -1) lost++;
+  }
+  return { released, lost };
 }
 
 module.exports = {
@@ -190,4 +249,5 @@ module.exports = {
   releaseReservation,
   sweepExpiredReservations,
   RESERVATION_TTL_SEC,
+  PENDING_ZSET,
 };
