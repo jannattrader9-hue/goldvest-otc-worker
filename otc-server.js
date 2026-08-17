@@ -871,6 +871,39 @@ const _MARKET_DECIMALS = {
   USDPKROTC: 3,
 };
 
+// ══════════════════════════════════════════════════════════════════
+// [DECIMALS — একটাই উৎস] কোনো market এর দাম কত ঘর দশমিকে দেখানো হবে।
+//
+// নিয়ম: মোট প্রায় ৬টি সংখ্যা দেখাও —
+//     decimals = ৬ − (পূর্ণসংখ্যার ঘর),  সর্বনিম্ন ২, সর্বোচ্চ ৫
+//
+// এই নিয়মটা আবিষ্কার করা হয়নি, নিচের _MARKET_DECIMALS টেবিল থেকেই
+// বের করা: টেবিলের ১৬টি pair-ই ব্যতিক্রমহীনভাবে এটা মেনে চলে
+// (EURGBP 0.87→5, CNYJPY 24.8→4, USDJPY 156→3, USDARS 1387→2,
+//  USDIDR 17841→2)। তাই টেবিল ও নিয়ম একই ফল দেয় — টেবিল অক্ষত রেখেই
+// নতুন market গুলো স্বয়ংক্রিয়ভাবে সঠিক হয়।
+//
+// কেন দরকার হলো: আগের fallback ছিল seed-price এর *string দৈর্ঘ্য* —
+//   Math.max(5, String(price).split('.')[1].length)
+// JavaScript এর float এ 606.62 লেখা হয় 606.6200000000001 হিসেবে, তাই
+// টেবিলে না-থাকা market (সব crypto) পেত decimals ১৪-১৫। এতে শুধু
+// প্রদর্শন নয়, engine ও ভাঙত: pip = 10^-decimals, অর্থাৎ pip হয়ে যেত
+// ০.০০০০০০০০০০০০০০১ — দাম কার্যত নড়তই না।
+//
+// এটাই একমাত্র জায়গা যেখানে decimals ঠিক হয়। OTC, forex ও crypto —
+// তিন path ই এখান থেকে নেয়, তাই ভবিষ্যতে নতুন market যোগ করলে আর
+// কোথাও কিছু করতে হবে না।
+// ══════════════════════════════════════════════════════════════════
+function decimalsFor(id, price) {
+  const fromTable = _MARKET_DECIMALS[id];
+  if (typeof fromTable === 'number') return fromTable;
+
+  const p = Math.abs(Number(price));
+  if (!isFinite(p) || p <= 0) return 5;   // দাম এখনো জানা নেই — নিরাপদ ডিফল্ট
+  const intDigits = p >= 1 ? Math.floor(Math.log10(p)) + 1 : 1;
+  return Math.max(2, Math.min(5, 6 - intDigits));
+}
+
 // symbol → [base, quote] — admin panel এর ঠিক তালিকা অনুযায়ী (Index.js
 // এর _OTC_PAIR_MAP এর সাথে হুবহু মিলিয়ে রাখা, দুই জায়গায় duplicate
 // রাখা হলো কারণ otc-server.js ও Index.js সম্পূর্ণ আলাদা service/repo)
@@ -1101,11 +1134,10 @@ function tickOTC(id) {
   //   speedMultiplier— সব নড়াচড়ার গুণক
   // ══════════════════════════════════════════════════════════════════
   if (!state._eng) {
-    // [DECIMALS] প্রথমে _MARKET_DECIMALS table থেকে সঠিক দশমিক ঘর খুঁজি
-    // (Quotex এর সাথে সরাসরি মিলিয়ে যাচাই করা)। table এ না থাকলে (নতুন
-    // market) পুরনো fallback — seed price এর string length, ন্যূনতম ৫।
-    const dec = _MARKET_DECIMALS[id]
-      ?? Math.max(5, (String(state.price).split('.')[1] || '').length || 5);
+    // [DECIMALS] একটাই উৎস — decimalsFor() (উপরে সংজ্ঞায়িত)। table এ
+    // থাকলে টেবিলের মান, নইলে ৬-সংখ্যার নিয়ম। আগে এখানে string-দৈর্ঘ্যের
+    // fallback ছিল, যা crypto গুলোকে decimals ১৪-১৫ দিত।
+    const dec = decimalsFor(id, state.price);
     state._eng = engine.createState(state.price, Math.max(1, dec));
     console.log(`[engine] ${id} — চালু (decimals: ${state._eng.decimals}${_MARKET_DECIMALS[id] ? ', table থেকে' : ', fallback দিয়ে'})`);
     // [REFERENCE ANCHOR] শুধু প্রথমবার engine তৈরি হওয়ার সময় Firestore
@@ -1396,9 +1428,14 @@ function tickForex(id) {
     // trade.expiryTimestamp = candle close time (= next candle's open time), candleTime এ candle open time থাকে
     const closedCandleTime  = state.nextCandle / 1000;
     const closedCandleClose = price;
-    saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price });
+    // [DECIMALS FIX] real (forex/crypto) path এ decimals কখনোই পাঠানো
+    // হতো না — frontend তখন আগের market এর _decimals ধরে বসে থাকত।
+    // তাই BNB/USDT OTC (তখন ভুলভাবে ১৫) দেখার পর real BNB/USDT এ গেলে
+    // সেখানেও ১৫ ঘর দেখাত। এখন তিনটি write ই decimals বহন করে।
+    const _rdec = decimalsFor(id, price);
+    saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, decimals:_rdec });
     // /live কে সাথে সাথে closed candle-এর final value দিয়ে আপডেট করো (null না) — client তাৎক্ষণিকভাবে সঠিক close পাবে
-    db.ref(`otc_candles/${id}/live`).set({ time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle, tickId: (state._forexTickId || 0) }).catch(()=>{});
+    db.ref(`otc_candles/${id}/live`).set({ time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle, decimals:_rdec, tickId: (state._forexTickId || 0) }).catch(()=>{});
 
     // ── candle just closed — এই মুহূর্তের close price দিয়ে matching live trades settle করো ──
     // Synchronously mark — একই tick-এ _settleDueTradesFromMemory এই symbol skip করবে
@@ -1412,7 +1449,7 @@ function tickForex(id) {
     state.nextCandle += CANDLE_MS;
     while (state.nextCandle <= now) { state.candleTime = state.nextCandle/1000; state.nextCandle += CANDLE_MS; }
   } else {
-    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle, tickId: (state._forexTickId || 0) });
+    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle, decimals: decimalsFor(id, price), tickId: (state._forexTickId || 0) });
   }
   for (const { label } of SUB_INTERVALS) {
     const ss = state.subStates[label];
