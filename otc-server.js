@@ -1594,8 +1594,37 @@ http.createServer(async (req, res) => {
       const _visibleTickId = trade.visibleTickId;
       if (_visibleTickId !== undefined && _visibleTickId !== null) {
         const _tick = tickHistory.findTickById(trade.symbol, _visibleTickId);
-        if (_tick) _tickIdEntry = _tick.price;
-        else console.warn(`[place-trade] visibleTickId=${_visibleTickId} history তে পাওয়া যায়নি (userId=${userId}) — fallback ব্যবহার হবে`);
+        // [SECURITY — TICK STALENESS] tick টা পাওয়া গেলেই যথেষ্ট নয়,
+        // সেটা *এই মুহূর্তের* tick কিনা তাও দেখতে হবে।
+        //
+        // tickhistory.js প্রতি symbol এ ৫০০০ tick রাখে — বর্তমান
+        // cadence এ প্রায় ৭৯ মিনিট। বয়স যাচাই না করায় যেকোনো পুরনো
+        // tickId পাঠিয়ে সেই সময়ের দামে entry নেওয়া যেত, অর্থাৎ
+        // ফলাফল আগে থেকে জেনে trade করা — কার্যত নিশ্চিত জয়।
+        //
+        // এটা কেবল তাত্ত্বিক আক্রমণ নয়: tab background এ গেলে
+        // chartengine এর RAF জমে যায় আর _visibleTickId পুরনো tick এ
+        // আটকে থাকে। লাইভ মাপা হয়েছে — ১৩.৬ মিনিট পুরনো tickId,
+        // ৪৪ pip দামের পার্থক্য। অর্থাৎ শুধু ট্যাব বদলালেই সাধারণ
+        // user দুর্ঘটনাক্রমে এই সুবিধা পেয়ে যেত।
+        //
+        // clickTs fallback পথে ইতিমধ্যেই ±২ সেকেন্ডের drift-check আছে
+        // (নিচে), কিন্তু tickId পথের অগ্রাধিকার বেশি হওয়ায় সেটা এড়িয়ে
+        // যেত। একই ২ সেকেন্ড সীমা এখানেও প্রয়োগ করা হলো।
+        //
+        // [LIVE SAFETY] বাসি হলে trade *বাতিল* করা হয় না — শুধু এই
+        // পথটা ছেড়ে নিচের স্বাভাবিক fallback chain এ যায় (clickTs →
+        // server price)। তাই কারও বৈধ trade আটকাবে না।
+        if (_tick) {
+          const _tickAge = Math.abs(Date.now() - _tick.timestamp);
+          if (_tickAge <= 2000) {
+            _tickIdEntry = _tick.price;
+          } else {
+            console.warn(`[place-trade] tickId=${_visibleTickId} বাসি (${_tickAge}ms পুরনো) — উপেক্ষা, fallback ব্যবহার হবে (userId=${userId})`);
+          }
+        } else {
+          console.warn(`[place-trade] visibleTickId=${_visibleTickId} history তে পাওয়া যায়নি (userId=${userId}) — fallback ব্যবহার হবে`);
+        }
       }
 
       // [TICK HISTORY — fallback] client tickId না পাঠালে (পুরনো client)
