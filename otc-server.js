@@ -1528,6 +1528,22 @@ function tickForex(id) {
     // সেখানেও ১৫ ঘর দেখাত। এখন তিনটি write ই decimals বহন করে।
     const _rdec = decimalsFor(id, price);
     saveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, decimals:_rdec });
+    // [GAP FIX — REAL PATH] OTC path এ (tickOTC) এই সংশোধন আগেই যোগ
+    // করা হয়েছিল, কিন্তু real (forex/crypto) path এ যায়নি — তাই
+    // BTC/USDT, BNB/USDT সহ সব Binance/FOREX market এ candle
+    // gap-up/gap-down bug টা রয়ে গিয়েছিল।
+    //
+    // কারণ একই: স্বাভাবিক tick এ নিচের else-শাখা saveLiveCandle()
+    // দিয়ে Redis/WS এ broadcast করে, কিন্তু candle boundary তে শুধু
+    // RTDB তে লেখা হতো। ফলে WS-শ্রোতা frontend candle N এর *final*
+    // close কখনো পেত না — সে candle N কে আগের tick এর দামে finalize
+    // করত আর candle N+1 খুলত এই tick এর দামে → ঠিক এক tick এর gap।
+    // reload দিলে RTDB এর সঠিক close আসত বলে gap উধাও হয়ে যেত।
+    //
+    // এখানে state mutate হওয়ার আগেই closed candle এর final state
+    // publish করা হচ্ছে; ঠিক পরেই candle N+1 broadcast হবে, একই Redis
+    // connection বলে ক্রম অক্ষুণ্ন থাকে।
+    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle, decimals:_rdec, tickId: (state._forexTickId || 0) });
     // /live কে সাথে সাথে closed candle-এর final value দিয়ে আপডেট করো (null না) — client তাৎক্ষণিকভাবে সঠিক close পাবে
     db.ref(`otc_candles/${id}/live`).set({ time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle, decimals:_rdec, tickId: (state._forexTickId || 0) }).catch(()=>{});
 
