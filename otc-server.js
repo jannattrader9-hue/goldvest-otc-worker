@@ -869,6 +869,37 @@ const _MARKET_DECIMALS = {
   USDCADOTC: 5, USDCHFOTC: 5, USDCOPOTC: 2, USDEGPOTC: 4,
   USDIDROTC: 2, USDJPYOTC: 3, USDNGNOTC: 2, USDPHPOTC: 4,
   USDPKROTC: 3,
+
+  // ── Binance feed (real crypto) ────────────────────────────────
+  // এগুলোর দাম Binance থেকে আসে, তাই ঘরও Binance এর tickSize
+  // অনুযায়ী হওয়া উচিত — কোনো সাধারণ নিয়ম থেকে নয়। নিচের তিনটি
+  // স্ক্রিনশট মিলিয়ে যাচাই করা: BTC 64084.00, BNB 606.59, SOL 75.95
+  // — তিনটিই ২ ঘর। বাকিগুলোও Binance এর প্রচলিত tickSize:
+  //   BTC/ETH/BNB/SOL → 0.01  → ২ ঘর
+  //   XRP/ADA         → 0.0001 → ৪ ঘর
+  //   DOGE            → 0.00001 → ৫ ঘর
+  // (XRP/ADA/DOGE স্ক্রিনশটে যাচাই করা হয়নি — Binance এ দেখে নিশ্চিত
+  //  করলে ভালো, ভুল হলে এখানে এক জায়গায় বদলালেই হবে।)
+  BTCUSDT: 2, ETHUSDT: 2, BNBUSDT: 2, SOLUSDT: 2,
+  XRPUSDT: 4, ADAUSDT: 4, DOGEUSDT: 5,
+
+  // ── FOREX feed (real) ─────────────────────────────────────────
+  // OTC সংস্করণের সাথে একই ঘর — একই মুদ্রা-জোড়া, তাই আলাদা হওয়ার
+  // কারণ নেই। এগুলো না থাকায় এতদিন এরাও fallback এ যেত।
+  EURGBP: 5, EURJPY: 3, EURNZD: 5, EURUSD: 5,
+  GBPUSD: 5, NZDJPY: 4, NZDUSD: 5, USDJPY: 3,
+
+  // ── USDT/BDT ──────────────────────────────────────────────────
+  // দাম ~১২২, তাই ৩ ঘর (৬-সংখ্যার নিয়মের সাথেও মেলে)
+  USDTBDT: 3,
+
+  // NOTE: crypto OTC (BTCOTC, ETHOTC, BNBOTC, SOLOTC) এখানে
+  // ইচ্ছাকৃতভাবে যোগ করা হয়নি। ওদের বর্তমান দাম আসল দাম থেকে
+  // সম্পূর্ণ আলাদা (BNBOTC 0.43 বনাম আসল 606, SOLOTC 456 বনাম আসল
+  // 75.95) কারণ ওদের কোনো market_reference নেই। এখন ২ ঘর বসালে
+  // BNBOTC দেখাবে "0.43" — বর্তমানের চেয়েও খারাপ। reference ঠিক
+  // করার সাথে সাথেই এখানে যোগ করতে হবে: BTCOTC/ETHOTC/BNBOTC/
+  // SOLOTC সবগুলো ২।
 };
 
 // ══════════════════════════════════════════════════════════════════
