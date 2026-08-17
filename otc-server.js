@@ -1156,8 +1156,6 @@ function _tickTail(id, state) {
     });
 
     state.candleTime = state.nextCandle/1000; state.candleOpen = state.price;
-    // [DIAGNOSTIC] candle-boundary এ open vs prevClose verify করার জন্য
-    console.log(`[gap-diag] ${id} candle-boundary: closedClose=${closedCandleClose} newOpen=${state.candleOpen} (একই হওয়ার কথা, কোনো নতুন tick generate হয়নি এখানে)`);
     state.candleHigh = state.price; state.candleLow = state.price;
     state.nextCandle += CANDLE_MS;
     // [FIX] tick দেরিতে এলে (জমাটে ব্যবধান বড় হয়) একাধিক candle পার হয়ে
