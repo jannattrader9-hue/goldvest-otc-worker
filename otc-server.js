@@ -893,13 +893,11 @@ const _MARKET_DECIMALS = {
   // দাম ~১২২, তাই ৩ ঘর (৬-সংখ্যার নিয়মের সাথেও মেলে)
   USDTBDT: 3,
 
-  // NOTE: crypto OTC (BTCOTC, ETHOTC, BNBOTC, SOLOTC) এখানে
-  // ইচ্ছাকৃতভাবে যোগ করা হয়নি। ওদের বর্তমান দাম আসল দাম থেকে
-  // সম্পূর্ণ আলাদা (BNBOTC 0.43 বনাম আসল 606, SOLOTC 456 বনাম আসল
-  // 75.95) কারণ ওদের কোনো market_reference নেই। এখন ২ ঘর বসালে
-  // BNBOTC দেখাবে "0.43" — বর্তমানের চেয়েও খারাপ। reference ঠিক
-  // করার সাথে সাথেই এখানে যোগ করতে হবে: BTCOTC/ETHOTC/BNBOTC/
-  // SOLOTC সবগুলো ২।
+  // ── crypto OTC ────────────────────────────────────────────────
+  // _CRYPTO_OTC_MAP + Binance reference যোগ হওয়ায় এদের দাম এখন আসল
+  // দামের কাছাকাছি চলে (BNBOTC ~৬০৬, SOLOTC ~৭৬)। তাই real সংস্করণের
+  // সাথে একই ঘর — নইলে একই coin এর OTC ও real আলাদা ঘরে দেখাত।
+  BTCOTC: 2, ETHOTC: 2, BNBOTC: 2, SOLOTC: 2,
 };
 
 // ══════════════════════════════════════════════════════════════════
@@ -1012,6 +1010,71 @@ async function _fetchAndStoreReferencePrices() {
   } catch (e) {
     console.error('[market-reference] startup fetch ব্যর্থ:', e.message);
     // ব্যর্থ হলেও থেমে থাকব না — Index.js এর দৈনিক schedule পরে ঠিক করে দেবে
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════
+// [CRYPTO OTC REFERENCE] crypto OTC → যে Binance symbol এর দাম অনুসরণ
+// করবে।
+//
+// forex OTC গুলো _OTC_PAIR_MAP + exchangerate-api দিয়ে market_reference
+// পায়, তাই তাদের দাম সবসময় বাস্তবের কাছাকাছি থাকে। crypto OTC কোনো
+// map এই ছিল না — exchangerate-api তে BTC/ETH/BNB/SOL নেই — তাই তাদের
+// market_reference doc কখনো তৈরিই হয়নি, referencePrice থাকত ০, অর্থাৎ
+// anchor সম্পূর্ণ নিষ্ক্রিয়। ফলে যেখান থেকে শুরু হয়েছিল সেখানেই ভেসে
+// বেড়াত (BNBOTC ০.৪৩ বনাম আসল ৬০৬, SOLOTC ৪৫৬ বনাম আসল ৭৫.৯৫)।
+//
+// এখানে আলাদা map রাখা হলো কারণ উৎসও আলাদা (Binance, exchangerate-api
+// নয়)। ফলাফল একই collection এ লেখা হয়, তাই বাকি pipeline
+// (_getReferencePrice → referencePrice → anchor) অপরিবর্তিত থাকে।
+// ══════════════════════════════════════════════════════════════════
+const _CRYPTO_OTC_MAP = {
+  BTCOTC: 'BTCUSDT',
+  ETHOTC: 'ETHUSDT',
+  BNBOTC: 'BNBUSDT',
+  SOLOTC: 'SOLUSDT',
+};
+
+/**
+ * [CRYPTO REFERENCE — STARTUP FETCH] Binance এর public ticker থেকে
+ * crypto OTC গুলোর real price এনে market_reference এ লেখে।
+ * _fetchAndStoreReferencePrices() এর crypto সংস্করণ — একই কাজ, ভিন্ন উৎস।
+ *
+ * ব্যর্থ হলে শুধু log করে থেমে যায়; server চালু হতে বা market শুরু হতে
+ * কখনো বাধা দেয় না (আগের মতোই আচরণ — anchor নিষ্ক্রিয় থাকবে, ক্ষতি নেই)।
+ */
+async function _fetchAndStoreCryptoReferencePrices() {
+  const symbols = Object.values(_CRYPTO_OTC_MAP);
+  if (!symbols.length) return;
+  try {
+    const query = encodeURIComponent(JSON.stringify(symbols));
+    const data = await _fetchJson(`https://api.binance.com/api/v3/ticker/price?symbols=${query}`);
+    if (!Array.isArray(data)) {
+      console.error('[crypto-reference] startup fetch ব্যর্থ: অপ্রত্যাশিত response');
+      return;
+    }
+    const bySymbol = {};
+    for (const row of data) {
+      const p = parseFloat(row && row.price);
+      if (row && row.symbol && isFinite(p) && p > 0) bySymbol[row.symbol] = p;
+    }
+
+    const batch = firestore.batch();
+    let count = 0;
+    for (const [otcId, binanceSymbol] of Object.entries(_CRYPTO_OTC_MAP)) {
+      const price = bySymbol[binanceSymbol];
+      if (!price) continue;
+      batch.set(firestore.collection('market_reference').doc(otcId), {
+        price, base: binanceSymbol, quote: 'USDT',
+        source: 'binance-startup',
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, { merge: true });
+      count++;
+    }
+    if (count > 0) await batch.commit();
+    console.log(`[crypto-reference] startup fetch — ${count}/${symbols.length} crypto OTC pair Firestore এ লেখা হলো`);
+  } catch (e) {
+    console.error('[crypto-reference] startup fetch ব্যর্থ:', e.message);
   }
 }
 
@@ -1559,6 +1622,9 @@ async function main() {
   // জন্য দরকারি ডেটা ইতিমধ্যে Firestore এ থাকে — deploy করার সাথে সাথেই
   // কাজ করে, দৈনিক schedule এর জন্য অপেক্ষা করতে হয় না।
   await _fetchAndStoreReferencePrices();
+  // [CRYPTO REFERENCE] crypto OTC এর উৎস আলাদা (Binance), তাই আলাদা
+  // fetch — কিন্তু একই সময়ে, market শুরু হওয়ার আগেই।
+  await _fetchAndStoreCryptoReferencePrices();
   watchFirestoreMarkets();
   await _recoverLiveTradesFromRTDB();
   // ══════════════════════════════════════════════════════════════════
