@@ -519,6 +519,31 @@ async function _settleDueTradesFromMemory() {
     closePrice = orderSettle.adjustClosePrice(liveSnapshot, closePrice, _states[symbol]?._eng?.decimals);   // [MTG PROTECTION]
       trades.forEach(t => { t.closePrice = closePrice; t.preAdjusted = true; });
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
+      // ══════════════════════════════════════════════════════════════
+      // [DUPLICATE SETTLE FIX] settle হয়ে যাওয়া trade গুলো RTDB
+      // settlement_queue থেকেও মুছে দিই।
+      //
+      // আগে এই path কেবল _activeTradesMemory থেকে সরাত, RTDB queue
+      // অক্ষত রেখে যেত। ফলে পরের tick এ _settleDueTradesFromRTDB()
+      // ঠিক একই trade আবার queue তে পেয়ে দ্বিতীয়বার settle চালাত —
+      // log এ [tick-settle] ও [rtdb-tick-settle] একই সেকেন্ডে একই
+      // closePrice নিয়ে জোড়ায় জোড়ায় আসত। টাকা দ্বিগুণ হতো না
+      // (downstream idempotent), কিন্তু প্রতিটা trade এর settlement
+      // কাজ দুইবার হতো — user বাড়লে এই অপচয় রৈখিকভাবে বাড়ত।
+      //
+      // এখন queue entry থাকা মানেই "এই trade এখনো নিষ্পত্তি হয়নি" —
+      // তাই RTDB path তার আসল ভূমিকাতেই থাকে: server restart বা
+      // crash এ হারিয়ে যাওয়া trade উদ্ধার করা। settle এর পরে কিন্তু
+      // remove এর আগে crash হলে entry থেকে যাবে এবং RTDB path আবার
+      // চালাবে — সেটাও নিরাপদ, কারণ downstream duplicate ধরে।
+      //
+      // allSettled ব্যবহার করা হয়েছে ইচ্ছাকৃতভাবে: RTDB remove ব্যর্থ
+      // হলেও settlement ভাঙবে না, শুধু entry পড়ে থাকবে — অর্থাৎ
+      // সবচেয়ে খারাপ ক্ষেত্রেও আচরণ আজকের মতোই থাকে, খারাপ হয় না।
+      // ══════════════════════════════════════════════════════════════
+      await Promise.allSettled(trades.map(t =>
+        db.ref(`settlement_queue/${t.expiryTimestamp}/${t.userId}/${t.tradeId}`).remove()
+      ));
   }));
 
   // Safety cleanup — 30s পরে Firestore confirm না এলেও pending guard clear করো
