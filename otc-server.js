@@ -258,7 +258,21 @@ async function _batchSettleAndBroadcast(symbol, trades, closePrice) {
       }));
       // LPUSH — settler blpop করে instantly process করবে
       await redisPub.lpush('gv:settle_queue', ...jobs);
-      console.log(`[redis-push] ${symbol} pushed=${trades.length} closePrice=${closePrice.toFixed(5)}`);
+      // [LATENCY MEASURE] expiry → queue push, প্রকৃত ms।
+      //
+      // settler এর log এ lagMs = expiry → broadcast (মাপা: ৯৮৯-১৭৮৭ms),
+      // আর settler এর নিজের debounce এখন সর্বোচ্চ ১৫০ms। অর্থাৎ বড়
+      // অংশটা queue তে পৌঁছানোর আগেই খরচ হচ্ছে — কিন্তু ঠিক কোথায়,
+      // সেটা অনুমান না করে এখানে মেপে নিই।
+      //
+      // pushLagMs ছোট (<২০০ms) হলে দেরিটা settler এর ভেতরে;
+      // বড় হলে দেরিটা otc-server এ — expiry শনাক্ত করা বা
+      // _applyExpiryPrices এর await গুলোতে।
+      const _pushLag = trades.reduce((mn, t) => {
+        const e = t.expiryTimestampMs > 0 ? t.expiryTimestampMs : (t.expiryTimestamp || 0) * 1000;
+        return (e > 0 && (mn === 0 || e < mn)) ? e : mn;
+      }, 0);
+      console.log(`[redis-push] ${symbol} pushed=${trades.length} closePrice=${closePrice.toFixed(5)} pushLagMs=${_pushLag > 0 ? Date.now() - _pushLag : -1}`);
       return;
     } catch (e) {
       console.error(`[redis-push] ${symbol} failed, falling back to HTTP:`, e.message);
