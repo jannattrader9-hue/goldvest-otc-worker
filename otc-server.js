@@ -746,7 +746,36 @@ async function loadLastCandle(id) {
   return null;
 }
 
+// ══════════════════════════════════════════════════════════════════
+// [CANDLE HISTORY IN REDIS] বন্ধ হওয়া প্রতিটা candle Redis এর একটা
+// list এ রাখি — client এখান থেকেই history নেবে, WebSocket দিয়ে।
+//
+// কেন দরকার: history এতদিন RTDB থেকে আসত। RTDB instance আমেরিকায়
+// (nam5), আর reconnect এর পর সেটা ১২ সেকেন্ড পর্যন্ত নিত, কখনো সাড়াই
+// দিত না (লাইভ log এ "500 candles loaded" একবারও আসেনি)। ওই দেরির
+// সময়টুকুতেই নতুন market এর tick পুরনো chart এ মিশে ভাঙা chart তৈরি
+// হতো — gap, ভুল দাম, "নাম বদলাল chart বদলাল না", open/close না মেলা
+// — সব একই কারণের লক্ষণ।
+//
+// Redis ও Railway দুটোই এখন সিঙ্গাপুরে, তাই এই পথ অনেক কাছের।
+// RTDB write অক্ষত রাখা হয়েছে — client এ WS ব্যর্থ হলে সেটাই fallback।
+//
+// LTRIM দিয়ে প্রতি symbol এ সর্বশেষ ৫০০ রাখা হয়; ২৯ market এ মোট
+// ~১৪,৫০০ entry, কয়েক MB — Redis এর জন্য নগণ্য।
+// ══════════════════════════════════════════════════════════════════
+const CANDLE_HISTORY_MAX = 500;
+function _pushCandleToRedis(id, candle) {
+  if (!redisReady) return;
+  const key = `gv:candles:${id}`;
+  redisPub.multi()
+    .rpush(key, JSON.stringify(candle))
+    .ltrim(key, -CANDLE_HISTORY_MAX, -1)
+    .exec()
+    .catch(e => console.error(`[${id}] redis candle push failed:`, e.message));
+}
+
 function saveCandle(id, candle) {
+  _pushCandleToRedis(id, candle);
   db.ref(`otc_candles/${id}/candles`).push(candle)
     .then(() => {
       console.log(`[${id}] candle close=${candle.close.toFixed(5)}`);
