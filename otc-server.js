@@ -127,6 +127,9 @@ const SETTLE_TOKEN        = process.env.SETTLE_TOKEN || 'gv_settle_secret_2024';
 // (Quotex-pattern: single event → instant bulk UI update)
 const _userSettleQueue = new Map(); // userId -> [{tradeId, status, closePrice, profit}, ...]
 const _userSettleTimers = new Map(); // userId -> timeout handle
+// [LATENCY] প্রথম item কখন এসেছিল — debounce যেন অনির্দিষ্টকাল
+// পিছিয়ে না যায়, তার কঠিন সীমার জন্য।
+const _userSettleFirstAt = new Map(); // userId -> ms
 
 function _queueSettlementBroadcast(userId, tradeId, settleResult) {
   if (!userId || !settleResult || settleResult.result !== 'ok') return;
@@ -138,18 +141,64 @@ function _queueSettlementBroadcast(userId, tradeId, settleResult) {
     profit:     settleResult.profit,
   });
 
+  // ══════════════════════════════════════════════════════════════
+  // [LATENCY] আগে এখানে ৮০০ms এর debounce ছিল, এবং সেটা প্রতিবার
+  // reset হতো — একই user এর আরেকটা trade এর মধ্যে settle হলে আবার
+  // ৮০০ms শুরু। ফলে ফল ঘোষণায় সবচেয়ে বড় দেরিটা এখানেই জমত।
+  //
+  // উদ্দেশ্যটা ঠিক ছিল: একাধিক trade একসাথে পাঠালে client একটাই
+  // event এ সব দেখাতে পারে (Quotex-pattern)। কিন্তু settle loop এর
+  // সব due trade *একই পাসে* queue তে যায় — অর্থাৎ সিঙ্ক্রোনাসভাবে।
+  // তাই পুরো ব্যাচ ধরতে ৬০ms ই যথেষ্ট, ৮০০ms এর দরকার নেই।
+  //
+  // সাথে একটা কঠিন সীমা: প্রথম item আসার ২০০ms এর মধ্যে flush হবেই,
+  // যত reset ই হোক। নইলে দ্রুত পরপর trade করলে ঘোষণা অনির্দিষ্টকাল
+  // পিছিয়ে যেতে পারত।
+  // ══════════════════════════════════════════════════════════════
+  const firstAt = _userSettleFirstAt.get(userId);
+  if (firstAt === undefined) _userSettleFirstAt.set(userId, Date.now());
+
+  if (firstAt !== undefined && (Date.now() - firstAt) >= 200) {
+    if (_userSettleTimers.has(userId)) clearTimeout(_userSettleTimers.get(userId));
+    _flushUserSettleBatch(userId);
+    return;
+  }
+
   if (_userSettleTimers.has(userId)) clearTimeout(_userSettleTimers.get(userId));
-  _userSettleTimers.set(userId, setTimeout(() => _flushUserSettleBatch(userId), 800));
+  _userSettleTimers.set(userId, setTimeout(() => _flushUserSettleBatch(userId), 60));
 }
 
 function _flushUserSettleBatch(userId) {
   _userSettleTimers.delete(userId);
+  _userSettleFirstAt.delete(userId);
   const items = _userSettleQueue.get(userId);
   _userSettleQueue.delete(userId);
   if (!items || items.length === 0) return;
 
   const batchId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   console.log(`[batch-broadcast] userId=${userId} batchId=${batchId} items=${items.length}`);
+
+  // ══════════════════════════════════════════════════════════════
+  // [FAST PATH] ফলাফল সরাসরি Redis → ws-server → ব্রাউজার।
+  //
+  // RTDB এর পথ (নিচে) অক্ষত রাখা হয়েছে — সেটাই fallback। কারণ
+  // RTDB instance আমেরিকায় (nam5), বাংলাদেশ থেকে round-trip
+  // ~২৫০-৪০০ms; আর Railway এখন সিঙ্গাপুরে, তাই WebSocket পথ
+  // অনেক কাছের। দুটোই পাঠানো হয় বলে কোনো একটা পথ ব্যর্থ হলেও
+  // user ফল পাবেই — শুধু দ্রুতটা আগে পৌঁছাবে।
+  //
+  // channel এ userId আছে বলে ws-server শুধু সেই user এর socket এই
+  // পাঠাবে — অন্য কেউ কখনো এই বার্তা পাবে না।
+  //
+  // px:* (দাম) channel সম্পূর্ণ আলাদা — candle/দামের পথে এটি
+  // কোনোভাবেই হাত দেয় না।
+  // ══════════════════════════════════════════════════════════════
+  if (redisReady) {
+    redisPub.publish(`settle:${userId}`, JSON.stringify({
+      type: 'settle', batchId, items, timestamp: Date.now(),
+    })).catch(e => console.error(`[settle-ws] ${userId} publish failed:`, e.message));
+  }
+
   db.ref(`user_settlement_batches/${userId}/${batchId}`).set({
     items,
     timestamp: Date.now(),
@@ -468,10 +517,22 @@ async function _applyExpiryPrices(symbol, trades) {
 }
 
 async function _settleDueTradesFromMemory() {
-  const nowSec = Math.floor(Date.now() / 1000);
+  // [LATENCY] আগে শর্ত ছিল `t.expiryTimestamp <= nowSec` — অর্থাৎ ceil
+  // করা সেকেন্ড-bucket। trade শেষ হতো ...992.948 এ, কিন্তু settle
+  // অপেক্ষা করত ...993 সেকেন্ড পর্যন্ত — ১০০০ms পর্যন্ত অপচয়, অথচ
+  // ms-নির্ভুল expiry পাশেই সংরক্ষিত ছিল, ব্যবহারই হতো না।
+  //
+  // এখন সরাসরি ms এ তুলনা। expiryTimestampMs না থাকলে (পুরনো trade)
+  // আগের সেকেন্ড-হিসাবেই fallback — তাই কিছু ভাঙে না।
+  //
+  // দাম কোন মুহূর্তের সেটা এতে বদলায় না — _applyExpiryPrices আগের
+  // মতোই expiryTimestampMs ধরে tickHistory থেকে দাম নেয়। শুধু
+  // *ঘোষণা* দ্রুত হয়, ফলাফল অপরিবর্তিত।
+  const nowMs = Date.now();
   const due = [];
   for (const [key, t] of _activeTradesMemory.entries()) {
-    if (t.expiryTimestamp <= nowSec && t.accountType === 'live') {
+    const expMs = t.expiryTimestampMs > 0 ? t.expiryTimestampMs : (t.expiryTimestamp * 1000);
+    if (expMs <= nowMs && t.accountType === 'live') {
       if (_pendingSettle.has(key)) continue; // Firestore confirm আসেনি — skip
       if (_candleSettlingSymbols.has(t.symbol)) continue; // candle path চলছে — skip
       due.push([key, t]);
@@ -1686,7 +1747,16 @@ async function main() {
     Object.keys(_tickTimers).forEach(id => {
       if (!_activeMarkets.has(id)) { clearTimeout(_tickTimers[id]); delete _tickTimers[id]; }
     });
+    // [LATENCY] memory path এখন ১০০ms এ — এটা RAM এর উপর লুপ, কোনো
+    // I/O নেই, তাই খরচ নগণ্য। আগে ৫০০ms ছিল, অর্থাৎ ট্রেড শেষ হওয়ার
+    // পর গড়ে ২৫০ms শুধু পরের চক্রের অপেক্ষায় যেত।
     _settleDueTradesFromMemory().catch(e => console.error('[tick-settle] error:', e.message));
+  }, 100);
+
+  // RTDB path আলাদা, ধীর ছন্দে — এটা প্রতিবার RTDB পড়ে, তাই ১০০ms এ
+  // চালালে Firebase read খরচ ৫ গুণ বাড়ত। এর কাজ শুধু restart/crash এ
+  // হারানো trade উদ্ধার, তাই ৫০০ms ই যথেষ্ট।
+  setInterval(() => {
     _settleDueTradesFromRTDB().catch(e => console.error('[rtdb-tick-settle] error:', e.message));
   }, TICK_MS);
   console.log('Server running ✅');
@@ -2025,6 +2095,45 @@ http.createServer(async (req, res) => {
   // endpoint কল হয় — reservation কে চূড়ান্ত করে, trade "live" করে দেয়।
   // Balance ইতিমধ্যেই reserve-time এ deduct হয়ে গেছে, এখানে শুধু trade
   // এর RTDB hash এ status/visibility আপডেট হয়।
+  // ══════════════════════════════════════════════════════════════════
+  // [WS AUTH] settlement ফল WebSocket এ পাঠাতে হলে ws-server কে জানতে
+  // হবে কোন socket কোন user এর — নইলে একজনের ফল আরেকজন দেখে ফেলবে।
+  //
+  // ws-server এ firebase-admin যোগ না করে সমাধান: এখানে (যেখানে
+  // idToken যাচাই করার সব ব্যবস্থা আছে) একটা এলোমেলো short-lived token
+  // বানিয়ে Redis এ uid এর সাথে বেঁধে রাখি। client সেটা socket এ পাঠায়,
+  // ws-server শুধু Redis এ দেখে নেয় — তার Redis সংযোগ আগে থেকেই আছে।
+  //
+  // token এলোমেলো ৩২ byte, TTL ১০ মিনিট, একবার ব্যবহারে মুছে যায় না
+  // (পুনঃসংযোগে দরকার হয়), কিন্তু মেয়াদ শেষে নিজেই উধাও।
+  // ══════════════════════════════════════════════════════════════════
+  if (req.method === 'POST' && req.url === '/ws-token') {
+    try {
+      let body;
+      try { body = await _readBody(req); }
+      catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid body' })); return; }
+
+      const { idToken } = body;
+      if (!idToken) { res.writeHead(400); res.end(JSON.stringify({ error: 'Missing idToken' })); return; }
+
+      let decoded;
+      try { decoded = await admin.auth().verifyIdToken(idToken); }
+      catch(e) { res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
+
+      if (!redisReady) { res.writeHead(503); res.end(JSON.stringify({ error: 'Not ready' })); return; }
+
+      const token = require('crypto').randomBytes(32).toString('hex');
+      await redisPub.set(`gv:wstoken:${token}`, decoded.uid, 'EX', 600);
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, token, expiresIn: 600 }));
+    } catch (e) {
+      console.error('[ws-token] error:', e.message);
+      res.writeHead(500); res.end(JSON.stringify({ error: 'Internal error' }));
+    }
+    return;
+  }
+
   if (req.method === 'POST' && req.url === '/execute-trade') {
     try {
       let body;
