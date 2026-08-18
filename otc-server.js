@@ -178,27 +178,14 @@ function _flushUserSettleBatch(userId) {
   const batchId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   console.log(`[batch-broadcast] userId=${userId} batchId=${batchId} items=${items.length}`);
 
-  // ══════════════════════════════════════════════════════════════
-  // [FAST PATH] ফলাফল সরাসরি Redis → ws-server → ব্রাউজার।
+  // NOTE: এই function টা কেবল HTTP-fallback পথে চলে (Redis বন্ধ থাকলে)।
+  // স্বাভাবিক অবস্থায় settlement broadcast করে redis-settler service —
+  // _batchSettleAndBroadcast() এ `lpush('gv:settle_queue')` করে return
+  // করে দেয়, তাই নিচের কোড পর্যন্ত পৌঁছায় না।
   //
-  // RTDB এর পথ (নিচে) অক্ষত রাখা হয়েছে — সেটাই fallback। কারণ
-  // RTDB instance আমেরিকায় (nam5), বাংলাদেশ থেকে round-trip
-  // ~২৫০-৪০০ms; আর Railway এখন সিঙ্গাপুরে, তাই WebSocket পথ
-  // অনেক কাছের। দুটোই পাঠানো হয় বলে কোনো একটা পথ ব্যর্থ হলেও
-  // user ফল পাবেই — শুধু দ্রুতটা আগে পৌঁছাবে।
-  //
-  // channel এ userId আছে বলে ws-server শুধু সেই user এর socket এই
-  // পাঠাবে — অন্য কেউ কখনো এই বার্তা পাবে না।
-  //
-  // px:* (দাম) channel সম্পূর্ণ আলাদা — candle/দামের পথে এটি
-  // কোনোভাবেই হাত দেয় না।
-  // ══════════════════════════════════════════════════════════════
-  if (redisReady) {
-    redisPub.publish(`settle:${userId}`, JSON.stringify({
-      type: 'settle', batchId, items, timestamp: Date.now(),
-    })).catch(e => console.error(`[settle-ws] ${userId} publish failed:`, e.message));
-  }
-
+  // WebSocket fast-path (Redis channel `settle:{userId}`) তাই এখানে নয়,
+  // redis-settler.js এর _flushBroadcast() এ বসানো হয়েছে — যেখানে আসল
+  // broadcast হয়। এখানে বসালে সেটা কখনো চলত না।
   db.ref(`user_settlement_batches/${userId}/${batchId}`).set({
     items,
     timestamp: Date.now(),
