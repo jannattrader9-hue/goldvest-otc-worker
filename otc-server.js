@@ -1999,6 +1999,11 @@ http.createServer(async (req, res) => {
         // [PRECISION FIX] settlement এর সময় ms-নির্ভুল দাম খুঁজতে —
         // না থাকলে (পুরনো client) 0, তখন fallback সেকেন্ড-ভিত্তিক path
         'expiryTimestampMs', String(_expiryMs || 0),   // [SECURITY] server-যাচাই করা
+        // [TIE PRECISION] settler কে জানাতে হবে এই market এ দাম কত ঘরে
+        // দেখানো হয়। কারণ user পর্দায় গোল-করা দাম দেখে (USD/COP ২ ঘর),
+        // অথচ settler হুবহু float তুলনা করত — তাই "Difference 0" দেখেও
+        // trade lost হত। এখন settler এই ঘর অনুযায়ী তুলনা করবে।
+        'decimals',        String(decimalsFor(trade.symbol, entryPrice)),
         'currency',        trade.currency || 'USD',
       );
       // [MAX DURATION] সর্বোচ্চ ৪ ঘণ্টার trade + ১ ঘণ্টা নিরাপত্তা মার্জিন।
