@@ -765,12 +765,26 @@ async function loadLastCandle(id) {
 // ══════════════════════════════════════════════════════════════════
 const CANDLE_HISTORY_MAX = 500;
 function _pushCandleToRedis(id, candle) {
-  if (!redisReady) return;
+  if (!redisReady) {
+    // [DIAG] Redis প্রস্তুত না থাকলে candle টা list এ যায় না — তখন
+    // client এর history এক candle পিছিয়ে থাকবে এবং প্রতিবার "gap"
+    // মনে হবে। এটা নীরবে ঘটলে ধরা কঠিন, তাই log করি।
+    console.warn(`[${id}] redis প্রস্তুত নয় — candle history তে যোগ হলো না (time=${candle.time})`);
+    return;
+  }
   const key = `gv:candles:${id}`;
   redisPub.multi()
     .rpush(key, JSON.stringify(candle))
     .ltrim(key, -CANDLE_HISTORY_MAX, -1)
     .exec()
+    // [DIAG] লাইভ log এ দেখা গেছে client এর history বারবার একই candle এ
+    // থেমে ছিল (close=0.87227), অথচ live দাম এগিয়ে গিয়েছিল — অর্থাৎ
+    // সর্বশেষ বন্ধ candle Redis list এ পৌঁছায়নি। সেটা সত্যিই ঘটছে
+    // কিনা এবং list কত লম্বা, তা এখানেই দেখা যাবে।
+    .then(res => {
+      const len = res && res[0] && res[0][1];
+      console.log(`[${id}] redis candle push ok time=${candle.time} listLen=${len}`);
+    })
     .catch(e => console.error(`[${id}] redis candle push failed:`, e.message));
 }
 
