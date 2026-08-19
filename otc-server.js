@@ -809,6 +809,18 @@ function saveLiveCandle(id, candle) {
   // কেউ subscribe না করলেও Redis publish প্রায় শূন্য খরচ, তাই নিরাপদ।
   // payload ছোট: শুধু দরকারি field, JSON string।
   if (redisReady && redisPub) {
+    // ══════════════════════════════════════════════════════════════
+    // [LIVE SNAPSHOT] চলমান candle টা Redis এ *সংরক্ষণ* ও করি (publish
+    // তো নিচে হচ্ছেই)। কারণ client history পাওয়ার পর চলমান candle টা
+    // RTDB এর `/live` থেকে পড়ত — সেই read লাইভ log এ প্রতিবার ঝুলে
+    // যাচ্ছিল ("live snapshot এলো না (1500ms)"), ফলে প্রতিটা market
+    // switch এ ১.৫ সেকেন্ড নষ্ট হতো আর চলমান candle প্রথমে দেখা যেত না।
+    //
+    // এখন ws-server history এর সাথেই এটা পাঠিয়ে দেবে — RTDB এর দরকার
+    // ফুরোবে। TTL ৩০০s: কোনো market বন্ধ হলে পুরনো মান পড়ে থাকবে না।
+    // ══════════════════════════════════════════════════════════════
+    redisPub.set(`gv:live:${id}`, JSON.stringify(candle), 'EX', 300).catch(() => {});
+
     const msg = JSON.stringify({
       s: id,                 // symbol
       t: candle.time,        // candle time
