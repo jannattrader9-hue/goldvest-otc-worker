@@ -1421,8 +1421,12 @@ function _tickTail(id, state) {
     // করা হচ্ছে — এর ঠিক পরেই (নিচে) candle N+1 broadcast হবে, order
     // preserved (একই Redis connection)।
     saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle, decimals:_dec, tickId: (state._eng ? state._eng.tickId : 0) });
-    // /live কে সাথে সাথে closed candle-এর final value দিয়ে আপডেট করো (null না) — client তাৎক্ষণিকভাবে সঠিক close পাবে
-    db.ref(`otc_candles/${id}/live`).set({ time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle, decimals:_dec, tickId: (state._eng ? state._eng.tickId : 0) }).catch(()=>{});
+    // [BILL] এখানে আগে `otc_candles/${id}/live` এ আরেকটা `.set()` ছিল —
+    // ঠিক উপরের saveLiveCandle() যে object টা একই path এ লিখেছে, হুবহু
+    // সেটাই দ্বিতীয়বার। মাঝে state এর কোনো মান বদলায় না, তাই লেখা দুটো
+    // অভিন্ন ছিল। Railway network বিল কমাতে পুনরাবৃত্তিটা সরানো হলো —
+    // /live এখনো প্রতি candle-close এ closed candle এর final value ই
+    // পায় (saveLiveCandle থেকে), আচরণ অপরিবর্তিত।
 
     // ── candle just closed — এই মুহূর্তের close price দিয়ে matching live trades settle করো ──
     // Synchronously mark — একই tick-এ _settleDueTradesFromMemory এই symbol skip করবে
@@ -1669,8 +1673,9 @@ function tickForex(id) {
     // publish করা হচ্ছে; ঠিক পরেই candle N+1 broadcast হবে, একই Redis
     // connection বলে ক্রম অক্ষুণ্ন থাকে।
     saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle, decimals:_rdec, tickId: (state._forexTickId || 0) });
-    // /live কে সাথে সাথে closed candle-এর final value দিয়ে আপডেট করো (null না) — client তাৎক্ষণিকভাবে সঠিক close পাবে
-    db.ref(`otc_candles/${id}/live`).set({ time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle, decimals:_rdec, tickId: (state._forexTickId || 0) }).catch(()=>{});
+    // [BILL] OTC path এর মতোই এখানেও `otc_candles/${id}/live` এ একটা
+    // অভিন্ন দ্বিতীয় `.set()` ছিল — ঠিক উপরের saveLiveCandle() যা
+    // লিখেছে তারই নকল। সরানো হলো, আচরণ অপরিবর্তিত।
 
     // ── candle just closed — এই মুহূর্তের close price দিয়ে matching live trades settle করো ──
     // Synchronously mark — একই tick-এ _settleDueTradesFromMemory এই symbol skip করবে
