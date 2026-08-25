@@ -799,9 +799,70 @@ function saveCandle(id, candle) {
     .catch(e => console.error(`[${id}] save failed:`, e.message));
 }
 
-function saveLiveCandle(id, candle) {
-  // RTDB — client এখনো এখান থেকেই দাম পড়ে (অক্ষত, fallback হিসেবে থাকবে)
-  db.ref(`otc_candles/${id}/live`).set(candle).catch(() => {});
+// ══════════════════════════════════════════════════════════════════════
+// [BILL — VIEWER GATING] যে market কেউ দেখছে না, তার tick-by-tick RTDB
+// লেখা বাদ দেওয়া।
+// ----------------------------------------------------------------------
+// কেন: ২৯টা market ২৪/৭ চলে, প্রতি tick এ ৩টা করে RTDB লেখা — অথচ
+// সাধারণত ১-২টার বেশি market কেউ দেখে না। বাকি লেখাগুলো কেউ পড়েই না,
+// শুধু Railway network বিল বাড়ায় (মাপা ~২৬৭ GB/মাস)।
+//
+// কে জানায়: ws-server.js প্রতি ৫s এ `gv:active:symbols` এ লিখে রাখে কোন
+// symbol গুলোতে এখন client subscribe করে আছে (TTL ১৫s)।
+//
+// নিরাপত্তা — তিন স্তর, সব ক্ষেত্রেই ব্যর্থতা "লেখা চালু" দিকে যায়:
+//   ১. ENABLE_VIEWER_GATING != 'on'  → gating সম্পূর্ণ নিষ্ক্রিয়।
+//      Railway variable বদলেই তাৎক্ষণিক বন্ধ করা যায়, redeploy লাগে না।
+//   ২. key না পাওয়া / Redis ব্যর্থ / ws-server মৃত (TTL শেষ) / JSON ভাঙা
+//      → _activeSymbols থাকে null, অর্থাৎ "অজানা" — তখন সব market এর
+//      লেখা আগের মতোই চলে।
+//   ৩. তালিকায় "*" থাকলে (কোনো client সব symbol এ subscribe করেছে)
+//      → gating নিষ্ক্রিয়।
+//
+// আর candle-boundary এর লেখা (force=true) কখনোই বাদ যায় না — তাই বন্ধ
+// থাকা market এও `/live` সর্বোচ্চ ১ মিনিটের পুরনো হয়, আর `candles`
+// ইতিহাস সম্পূর্ণ অক্ষত থাকে।
+// ══════════════════════════════════════════════════════════════════════
+const VIEWER_GATING     = (process.env.ENABLE_VIEWER_GATING || 'off').toLowerCase() === 'on';
+const ACTIVE_SYMBOLS_KEY = 'gv:active:symbols';
+const ACTIVE_POLL_MS     = 2000;
+let   _activeSymbols     = null;   // null = অজানা → সব লেখা চালু (নিরাপদ ডিফল্ট)
+
+async function _refreshActiveSymbols() {
+  if (!VIEWER_GATING || !redisReady || !redisPub) { _activeSymbols = null; return; }
+  try {
+    const raw = await redisPub.get(ACTIVE_SYMBOLS_KEY);
+    if (!raw) { _activeSymbols = null; return; }   // key নেই/মেয়াদ শেষ → অজানা
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr)) { _activeSymbols = null; return; }
+    if (arr.includes('*')) { _activeSymbols = null; return; }   // wildcard → নিষ্ক্রিয়
+    _activeSymbols = new Set(arr);
+  } catch (e) {
+    // যেকোনো ত্রুটিতে "অজানা" — অর্থাৎ কিছুই বন্ধ হয় না
+    _activeSymbols = null;
+  }
+}
+
+if (VIEWER_GATING) {
+  console.log('[gating] দর্শক-ভিত্তিক RTDB gating চালু (ENABLE_VIEWER_GATING=on)');
+  setInterval(() => { _refreshActiveSymbols().catch(() => {}); }, ACTIVE_POLL_MS);
+} else {
+  console.log('[gating] নিষ্ক্রিয় — সব market এর RTDB live লেখা আগের মতোই চলবে');
+}
+
+/** এই symbol এ এখন কেউ তাকিয়ে আছে? অনিশ্চিত হলে সবসময় true। */
+function _isWatched(id) {
+  if (!VIEWER_GATING)   return true;
+  if (_activeSymbols === null) return true;   // অজানা → নিরাপদ দিকে
+  return _activeSymbols.has(id);
+}
+
+function saveLiveCandle(id, candle, force = false) {
+  // RTDB — client এখনো এখান থেকেই দাম পড়ে (অক্ষত, fallback হিসেবে থাকবে)।
+  // [BILL] কেউ না দেখলে এই লেখাটা বাদ; candle-boundary এ (force) কখনো নয়।
+  if (force || _isWatched(id)) {
+    db.ref(`otc_candles/${id}/live`).set(candle).catch(() => {});
+  }
 
   // [SCALE ২.৪ — ধাপ ১] Redis Pub/Sub এ একই দাম publish।
   // ভবিষ্যতের ws-service এটা subscribe করে লক্ষ client কে WebSocket এ পাঠাবে
@@ -904,6 +965,10 @@ function saveSubCandle(id, label, candle) {
 }
 
 function saveLiveSubCandle(id, label, candle) {
+  // [BILL] কেউ এই market না দেখলে লেখা বাদ — ১৫s/৩০s এর চলমান candle
+  // শুধু তখনই দরকার যখন কেউ সত্যিই ওই চার্ট খুলে আছে। বন্ধ candle
+  // (`subcandles_*/candles`) সবসময় লেখা হয়, তাই ইতিহাস অক্ষত।
+  if (!_isWatched(id)) return;
   db.ref(`subcandles_${label}/${id}/live`).set(candle).catch(() => {});
 }
 
@@ -1420,7 +1485,7 @@ function _tickTail(id, state) {
     // এখানে state mutate হওয়ার আগেই closed candle-এর final state publish
     // করা হচ্ছে — এর ঠিক পরেই (নিচে) candle N+1 broadcast হবে, order
     // preserved (একই Redis connection)।
-    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle, decimals:_dec, tickId: (state._eng ? state._eng.tickId : 0) });
+    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle, decimals:_dec, tickId: (state._eng ? state._eng.tickId : 0) }, true);
     // [BILL] এখানে আগে `otc_candles/${id}/live` এ আরেকটা `.set()` ছিল —
     // ঠিক উপরের saveLiveCandle() যে object টা একই path এ লিখেছে, হুবহু
     // সেটাই দ্বিতীয়বার। মাঝে state এর কোনো মান বদলায় না, তাই লেখা দুটো
@@ -1462,7 +1527,7 @@ function _tickTail(id, state) {
     // সঠিক gap-open কখনো broadcast-ই হতো না। এখন candle-boundary পার
     // হওয়ার সাথে সাথেই (এই একই cycle এ) নতুন candleOpen দিয়ে broadcast
     // করা হচ্ছে — কোনো tick miss নেই।
-    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.candleOpen, nextCandle:state.nextCandle, decimals: (state._eng ? state._eng.decimals : 5), tickId: (state._eng ? state._eng.tickId : 0) });
+    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.candleOpen, nextCandle:state.nextCandle, decimals: (state._eng ? state._eng.decimals : 5), tickId: (state._eng ? state._eng.tickId : 0) }, true);
   } else {
     saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:state.price, nextCandle:state.nextCandle, decimals: (state._eng ? state._eng.decimals : 5), tickId: (state._eng ? state._eng.tickId : 0) });
   }
@@ -1672,7 +1737,7 @@ function tickForex(id) {
     // এখানে state mutate হওয়ার আগেই closed candle এর final state
     // publish করা হচ্ছে; ঠিক পরেই candle N+1 broadcast হবে, একই Redis
     // connection বলে ক্রম অক্ষুণ্ন থাকে।
-    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle, decimals:_rdec, tickId: (state._forexTickId || 0) });
+    saveLiveCandle(id, { time:state.candleTime, open:state.candleOpen, high:state.candleHigh, low:state.candleLow, close:price, nextCandle:state.nextCandle, decimals:_rdec, tickId: (state._forexTickId || 0) }, true);
     // [BILL] OTC path এর মতোই এখানেও `otc_candles/${id}/live` এ একটা
     // অভিন্ন দ্বিতীয় `.set()` ছিল — ঠিক উপরের saveLiveCandle() যা
     // লিখেছে তারই নকল। সরানো হলো, আচরণ অপরিবর্তিত।
