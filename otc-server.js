@@ -491,7 +491,37 @@ async function _applyExpiryPrices(symbol, trades) {
     // client (যাদের এই field নেই) এর জন্য সেকেন্ড-fallback অক্ষত রইল।
     const expMs = t.expiryTimestampMs > 0 ? t.expiryTimestampMs : (t.expiryTimestamp ? t.expiryTimestamp * 1000 : 0);
     if (!expMs) continue;
-    const tick = tickHistory.findLatestTickAtOrBefore(symbol, expMs);
+    // ══════════════════════════════════════════════════════════════
+    // [CANDLE-BOUNDARY SETTLEMENT] time-mode trade candle boundary তেই
+    // শেষ হয় (১২:২০:০০.০০০)। server এ candle বন্ধ হয় boundary পার
+    // হওয়ার পর আসা *প্রথম* tick দিয়ে — সেই একই tick একসাথে আগের
+    // candle এর close ও নতুন candle এর open (এজন্যই চার্টে ফাঁক নেই)।
+    //
+    // কিন্তু settlement নিত expiry এর *আগের* শেষ tick। লাইভ প্রমাণ:
+    //   trade close 12:20:00 → settle 3161.99
+    //   চার্টে 12:19 candle close = 12:20 candle open = 3162.05
+    // অর্থাৎ user এমন এক দামে হারত/জিতত যা চার্টে কোথাও নেই।
+    //
+    // তাই expiry ঠিক candle boundary তে পড়লে boundary এর tick ব্যবহার
+    // করি। না পেলে (এখনো আসেনি, বা ৩ সেকেন্ডের বেশি দূরে) নিচের পুরনো
+    // নিয়মেই যায় — কিছু ঝুলে থাকে না।
+    //
+    // timer-mode (৫s, ১০s, ৩০s) এ expiry boundary তে পড়ে না, তাই
+    // শর্তই মেলে না — সেগুলো সম্পূর্ণ অপরিবর্তিত।
+    // ══════════════════════════════════════════════════════════════
+    let tick = null;
+    if (expMs % CANDLE_MS === 0) {
+      tick = tickHistory.findFirstTickAtOrAfter(symbol, expMs, 3000);
+      if (tick) {
+        t.closePrice = tick.price;
+        t.settlementTickId = tick.tickId;
+        t.settlementTimestamp = tick.timestamp;
+        t.settlementSource = 'candle-boundary';
+        continue;
+      }
+    }
+
+    tick = tickHistory.findLatestTickAtOrBefore(symbol, expMs);
     if (tick) {
       t.closePrice = tick.price;
       // [AUDIT TRAIL] পরে dispute/debugging এ কোন tick, কখন, কোন
@@ -536,6 +566,30 @@ async function _settleDueTradesFromMemory() {
     if (expMs <= nowMs && t.accountType === 'live') {
       if (_pendingSettle.has(key)) continue; // Firestore confirm আসেনি — skip
       if (_candleSettlingSymbols.has(t.symbol)) continue; // candle path চলছে — skip
+
+      // ══════════════════════════════════════════════════════════
+      // [CANDLE-BOUNDARY WAIT] time-mode trade candle boundary তে শেষ
+      // হয়, আর সঠিক দাম হলো boundary এর tick (= candle এর close =
+      // পরের candle এর open)।
+      //
+      // এই লুপ চলে প্রতি ১০০ms এ, তাই expiry এর ~৫০ms পরেই trade কে
+      // "due" পায় — কিন্তু boundary এর tick তখনো আসেনি (tick আসে
+      // ৫৫০-১৩৫০ms পর পর, তাই boundary এর পর গড়ে ~৪৫০ms লাগে)।
+      // তখন settle করলে আবার আগের tick ধরা পড়ত — অর্থাৎ পুরনো ভুল।
+      //
+      // তাই ওই tick না আসা পর্যন্ত এই চক্রে ছেড়ে দিই। tick এসে গেলেই
+      // পরের ১০০ms চক্রে ধরা পড়বে — অর্থাৎ candle বন্ধ হওয়ার ~৫০ms
+      // পরে। অপেক্ষা tick এর জন্য, ঘড়ির জন্য নয়।
+      //
+      // ৩ সেকেন্ডেও tick না এলে (market থেমে আছে/সংযোগ নেই) আর
+      // অপেক্ষা করি না — পুরনো নিয়মেই settle হয়, কিছু ঝুলে থাকে না।
+      //
+      // timer-mode এ expMs boundary তে পড়ে না, তাই এই শর্ত মেলেই না।
+      // ══════════════════════════════════════════════════════════
+      if (expMs % CANDLE_MS === 0 && (nowMs - expMs) < 3000) {
+        if (!tickHistory.findFirstTickAtOrAfter(t.symbol, expMs, 3000)) continue;
+      }
+
       due.push([key, t]);
     }
   }
