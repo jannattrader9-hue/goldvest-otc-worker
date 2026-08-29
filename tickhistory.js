@@ -85,6 +85,47 @@ function findLatestTickAtOrBefore(symbol, timestamp) {
 }
 
 /**
+ * নির্দিষ্ট সময়ে বা তার ঠিক *পরের* প্রথম tick।
+ *
+ * findLatestTickAtOrBefore() এর উল্টো। কেন দরকার:
+ *
+ * Time-mode trade candle boundary তে শেষ হয় (যেমন ১২:২০:০০.০০০)।
+ * server এ candle বন্ধ হয় boundary পার হওয়ার পর যে প্রথম tick আসে
+ * সেটা দিয়ে — ওই একই tick একসাথে আগের candle এর close আর নতুন
+ * candle এর open হয় (এজন্যই চার্টে ফাঁক থাকে না)।
+ *
+ * কিন্তু settlement এতদিন expiry এর *আগের* শেষ tick নিত। ফলে user
+ * চার্টে candle বন্ধ দেখত ৩১৬২.০৫ এ, অথচ trade settle হতো ৩১৬১.৯৯ এ
+ * — এমন এক দামে যা চার্টে কোথাও লেখা নেই।
+ *
+ * timer-mode trade (৫s, ১০s) এ আগের নিয়মই সঠিক, তাই সেটা অপরিবর্তিত —
+ * এই function শুধু boundary তে শেষ হওয়া trade এর জন্য।
+ *
+ * @param {number} maxAheadMs — কতদূর পরের tick পর্যন্ত মানব (না দিলে
+ *        ৩ সেকেন্ড)। এর বাইরে হলে null, তখন caller পুরনো নিয়মে যাবে।
+ */
+function findFirstTickAtOrAfter(symbol, timestamp, maxAheadMs = 3000) {
+  const arr = _history.get(symbol);
+  if (!arr || arr.length === 0) return null;
+
+  // Binary search — প্রথম index যেখানে arr[i].timestamp >= timestamp
+  let lo = 0, hi = arr.length - 1, result = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (arr[mid].timestamp >= timestamp) {
+      result = mid;
+      hi = mid - 1;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  if (result < 0) return null;                       // এত পরের tick এখনো আসেনি
+  const tick = arr[result];
+  if (tick.timestamp - timestamp > maxAheadMs) return null;   // অনেক দূরের, বিশ্বাসযোগ্য নয়
+  return tick;
+}
+
+/**
  * Diagnostic/monitoring — কোনো symbol এর history-buffer এর বর্তমান size।
  */
 function getHistorySize(symbol) {
@@ -104,6 +145,7 @@ module.exports = {
   recordTick,
   findTickById,
   findLatestTickAtOrBefore,
+  findFirstTickAtOrAfter,
   getHistorySize,
   clearHistory,
 };
