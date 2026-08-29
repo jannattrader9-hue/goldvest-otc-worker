@@ -1068,6 +1068,10 @@ function publishSubTick(id, label, candle) {
   if (!_isWatched(id)) return;
   const msg = JSON.stringify({
     s: id,
+    // [INTERVAL TAG] কোন ঘরের tick — client এটা দেখেই ঠিক করে কোনটা
+    // নেবে। ১m এর `px:${id}` চ্যানেলের payload এ `i` থাকে না, তাই
+    // পুরনো client গুলোর কিছুই বদলায় না।
+    i: label,
     t: candle.time,
     o: candle.open,
     h: candle.high,
