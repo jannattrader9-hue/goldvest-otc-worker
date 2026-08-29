@@ -1047,6 +1047,38 @@ function saveSubCandle(id, label, candle) {
     .catch(e => console.error(`[${id}][${label}] sub save failed:`, e.message));
 }
 
+// ══════════════════════════════════════════════════════════════
+// [SUB TICK PUBLISH] sub-minute candle এর tick WebSocket এ পাঠাই।
+//
+// কেন দরকার: `px:${id}` চ্যানেলে যা যায় তা সবসময় ১ মিনিটের candle
+// (মূল state)। frontend timeframe ১৫s করলেও live tick ওই ৬০ সেকেন্ডের
+// ঘরেই আসত, অথচ history আসত subcandles_15s থেকে — দুটো মেলে না।
+// ফলে প্রতি মিনিটে চার্টের ঘর লাফাত, chartengine "3 candle gap" ধরে
+// ২০০ candle reload করাত, আর candle এলোমেলো হয়ে যেত।
+//
+// এখন প্রতিটা sub-interval এর নিজের চ্যানেল: `px:${id}:15s` ইত্যাদি।
+// payload হুবহু ১m এর মতো, তাই ws-server ও client এ আলাদা রূপ লাগে না।
+// `px:${id}` অপরিবর্তিত — ১m+ এর পথে কিছুই বদলায়নি।
+//
+// _isWatched: saveLiveSubCandle এর মতোই — কেউ ওই market না দেখলে
+// পাঠানোর দরকার নেই, তাই publish এর পরিমাণ প্রায় শূন্যই থাকে।
+// ══════════════════════════════════════════════════════════════
+function publishSubTick(id, label, candle) {
+  if (!redisReady || !redisPub) return;
+  if (!_isWatched(id)) return;
+  const msg = JSON.stringify({
+    s: id,
+    t: candle.time,
+    o: candle.open,
+    h: candle.high,
+    l: candle.low,
+    c: candle.close,
+    n: candle.nextCandle,
+    k: candle.tickId,
+  });
+  redisPub.publish(`px:${id}:${label}`, msg).catch(() => {});
+}
+
 function saveLiveSubCandle(id, label, candle) {
   // [BILL] কেউ এই market না দেখলে লেখা বাদ — ১৫s/৩০s এর চলমান candle
   // শুধু তখনই দরকার যখন কেউ সত্যিই ওই চার্ট খুলে আছে। বন্ধ candle
@@ -1640,6 +1672,12 @@ function _tickTail(id, state) {
     } else {
       saveLiveSubCandle(id, label, { time:ss.candleTime, open:ss.candleOpen, high:ss.candleHigh, low:ss.candleLow, close:state.price, nextCandle:ss.nextCandle });
     }
+    // rollover হোক বা না হোক, ss এখন চলতি candle — সেটাই পাঠাই
+    publishSubTick(id, label, {
+      time: ss.candleTime, open: ss.candleOpen, high: ss.candleHigh,
+      low: ss.candleLow, close: state.price, nextCandle: ss.nextCandle,
+      tickId: (state._eng ? state._eng.tickId : 0),
+    });
   }
 }
 
@@ -1864,6 +1902,12 @@ function tickForex(id) {
     } else {
       saveLiveSubCandle(id, label, { time:ss.candleTime, open:ss.candleOpen, high:ss.candleHigh, low:ss.candleLow, close:price, nextCandle:ss.nextCandle });
     }
+    // Forex engine — OTC এর মতোই sub-interval tick পাঠাই
+    publishSubTick(id, label, {
+      time: ss.candleTime, open: ss.candleOpen, high: ss.candleHigh,
+      low: ss.candleLow, close: price, nextCandle: ss.nextCandle,
+      tickId: (state._eng ? state._eng.tickId : 0),
+    });
   }
 }
 
