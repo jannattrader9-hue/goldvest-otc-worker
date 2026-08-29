@@ -702,6 +702,35 @@ async function _settleDueTradesFromRTDB() {
           if (_candleSettlingSymbols.has(t.symbol)) return;
           const state = _states[t.symbol];
           if (!state || typeof state.price !== 'number') return;
+
+          // ══════════════════════════════════════════════════════
+          // [CANDLE-BOUNDARY WAIT] memory path এ যে শর্ত আছে, হুবহু
+          // সেটাই এখানেও দরকার — নইলে ফল এলোমেলো হয়।
+          //
+          // লাইভ প্রমাণ: একই ধরনের দুটো time-mode trade, একটা সঠিক
+          // দামে (candle close) settle হলো, আরেকটা ভুল দামে —
+          // পার্থক্য শুধু কোন path আগে ধরেছে।
+          //
+          // এই লুপ চলে প্রতি ৫০০ms এ আর সেকেন্ড-হিসাবে due দেখে, তাই
+          // boundary এর সেকেন্ড শুরু হওয়ার সাথে সাথেই trade কে due
+          // পায় — কিন্তু boundary এর tick তখনো আসেনি (গড়ে ~৪৫০ms
+          // পরে আসে)। তখন settle করলে _applyExpiryPrices এর
+          // candle-boundary শাখা খালি ফিরে আসে আর পুরনো নিয়মে
+          // expiry-র আগের tick বসে যায় — সেটাই ভুল দাম।
+          //
+          // তাই ওই tick না আসা পর্যন্ত ছেড়ে দিই। ৩ সেকেন্ডের বেশি
+          // হলে আর অপেক্ষা নয় — পুরনো নিয়মে settle, কিছু ঝুলবে না।
+          //
+          // timer-mode এ expiry boundary তে পড়ে না, তাই শর্তই মেলে না।
+          // ══════════════════════════════════════════════════════
+          {
+            const _expMs = t.expiryTimestampMs > 0
+              ? t.expiryTimestampMs
+              : expiryTimestamp * 1000;
+            if (_expMs % CANDLE_MS === 0 && (Date.now() - _expMs) < 3000) {
+              if (!tickHistory.findFirstTickAtOrAfter(t.symbol, _expMs, 3000)) return;
+            }
+          }
           if (!bySymbol.has(t.symbol)) bySymbol.set(t.symbol, { closePrice: state.price, trades: [] });
           bySymbol.get(t.symbol).trades.push({ userId, tradeId: tradeNode.key, closePrice: state.price, expiryTimestamp, expiryTimestampMs: t.expiryTimestampMs || 0, type: t.type || '', amount: t.amount || 0 });
           _rtdbSettledKeys.add(key);
