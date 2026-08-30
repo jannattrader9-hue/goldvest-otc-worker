@@ -907,6 +907,11 @@ function saveCandle(id, candle) {
 // ইতিহাস সম্পূর্ণ অক্ষত থাকে।
 // ══════════════════════════════════════════════════════════════════════
 const VIEWER_GATING     = (process.env.ENABLE_VIEWER_GATING || 'off').toLowerCase() === 'on';
+
+// [BILL — SETTLE POLL GATING] নিচে main() এ ব্যবহৃত। pending trade না
+// থাকলে RTDB settlement poll ধীর করে দেয়। বিস্তারিত ব্যাখ্যা main() এ।
+const SETTLE_POLL_GATING = (process.env.ENABLE_SETTLE_POLL_GATING || 'off').toLowerCase() === 'on';
+
 const ACTIVE_SYMBOLS_KEY = 'gv:active:symbols';
 const ACTIVE_POLL_MS     = 2000;
 let   _activeSymbols     = null;   // null = অজানা → সব লেখা চালু (নিরাপদ ডিফল্ট)
@@ -932,6 +937,65 @@ if (VIEWER_GATING) {
 } else {
   console.log('[gating] নিষ্ক্রিয় — সব market এর RTDB live লেখা আগের মতোই চলবে');
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// [STALE COUNTER SWEEP] `live_market_stats` এর ভূত পরিষ্কার।
+// ----------------------------------------------------------------------
+// সমস্যা: এই node টা trade খুললে +1, settle হলে −1 — দুটো আলাদা জায়গার
+// উপর নির্ভরশীল। একটাও decrement ফসকে গেলে (transaction ব্যর্থ, দুবার
+// settle, বা `.catch(()=>{})` এ চাপা পড়া ত্রুটি) কাউন্টার চিরকাল আটকে
+// থাকে — admin Live Monitor এ settle হয়ে যাওয়া trade "live" দেখায়।
+// বাস্তবে দেখা গেছে: USDCOPOTC/USDPHPOTC এ down=1 আটকে ছিল, অথচ
+// settlement_queue খালি, trade গুলো settle হয়ে গেছে।
+//
+// সমাধানের ধরন: জোড়া মেলানোর চেষ্টা না করে **সত্য থেকে যাচাই করা**।
+// `_activeTradesMemory` ই হলো এই server এ pending trade এর সত্য উৎস
+// (startup এ settlement_queue থেকে recovery হয়)। কোনো symbol যদি
+// সেখানে না থাকে, তার কাউন্টারও থাকা উচিত নয়।
+//
+// নিরাপত্তা:
+//   • পরপর ২ বার অনুপস্থিত থাকলে তবেই মোছে — race এড়াতে।
+//   • প্রথম sweep ১২০s পরে — startup recovery শেষ হওয়ার সময় দিয়ে।
+//   • এটা নিছক প্রদর্শনের কাউন্টার — কোনো trade, টাকা বা settlement
+//     রেকর্ড নয়। ভুল করে মুছলেও আর্থিক ক্ষতি নেই, পরের trade এ আবার
+//     তৈরি হয়।
+//
+// খরচ: মিনিটে একবার একটা ছোট node পড়া — নগণ্য।
+// ══════════════════════════════════════════════════════════════════════
+const _staleStatsStrikes = new Map();   // symbol → পরপর কতবার অনুপস্থিত
+
+async function _sweepStaleMarketStats() {
+  try {
+    const snap = await db.ref('live_market_stats').once('value');
+    if (!snap.exists()) { _staleStatsStrikes.clear(); return; }
+
+    // এখন কোন কোন symbol এ সত্যিই pending trade আছে
+    const liveSymbols = new Set();
+    for (const t of _activeTradesMemory.values()) {
+      if (t.symbol) liveSymbols.add(t.symbol);
+    }
+
+    snap.forEach(child => {
+      const symbol = child.key;
+      if (liveSymbols.has(symbol)) { _staleStatsStrikes.delete(symbol); return; }
+      const strikes = (_staleStatsStrikes.get(symbol) || 0) + 1;
+      if (strikes >= 2) {
+        _staleStatsStrikes.delete(symbol);
+        db.ref('live_market_stats/' + symbol).remove()
+          .then(() => console.log(`[stale-stats] ${symbol} — pending trade নেই, বাসি কাউন্টার মুছে দেওয়া হলো`))
+          .catch(() => {});
+      } else {
+        _staleStatsStrikes.set(symbol, strikes);
+      }
+    });
+  } catch (e) {
+    console.error('[stale-stats] sweep ব্যর্থ:', e.message);
+  }
+}
+
+setTimeout(() => {
+  setInterval(() => { _sweepStaleMarketStats().catch(() => {}); }, 60000);
+}, 120000);
 
 /** এই symbol এ এখন কেউ তাকিয়ে আছে? অনিশ্চিত হলে সবসময় true। */
 function _isWatched(id) {
@@ -2013,9 +2077,48 @@ async function main() {
   // RTDB path আলাদা, ধীর ছন্দে — এটা প্রতিবার RTDB পড়ে, তাই ১০০ms এ
   // চালালে Firebase read খরচ ৫ গুণ বাড়ত। এর কাজ শুধু restart/crash এ
   // হারানো trade উদ্ধার, তাই ৫০০ms ই যথেষ্ট।
-  setInterval(() => {
-    _settleDueTradesFromRTDB().catch(e => console.error('[rtdb-tick-settle] error:', e.message));
-  }, TICK_MS);
+  // ══════════════════════════════════════════════════════════════════
+  // [BILL — SETTLE POLL GATING] RTDB path এর ছন্দ পরিস্থিতি অনুযায়ী।
+  // ------------------------------------------------------------------
+  // কেন: মাপা গেছে RTDB Downloads ~৩৭ MB/ঘণ্টা, আর সেটা **user-নিরপেক্ষ** —
+  // রাত ৩টায় (৩-৪ connection) আর দুপুর ২টায় (৭-১০ connection) হার একই।
+  // অর্থাৎ খরচটা দর্শক নয়, ঘড়ি চালাচ্ছে। এই poll দিনে ১.৭ লাখ বার চলে,
+  // আর বেশির ভাগ সময় উত্তর "কিছু নেই"।
+  //
+  // কী বদলাল: `_activeTradesMemory` খালি থাকলে (কোনো pending trade-ই
+  // নেই) poll ৩০ সেকেন্ডে একবার। একটাও trade থাকলেই সাথে সাথে ৫০০ms
+  // এ ফিরে আসে।
+  //
+  // কেন সম্পূর্ণ বন্ধ নয়: memory খালি মানে সবসময় "queue খালি" নয় —
+  // restart এর ঠিক পরে, বা অন্য কোনো পথে queue তে entry এলে memory
+  // জানবে না। ৩০s এর safety net ওই ক্ষেত্রগুলো ধরবে।
+  //
+  // settle এর গতিতে প্রভাব নেই: আসল settle করে ১০০ms এর memory path
+  // (উপরে) আর candle-close path। এই RTDB path শুধু restart/crash এ
+  // হারানো trade উদ্ধারের জাল — trade থাকলে তো এমনিতেই fast মোডে।
+  //
+  // সুইচ: ENABLE_SETTLE_POLL_GATING=on। বন্ধ থাকলে আগের মতোই ধ্রুব ৫০০ms।
+  // ══════════════════════════════════════════════════════════════════
+  const RTDB_POLL_FAST_MS = TICK_MS;    // ৫০০ms — আগের আচরণ
+  const RTDB_POLL_IDLE_MS = 30000;      // কোনো pending trade না থাকলে
+
+  if (SETTLE_POLL_GATING) {
+    console.log('[settle-poll] gating চালু — pending trade না থাকলে RTDB poll ৩০s এ একবার');
+  } else {
+    console.log('[settle-poll] gating নিষ্ক্রিয় — RTDB poll আগের মতোই প্রতি ৫০০ms');
+  }
+
+  // setInterval এর বদলে self-scheduling — ছন্দ প্রতিবার নতুন করে ঠিক হয়,
+  // আর আগের চক্র শেষ না হওয়া পর্যন্ত পরেরটা শুরু হয় না (overlap নেই)।
+  function _rtdbPollTick() {
+    _settleDueTradesFromRTDB()
+      .catch(e => console.error('[rtdb-tick-settle] error:', e.message))
+      .finally(() => {
+        const idle  = SETTLE_POLL_GATING && _activeTradesMemory.size === 0;
+        setTimeout(_rtdbPollTick, idle ? RTDB_POLL_IDLE_MS : RTDB_POLL_FAST_MS);
+      });
+  }
+  _rtdbPollTick();
   console.log('Server running ✅');
 }
 main().catch(console.error);
