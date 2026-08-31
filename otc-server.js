@@ -93,6 +93,13 @@ if (REDIS_URL) {
 }
 
 const TICK_MS   = 500;
+
+// [BILL — CG FALLBACK GATING] `_settleCandleClose()` এ ব্যবহৃত (উপরের দিকে),
+// তাই এখানেই ঘোষণা — নিচের gating ব্লকে রাখলে TDZ ঝুঁকি থাকত।
+// বিস্তারিত ব্যাখ্যা `_settleCandleClose()` এর ভেতরে।
+const CG_FALLBACK_GATING = (process.env.ENABLE_CG_FALLBACK_GATING || 'off').toLowerCase() === 'on';
+let   _cgSweepHour = -1;   // শেষ কোন ঘণ্টায় নিরাপত্তা-sweep চলেছে
+
 // [ENGINE] দামের physics আলাদা ফাইলে (engine.js) — otc-server ছোট রাখতে।
 // ENGINE_MODE=off দিলে পুরনো inline physics চলবে (তাৎক্ষণিক rollback)।
 const engine      = require('./engine.js');
@@ -307,6 +314,43 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
     const queueSnap = await db.ref(`settlement_queue/${candleTime}`).once('value');
 
     if (!queueSnap.exists()) {
+      // ══════════════════════════════════════════════════════════════
+      // [BILL — CG FALLBACK GATING] এই Firestore collectionGroup query
+      // মাপা গেছে দিনে ~২৯,০০০-৪২,০০০ বার চলে (Query Insights), আর
+      // প্রায় সবসময় খালি ফেরে।
+      //
+      // কারণ: প্রতি মিনিটে ২৯টা market এ candle বন্ধ হয়, প্রতিবার RTDB
+      // queue দেখা হয়। ৪ জন user এ বেশির ভাগ market এ কোনো trade নেই,
+      // তাই queue খালি → প্রতিবারই Firestore এ fallback। Firestore এ
+      // ০-ফলাফলের query ও কমপক্ষে ১ read হিসেবে বিল হয়।
+      //   ২৯ market × ১৪৪০ মিনিট = ৪১,৭৬০/দিন — মাপা সংখ্যার সাথে মেলে।
+      //
+      // কী বদলাল: RTDB queue খালি **এবং** `_activeTradesMemory` তেও এই
+      // symbol এ কিছু নেই — তখন Firestore query বাদ। দুটোই খালি মানে
+      // সত্যিই কিছু নেই।
+      //
+      // ফাঁক ও তার ঢাকনা: এই fallback এর আসল উদ্দেশ্য ছিল "queue তে
+      // লেখা হয়নি এমন trade" ধরা — সেগুলো memory তেও থাকবে না। তাই
+      // গার্ডটা **ঘণ্টায় একবার শিথিল** হয়: প্রতি ঘণ্টায় প্রথমবার
+      // query চলবেই, symbol নির্বিশেষে। হারানো trade সর্বোচ্চ ১ ঘণ্টায়
+      // ধরা পড়বে, আর query সংখ্যা ~৯৮% কমে।
+      //
+      // সুইচ: ENABLE_CG_FALLBACK_GATING=on। বন্ধ থাকলে আগের আচরণ হুবহু।
+      // ══════════════════════════════════════════════════════════════
+      if (CG_FALLBACK_GATING) {
+        let symbolHasPending = false;
+        for (const t of _activeTradesMemory.values()) {
+          if (t.symbol === symbol) { symbolHasPending = true; break; }
+        }
+        const _hourBucket = Math.floor(Date.now() / 3600000);
+        const _sweepDue   = _cgSweepHour !== _hourBucket;
+        if (!symbolHasPending && !_sweepDue) {
+          _candleSettlingSymbols.delete(symbol);
+          return;
+        }
+        if (_sweepDue) _cgSweepHour = _hourBucket;
+      }
+
       // Fallback: RTDB queue-এ না থাকলে Firestore collectionGroup query
       // (পুরনো trades যেগুলো queue-এ লেখা হয়নি, বা Cloud Function miss করেছে)
       const fsSnap = await firestore.collectionGroup('trades')
@@ -2106,6 +2150,12 @@ async function main() {
     console.log('[settle-poll] gating চালু — pending trade না থাকলে RTDB poll ৩০s এ একবার');
   } else {
     console.log('[settle-poll] gating নিষ্ক্রিয় — RTDB poll আগের মতোই প্রতি ৫০০ms');
+  }
+
+  if (CG_FALLBACK_GATING) {
+    console.log('[cg-fallback] gating চালু — pending trade না থাকলে Firestore collectionGroup query বাদ (ঘণ্টায় একবার sweep)');
+  } else {
+    console.log('[cg-fallback] gating নিষ্ক্রিয় — প্রতি candle-close এ Firestore fallback আগের মতোই চলবে');
   }
 
   // setInterval এর বদলে self-scheduling — ছন্দ প্রতিবার নতুন করে ঠিক হয়,
