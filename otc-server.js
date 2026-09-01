@@ -1041,6 +1041,98 @@ setTimeout(() => {
   setInterval(() => { _sweepStaleMarketStats().catch(() => {}); }, 60000);
 }, 120000);
 
+// ══════════════════════════════════════════════════════════════════════
+// [BILL — SUBCANDLE TRIM] ৭ দিনের পুরনো sub-candle মুছে ফেলা।
+// ----------------------------------------------------------------------
+// সমস্যা: `subcandles_15s/*/candles` ও `subcandles_30s/*/candles` এ
+// প্রতি ১৫s ও ৩০s এ একটা করে candle `push()` হয়, কখনো মোছা হয় না।
+// মাপা: প্রাচীনতম entry ৬ জুন ২০২৬ — তিন মাসের জমা। RTDB storage
+// ৩ GB, যার ~৯০% এই দুটো node এ (হার: ১৫s এর ৪/মিনিট, ৩০s এর ২/মিনিট,
+// বনাম otc_candles এর ১/মিনিট)।
+//
+// খরচ: RTDB storage $৫/GB/মাস, ১ GB ফ্রি। ৩ GB মানে ~$১০/মাস, আর
+// প্রতি মাসে ~১.৫ GB করে বাড়ছে।
+//
+// কেন ৭ দিন: ১৫/৩০ সেকেন্ডের candle কেউ দিন-সপ্তাহ পুরনো দেখে না।
+// চার্টের আসল ইতিহাস `otc_candles` এ (১ মিনিট) — সেটা **স্পর্শ করা
+// হয় না**, তাই user এর অভিজ্ঞতায় কোনো পরিবর্তন নেই।
+//
+// নিরাপত্তা:
+//   • `orderByChild('time').endAt(cutoff)` — RTDB rules এ ওই দুটো
+//     node এ `.indexOn: ["time"]` যোগ করা আছে, নইলে গোটা node নামত।
+//   • ব্যাচে ব্যাচে (একবারে ৫০০), প্রতি ব্যাচের মাঝে বিরতি — RAM ও
+//     Load একসাথে লাফাবে না।
+//   • কখনোই আজকের বা সাম্প্রতিক candle ছোঁয় না — cutoff অতীতে।
+//   • সুইচ ENABLE_SUBCANDLE_TRIM=on, ডিফল্ট off।
+//
+// প্রথমবার তিন মাসের জমা মুছতে কয়েক ঘণ্টা লাগবে (দিনে একবার চলে,
+// প্রতিবার market প্রতি সর্বোচ্চ কয়েক ব্যাচ) — একবারের খরচ।
+// ══════════════════════════════════════════════════════════════════════
+const SUBCANDLE_TRIM      = (process.env.ENABLE_SUBCANDLE_TRIM || 'off').toLowerCase() === 'on';
+const SUBCANDLE_KEEP_DAYS = Number(process.env.SUBCANDLE_KEEP_DAYS || 7);
+const TRIM_BATCH          = 500;    // একবারে কতগুলো candle
+const TRIM_MAX_BATCHES    = 20;     // প্রতি market প্রতি চক্রে সর্বোচ্চ (= ১০,০০০)
+const TRIM_PAUSE_MS       = 1500;   // ব্যাচের মাঝে বিরতি
+
+const _sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function _trimOneNode(label, id, cutoffSec) {
+  const base = db.ref(`subcandles_${label}/${id}/candles`);
+  let removed = 0;
+
+  for (let b = 0; b < TRIM_MAX_BATCHES; b++) {
+    const snap = await base.orderByChild('time').endAt(cutoffSec).limitToFirst(TRIM_BATCH).once('value');
+    if (!snap.exists()) break;
+
+    const updates = {};
+    let n = 0;
+    snap.forEach(child => { updates[child.key] = null; n++; });
+    if (n === 0) break;
+
+    await base.update(updates);
+    removed += n;
+
+    if (n < TRIM_BATCH) break;   // আর কিছু বাকি নেই
+    await _sleep(TRIM_PAUSE_MS);
+  }
+  return removed;
+}
+
+async function _trimSubCandles() {
+  if (!SUBCANDLE_TRIM) return;
+  const cutoffSec = Math.floor(Date.now() / 1000) - SUBCANDLE_KEEP_DAYS * 86400;
+  let total = 0;
+
+  for (const id of [..._activeMarkets]) {
+    for (const { label } of SUB_INTERVALS) {
+      try {
+        const n = await _trimOneNode(label, id, cutoffSec);
+        if (n > 0) {
+          total += n;
+          console.log(`[trim] ${id} ${label} — ${n}টা পুরনো candle মোছা হলো`);
+        }
+      } catch (e) {
+        console.error(`[trim] ${id} ${label} ব্যর্থ:`, e.message);
+      }
+      await _sleep(300);   // market/interval এর মাঝে হালকা বিরতি
+    }
+  }
+  if (total > 0) console.log(`[trim] এই চক্রে মোট ${total}টা candle মোছা হলো (cutoff=${cutoffSec})`);
+  else           console.log('[trim] মোছার মতো পুরনো candle নেই');
+}
+
+if (SUBCANDLE_TRIM) {
+  console.log(`[trim] subcandle ছাঁটাই চালু — ${SUBCANDLE_KEEP_DAYS} দিনের পুরনো মুছবে, দিনে একবার`);
+  // startup এর ৫ মিনিট পর প্রথমবার (market গুলো চালু হওয়ার সময় দিয়ে),
+  // তারপর প্রতি ২৪ ঘণ্টায়
+  setTimeout(() => {
+    _trimSubCandles().catch(e => console.error('[trim] error:', e.message));
+    setInterval(() => { _trimSubCandles().catch(e => console.error('[trim] error:', e.message)); }, 24 * 3600 * 1000);
+  }, 5 * 60 * 1000);
+} else {
+  console.log('[trim] subcandle ছাঁটাই নিষ্ক্রিয় — পুরনো candle আগের মতোই জমতে থাকবে');
+}
+
 /** এই symbol এ এখন কেউ তাকিয়ে আছে? অনিশ্চিত হলে সবসময় true। */
 function _isWatched(id) {
   if (!VIEWER_GATING)   return true;
