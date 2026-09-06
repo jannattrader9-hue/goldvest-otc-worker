@@ -1071,8 +1071,15 @@ setTimeout(() => {
 const SUBCANDLE_TRIM      = (process.env.ENABLE_SUBCANDLE_TRIM || 'off').toLowerCase() === 'on';
 const SUBCANDLE_KEEP_DAYS = Number(process.env.SUBCANDLE_KEEP_DAYS || 7);
 const TRIM_BATCH          = 500;    // একবারে কতগুলো candle
-const TRIM_MAX_BATCHES    = 20;     // প্রতি market প্রতি চক্রে সর্বোচ্চ (= ১০,০০০)
-const TRIM_PAUSE_MS       = 1500;   // ব্যাচের মাঝে বিরতি
+// [BILL — গতি বাড়ানো, ৬ সেপ্টেম্বর] আগে ২০ ব্যাচ (=১০,০০০/market/চক্র)
+// আর দিনে একবার ছিল — ৬ দিনে storage ৩.০১ → ২.৭ GB, অর্থাৎ খুব ধীর।
+// এই গতিতে ফ্রি সীমায় (১ GB) নামতে এক মাসের বেশি লাগত, আর ততদিন
+// প্রতি মাসে ~$৮ storage বিল যেত।
+// এখন ২০০ ব্যাচ (=১,০০,০০০/market/চক্র), বিরতি কম, আর চক্র পরপর।
+// env দিয়ে বদলানো যায় — কোড deploy না করেই গতি কমানো/বাড়ানো যাবে।
+const TRIM_MAX_BATCHES    = Number(process.env.TRIM_MAX_BATCHES || 200);
+const TRIM_PAUSE_MS       = Number(process.env.TRIM_PAUSE_MS    || 600);   // ব্যাচের মাঝে বিরতি
+const TRIM_GAP_MS         = Number(process.env.TRIM_GAP_MS      || 30 * 60 * 1000); // চক্রের মাঝে
 
 const _sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -1122,13 +1129,24 @@ async function _trimSubCandles() {
 }
 
 if (SUBCANDLE_TRIM) {
-  console.log(`[trim] subcandle ছাঁটাই চালু — ${SUBCANDLE_KEEP_DAYS} দিনের পুরনো মুছবে, দিনে একবার`);
-  // startup এর ৫ মিনিট পর প্রথমবার (market গুলো চালু হওয়ার সময় দিয়ে),
-  // তারপর প্রতি ২৪ ঘণ্টায়
-  setTimeout(() => {
-    _trimSubCandles().catch(e => console.error('[trim] error:', e.message));
-    setInterval(() => { _trimSubCandles().catch(e => console.error('[trim] error:', e.message)); }, 24 * 3600 * 1000);
-  }, 5 * 60 * 1000);
+  console.log(`[trim] subcandle ছাঁটাই চালু — ${SUBCANDLE_KEEP_DAYS} দিনের পুরনো মুছবে`);
+  console.log(`[trim] গতি: প্রতি market এ সর্বোচ্চ ${TRIM_MAX_BATCHES * TRIM_BATCH}টা/চক্র, চক্রের মাঝে ${Math.round(TRIM_GAP_MS / 60000)} মিনিট`);
+
+  // [BILL] setInterval এর বদলে self-scheduling — একটা চক্র সম্পূর্ণ শেষ
+  // না হওয়া পর্যন্ত পরেরটা শুরু হয় না। আগে setInterval(24h) ছিল, কিন্তু
+  // চক্র নিজেই কয়েক ঘণ্টা নিতে পারে; overlap হলে RTDB তে দ্বিগুণ চাপ পড়ত।
+  //
+  // জমা শেষ হয়ে গেলে চক্র সেকেন্ডেই শেষ হবে ("মোছার মতো পুরনো candle নেই"),
+  // তখন এটা কার্যত ৩০ মিনিট পরপর একটা সস্তা পরীক্ষা হয়ে দাঁড়াবে।
+  async function _trimCycle() {
+    try {
+      await _trimSubCandles();
+    } catch (e) {
+      console.error('[trim] error:', e.message);
+    }
+    setTimeout(_trimCycle, TRIM_GAP_MS);
+  }
+  setTimeout(_trimCycle, 5 * 60 * 1000);   // startup এর ৫ মিনিট পর প্রথমবার
 } else {
   console.log('[trim] subcandle ছাঁটাই নিষ্ক্রিয় — পুরনো candle আগের মতোই জমতে থাকবে');
 }
