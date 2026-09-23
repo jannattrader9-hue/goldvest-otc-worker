@@ -1813,10 +1813,16 @@ function tickOTC(id) {
   let bias     = ctrl.trendStrength ?? 0.6;
 
   if (ctrl.mode === 'trade-based') {
+    /* [MODE-B] user যেদিকে ট্রেড করে, দাম তার উল্টো দিকে — টাকার অঙ্ক
+       এখানে দেখা হয় না (সেটা অন্য নিয়ম)। শুধু কয়টা ট্রেড কোন দিকে,
+       সেটাই দেখি: বেশি ট্রেড up এ থাকলে দাম নিচে, বেশি down এ থাকলে উপরে।
+       সমান হলে আগের দিকটাই ধরে রাখি — নইলে প্রতি ট্রেডে দিক লাফাত।
+       ট্রেড না থাকলে স্বাভাবিক (auto) চলা। */
     const stats = _tradeStats[id] || {};
-    const up    = parseFloat(stats.upAmount)   || 0;
-    const down  = parseFloat(stats.downAmount) || 0;
-    const want  = up > down * 1.2 ? -1 : down > up * 1.2 ? 1 : 0;   // উল্টো দিক
+    const upC   = parseInt(stats.upCount)   || 0;
+    const downC = parseInt(stats.downCount) || 0;
+    let   want  = upC > downC ? -1 : downC > upC ? 1 : 0;
+    if (want === 0 && (upC + downC) > 0) want = state._tbDir || 0;   // সমান — আগের দিক
     if (want === 0) {
       state._tbDir = 0; state._tbAt = 0;
     } else {
