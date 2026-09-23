@@ -1784,10 +1784,40 @@ function tickOTC(id) {
   const manual = ctrl.mode === 'manual';
   const dir    = ctrl.nextDirection;
 
+  /* ── [MODE-B / trade-based — ফেরানো] ────────────────────────────
+     আগে এটা শুধু real forex এর অংশে ছিল, OTC তে বসানোই হয়নি — তাই
+     Mode-B বাছলেও কিছু হতো না (otc_trade_stats আসত, কিন্তু ব্যবহার
+     হতো না)। এখন:
+       • যে দিকে বেশি টাকার ট্রেড, দাম তার *উল্টো* দিকে ঝোঁকে
+       • পার্থক্য ২০% এর কম হলে কিছুই করে না (auto র মতোই)
+       • সাথে সাথে নয় — দিক ঠিক হওয়ার ৩-৪ সেকেন্ড পরে শুরু, আর
+         ঝোঁক হালকা (০.৪৫), তাই user এর চোখে স্বাভাবিক লাগে;
+         ট্রেড নেওয়ার মুহূর্তেই দাম ঘুরে যায় না
+       • দিক বদলালে ঘড়ি আবার শুরু থেকে গোনে
+     auto আর manual আগের মতোই। ── */
+  let forceDir = manual ? (dir === 'up' ? 1 : dir === 'down' ? -1 : 0) : 0;
+  let bias     = ctrl.trendStrength ?? 0.6;
+
+  if (ctrl.mode === 'trade-based') {
+    const stats = _tradeStats[id] || {};
+    const up    = parseFloat(stats.upAmount)   || 0;
+    const down  = parseFloat(stats.downAmount) || 0;
+    const want  = up > down * 1.2 ? -1 : down > up * 1.2 ? 1 : 0;   // উল্টো দিক
+    if (want === 0) {
+      state._tbDir = 0; state._tbAt = 0;
+    } else {
+      if (state._tbDir !== want) {                 // নতুন দিক — ৩-৪ সেকেন্ড অপেক্ষা
+        state._tbDir = want;
+        state._tbAt  = Date.now() + 3000 + Math.random() * 1000;
+      }
+      if (Date.now() >= state._tbAt) { forceDir = want; bias = 0.45; }
+    }
+  }
+
   state.price = engine.nextPrice(state._eng, Date.now(), {
     unit: engine.CFG.unit * volMul * speed,
-    forceDir: manual ? (dir === 'up' ? 1 : dir === 'down' ? -1 : 0) : 0,
-    trendStrength: ctrl.trendStrength ?? 0.6,
+    forceDir,
+    trendStrength: bias,
   });
 
   // [TICK IDENTITY] প্রতিটা tick এর canonical price/timestamp সংরক্ষণ —
