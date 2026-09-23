@@ -121,7 +121,24 @@ function createState(price, decimals = 5) {
  * @param {object} [over] override — legacy signature compat এর জন্য রাখা, এই simplified version এ ব্যবহৃত হয় না
  */
 function nextPrice(st, now = Date.now(), over) {
-  const dir = Math.random() < 0.5 ? 1 : -1;
+  /* ── [ADMIN CONTROL — ফেরানো] ──────────────────────────────────
+     animation ঠিক করার সময় এই function নতুন করে লেখা হয়েছিল, আর তাতে
+     admin এর নিয়ন্ত্রণ বাদ পড়ে গিয়েছিল: দিক ঠিক হতো শুধু ৫০/৫০ random
+     দিয়ে, otc-server এর পাঠানো forceDir / trendStrength পড়াই হতো না।
+     ফলে admin panel এর "Next Candle Direction" কোনো কাজ করত না।
+
+       forceDir       0 = auto (আগের মতো ৫০/৫০), 1 = up, -1 = down
+       trendStrength  ০–১: manual দিকের জোর। ০.৬ মানে ~৮০% tick ওই
+                      দিকে, বাকিগুলো উল্টো — তাই candle গুলো ওই দিকে
+                      যায় কিন্তু দেখতে স্বাভাবিক থাকে (একটানা সরলরেখা
+                      হয় না, user সন্দেহ করে না)।
+     auto অবস্থায় আচরণ হুবহু আগের মতোই — কিছুই বদলায়নি। */
+  const o     = over || {};
+  const force = o.forceDir || 0;
+  const bias  = Math.min(Math.max(o.trendStrength ?? CFG.trendStrength, 0), 1);
+  const dir = force === 0
+      ? (Math.random() < 0.5 ? 1 : -1)                       // auto — আগের মতো
+      : (Math.random() < 0.5 + bias * 0.5 ? force : -force); // manual — ওই দিকে ঝোঁক
 
   // [PIP DISTRIBUTION — ৩০%/৭০%, user এর নির্দেশ] ছোট ৩০%, মাঝারি+বড়
   // মিলিয়ে বাকি ৭০% (৩৮%+৩২%)।
@@ -130,6 +147,14 @@ function nextPrice(st, now = Date.now(), over) {
   if (_r < 0.30)      mag = 1 + Math.random() * 2;    // ছোট: ১-৩ pip (৩০%)
   else if (_r < 0.68) mag = 3 + Math.random() * 9;    // মাঝারি: ৩-১২ pip (৩৮%)
   else                mag = 12 + Math.random() * 10;  // বড়: ১২-২২ pip (৩২%)
+
+  /* [ADMIN VOLATILITY / SPEED — ফেরানো] otc-server এর পাঠানো unit ও পড়া
+     হতো না, তাই admin এর Volatility (low/medium/high) আর Speed কিছুই
+     করত না। unit স্বাভাবিকের কত গুণ, সেই অনুপাতে pip এর মাপ বাড়ে/কমে —
+     উপরের ৩০%/৭০% বণ্টন অপরিবর্তিত থাকে। medium + speed ১ হলে গুণফল
+     ১, অর্থাৎ আগের মতোই। */
+  const scale = (o.unit && CFG.unit) ? (o.unit / CFG.unit) : 1;
+  mag *= Math.min(Math.max(scale, 0.1), 5);   // নিরাপত্তা সীমা
 
   const pip = Math.pow(10, -st.decimals);
   let delta = dir * pip * mag;
