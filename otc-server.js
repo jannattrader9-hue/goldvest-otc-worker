@@ -1766,7 +1766,21 @@ function tickOTC(id) {
     // ব্যর্থ হলেও কিছু আটকাবে না (referencePrice: 0 = anchor নিষ্ক্রিয়,
     // যেটা createState() এর নিরাপদ ডিফল্ট)।
     _getReferencePrice(id).then(ref => {
-      if (ref && state._eng) state._eng.referencePrice = ref;
+      if (!ref || !state._eng) return;
+      state._eng.referencePrice = ref;
+      /* [START SNAP] deploy এর পর কোনো market এর শুরুর দাম যদি আসল দামের
+         থেকে অনেক দূরে হয় (যেমন BTC ৩০,০০০ থেকে শুরু, আসল ৬৮,০০০), তখন
+         anchor টানতে টানতে দাম একটানা উপরে উঠত — সব candle সবুজ।
+         এখন শুরুতেই (চার্টে তখন কিছু নেই, তাই কেউ টের পায় না) এক লাফে
+         আসল দামে বসাই — তারপর স্বাভাবিক এলোমেলো চলা। */
+      const dev = Math.abs(ref - state.price) / ref;
+      if (dev > 0.06) {
+        const snapped = Number(ref.toFixed(state._eng.decimals));
+        console.log(`[engine] ${id} — শুরুর দাম ${state.price} → ${snapped} (reference থেকে ${(dev*100).toFixed(1)}% দূরে ছিল)`);
+        state.price = snapped;
+        state._eng.price = snapped;
+        state.candleOpen = state.candleHigh = state.candleLow = snapped;
+      }
     }).catch(() => {});
     state._refRefreshAt = Date.now() + 3600000;   // ১ ঘণ্টা পর হালকা refresh
   } else if (Date.now() >= (state._refRefreshAt || Infinity)) {
