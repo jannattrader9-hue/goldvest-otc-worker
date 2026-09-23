@@ -167,7 +167,14 @@ function nextPrice(st, now = Date.now(), over) {
     const anchorBand = 0.06, anchorStrength = 0.00005;
     if (Math.abs(refDiff) > anchorBand) {
       const pull = (refDiff - Math.sign(refDiff) * anchorBand) * anchorStrength;
-      delta += st.price * pull;
+      /* [ANCHOR CAP] টান হিসাব হয় দামের অনুপাতে, আর স্বাভাবিক পা হয় pip এর
+         অনুপাতে — BTC এর মত বড় দামে টান পা এর চেয়ে ১০-১৫ গুণ বড় হয়ে যেত।
+         তখন এলোমেলোভাব চাপা পড়ে দাম একটানা এক দিকে ছুটত (সব candle সবুজ)।
+         এখন টান কখনোই পা এর ২৫% এর বেশি নয় — সংশোধন হয়, কিন্তু চোখে
+         এলোমেলোভাবই থাকে। */
+      const want = st.price * pull;
+      const cap  = Math.abs(delta) * 0.25;
+      delta += Math.sign(want) * Math.min(Math.abs(want), cap);
     }
   }
 
