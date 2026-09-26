@@ -23,6 +23,8 @@ admin.initializeApp({
 const db        = admin.database();
 const firestore = admin.firestore();
 
+const MODE_B_ENABLED = (process.env.ENABLE_MODE_B || 'on').toLowerCase() !== 'off';
+
 // ── NOWPayments crypto currencies cache ──
 let _cryptoCurrenciesCache = null;
 let _cryptoCurrenciesCacheTime = 0;
@@ -371,10 +373,12 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
         _activeTradesMemory.delete(key);
         _pendingSettle.add(key);
       });
-      await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
-      { const _snap = []; for (const t of _activeTradesMemory.values()) if (t.symbol === symbol) _snap.push({ userId: t.userId, type: t.type, amount: t.amount });
+      await _applyExpiryPrices(symbol, trades);
+      if (!_isModeBActive(symbol)) {
+        const _snap = []; for (const t of _activeTradesMemory.values()) if (t.symbol === symbol) _snap.push({ userId: t.userId, type: t.type, amount: t.amount });
         for (const t of trades) _snap.push({ userId: t.userId, type: t.type, amount: t.amount });
-        closePrice = orderSettle.adjustClosePrice(_snap, closePrice, _states[symbol]?._eng?.decimals); }   // [MTG PROTECTION]
+        closePrice = orderSettle.adjustClosePrice(_snap, closePrice, _states[symbol]?._eng?.decimals);
+      }
       trades.forEach(t => { t.closePrice = closePrice; t.preAdjusted = true; });
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
       _candleSettlingSymbols.delete(symbol);
@@ -408,10 +412,12 @@ async function settleTradesForCandle(symbol, candleTime, closePrice) {
     const pendingKeys = trades.map(t => `${t.userId}/${t.tradeId}`);
     setTimeout(() => pendingKeys.forEach(k => _pendingSettle.delete(k)), 30000);
 
-    await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
-    { const _snap = []; for (const t of _activeTradesMemory.values()) if (t.symbol === symbol) _snap.push({ userId: t.userId, type: t.type, amount: t.amount });
+    await _applyExpiryPrices(symbol, trades);
+    if (!_isModeBActive(symbol)) {
+      const _snap = []; for (const t of _activeTradesMemory.values()) if (t.symbol === symbol) _snap.push({ userId: t.userId, type: t.type, amount: t.amount });
       for (const t of trades) _snap.push({ userId: t.userId, type: t.type, amount: t.amount });
-      closePrice = orderSettle.adjustClosePrice(_snap, closePrice, _states[symbol]?._eng?.decimals); }   // [MTG PROTECTION]
+      closePrice = orderSettle.adjustClosePrice(_snap, closePrice, _states[symbol]?._eng?.decimals);
+    }
       trades.forEach(t => { t.closePrice = closePrice; t.preAdjusted = true; });
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
 
@@ -668,15 +674,14 @@ async function _settleDueTradesFromMemory() {
     // open trades, সব duration মিলিয়ে) — তাদের সম্মিলিত up/down amount
     // দিয়ে majority ঠিক হয়, তারপর সেই adjustment এখন expire হওয়া
     // trades এ প্রয়োগ হয়।
-    const liveSnapshot = [];
-    for (const t of _activeTradesMemory.values()) {
-      if (t.symbol === symbol) liveSnapshot.push({ userId: t.userId, type: t.type, amount: t.amount });
+    if (!_isModeBActive(symbol)) {
+      const liveSnapshot = [];
+      for (const t of _activeTradesMemory.values()) {
+        if (t.symbol === symbol) liveSnapshot.push({ userId: t.userId, type: t.type, amount: t.amount });
+      }
+      for (const t of trades) liveSnapshot.push({ userId: t.userId, type: t.type, amount: t.amount });
+      closePrice = orderSettle.adjustClosePrice(liveSnapshot, closePrice, _states[symbol]?._eng?.decimals);
     }
-    // নিজেদেরও (এখন settle হচ্ছে) snapshot এ যোগ করি — তারা তো মাত্রই
-    // পর্যন্ত open ছিল, বাদ দিলে ছোট market এ snapshot ফাঁকা হয়ে যেতে পারে
-    for (const t of trades) liveSnapshot.push({ userId: t.userId, type: t.type, amount: t.amount });
-
-    closePrice = orderSettle.adjustClosePrice(liveSnapshot, closePrice, _states[symbol]?._eng?.decimals);   // [MTG PROTECTION]
       trades.forEach(t => { t.closePrice = closePrice; t.preAdjusted = true; });
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
       // ══════════════════════════════════════════════════════════════
@@ -789,9 +794,11 @@ async function _settleDueTradesFromRTDB() {
     await Promise.allSettled([...bySymbol.entries()].map(async ([symbol, { closePrice, trades }]) => {
       console.log(`[rtdb-tick-settle] ${symbol} due=${trades.length} closePrice=${closePrice.toFixed(5)}`);
       await _applyExpiryPrices(symbol, trades);   // [TICK HISTORY] expiry এর সঠিক দাম
-      { const _snap = []; for (const t of _activeTradesMemory.values()) if (t.symbol === symbol) _snap.push({ userId: t.userId, type: t.type, amount: t.amount });
+      if (!_isModeBActive(symbol)) {
+        const _snap = []; for (const t of _activeTradesMemory.values()) if (t.symbol === symbol) _snap.push({ userId: t.userId, type: t.type, amount: t.amount });
         for (const t of trades) _snap.push({ userId: t.userId, type: t.type, amount: t.amount });
-        closePrice = orderSettle.adjustClosePrice(_snap, closePrice, _states[symbol]?._eng?.decimals); }   // [MTG PROTECTION]
+        closePrice = orderSettle.adjustClosePrice(_snap, closePrice, _states[symbol]?._eng?.decimals);
+      }
       trades.forEach(t => { t.closePrice = closePrice; t.preAdjusted = true; });
       await _batchSettleAndBroadcast(symbol, trades, closePrice);
       // settle হয়ে গেলে RTDB queue থেকে delete করো
@@ -1667,8 +1674,7 @@ async function initOTC(market) {
   db.ref(`otc_controls/${id}`).on('value', snap => {
     if (snap.exists()) _controls[id] = { ..._controls[id], ...snap.val() };
   });
-  // trade-based mode এর জন্য — Forex engine এ যেভাবে আছে, OTC তেও same pattern
-  db.ref(`otc_trade_stats/${id}`).on('value', snap => {
+  db.ref(`live_market_stats/${id}`).on('value', snap => {
     _tradeStats[id] = snap.exists() ? snap.val() : {};
   });
 
@@ -1735,6 +1741,12 @@ async function initOTC(market) {
   await _load24hOpenPrice(id);
 
   console.log(`[${id}] OTC started @ ${price.toFixed(4)}`);
+}
+
+function _isModeBActive(id) {
+  if (!MODE_B_ENABLED) return false;
+  const ctrl = _controls[id];
+  return !!(ctrl && ctrl.mode === 'trade-based');
 }
 
 function tickOTC(id) {
@@ -1812,19 +1824,36 @@ function tickOTC(id) {
   let forceDir = manual ? (dir === 'up' ? 1 : dir === 'down' ? -1 : 0) : 0;
   let bias     = ctrl.trendStrength ?? 0.6;
 
-  if (ctrl.mode === 'trade-based') {
-    const stats = _tradeStats[id] || {};
-    const up    = parseFloat(stats.upAmount)   || 0;
-    const down  = parseFloat(stats.downAmount) || 0;
-    const want  = up > down * 1.2 ? -1 : down > up * 1.2 ? 1 : 0;   // উল্টো দিক
+  if (ctrl.mode === 'trade-based' && MODE_B_ENABLED) {
+    /* [MODE-B] user যেদিকে ট্রেড করে, দাম তার উল্টো দিকে — টাকার অঙ্ক
+       এখানে দেখা হয় না (সেটা অন্য নিয়ম)। শুধু কয়টা ট্রেড কোন দিকে,
+       সেটাই দেখি: বেশি ট্রেড up এ থাকলে দাম নিচে, বেশি down এ থাকলে উপরে।
+       সমান হলে আগের দিকটাই ধরে রাখি — নইলে প্রতি ট্রেডে দিক লাফাত।
+       ট্রেড না থাকলে স্বাভাবিক (auto) চলা। */
+    const stats   = _tradeStats[id] || {};
+    const upC     = parseInt(stats.up)           || 0;
+    const downC   = parseInt(stats.down)         || 0;
+    const upAmt   = parseFloat(stats.upAmount)   || 0;
+    const downAmt = parseFloat(stats.downAmount) || 0;
+
+    const scoreUp   = upC   + upAmt   * 0.05;
+    const scoreDown = downC + downAmt * 0.05;
+
+    let want = 0;
+    if (scoreUp   > scoreDown * 1.05) want = -1;
+    else if (scoreDown > scoreUp * 1.05) want = 1;
+    if (want === 0 && (upC + downC) > 0) want = state._tbDir || 0;   // সমান — আগের দিক
     if (want === 0) {
       state._tbDir = 0; state._tbAt = 0;
     } else {
       if (state._tbDir !== want) {                 // নতুন দিক — ৩-৪ সেকেন্ড অপেক্ষা
         state._tbDir = want;
-        state._tbAt  = Date.now() + 3000 + Math.random() * 1000;
+        state._tbAt  = Date.now() + 2000 + Math.random() * 1000;
       }
-      if (Date.now() >= state._tbAt) { forceDir = want; bias = 0.45; }
+      if (Date.now() >= state._tbAt) {
+        forceDir = want;
+        bias = 0.30;
+      }
     }
   }
 
@@ -2030,7 +2059,7 @@ async function initForex(id) {
   db.ref(`otc_controls/${id}`).on('value', snap => {
     if (snap.exists()) _controls[id] = { ..._controls[id], ...snap.val() };
   });
-  db.ref(`otc_trade_stats/${id}`).on('value', snap => {
+  db.ref(`live_market_stats/${id}`).on('value', snap => {
     _tradeStats[id] = snap.exists() ? snap.val() : {};
   });
   const now = Date.now(), start = Math.floor(now/CANDLE_MS)*CANDLE_MS;
