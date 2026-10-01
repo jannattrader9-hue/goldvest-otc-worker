@@ -1844,15 +1844,30 @@ function tickOTC(id) {
     else if (scoreDown > scoreUp * 1.05) want = 1;
     if (want === 0 && (upC + downC) > 0) want = state._tbDir || 0;   // সমান — আগের দিক
     if (want === 0) {
-      state._tbDir = 0; state._tbAt = 0;
+      state._tbDir = 0; state._tbAt = 0; state._tbDirSetAt = 0; state._tbCycleStart = 0;
     } else {
       if (state._tbDir !== want) {                 // নতুন দিক — ৩-৪ সেকেন্ড অপেক্ষা
         state._tbDir = want;
         state._tbAt  = Date.now() + 2000 + Math.random() * 1000;
+        state._tbDirSetAt  = state._tbAt;
+        state._tbCycleStart = 0;
       }
-      if (Date.now() >= state._tbAt) {
-        forceDir = want;
-        bias = 0.30;
+      const nowMs = Date.now();
+      if (nowMs >= state._tbAt) {
+        const dirAgeMs = nowMs - (state._tbDirSetAt || nowMs);
+        if (dirAgeMs < 60000) {
+          forceDir = want;
+          bias = 0.30;
+        } else {
+          if (!state._tbCycleStart) state._tbCycleStart = nowMs;
+          const CYCLE_MS = 30000;
+          const FORCE_MS = 10000;
+          const elapsed = (nowMs - state._tbCycleStart) % CYCLE_MS;
+          if (elapsed < FORCE_MS) {
+            forceDir = want;
+            bias = 0.30;
+          }
+        }
       }
     }
   }
