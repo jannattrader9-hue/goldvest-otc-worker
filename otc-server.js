@@ -2386,12 +2386,332 @@ function _readBody(req) {
 const BAL_KEY_OTC   = (uid) => `gv:bal:${uid}`;
 const TRADE_KEY_OTC = (tid) => `gv:trade:${tid}`;
 
+// ══════════════════════════════════════════════════════════════════
+// [DEMO SERVER] Demo trade — সম্পূর্ণ আলাদা পথ
+//
+// এই অংশ live এর কোনো কিছু ছোঁয় না: আলাদা Redis key (gv:demo:*),
+// আলাদা endpoint (/demo-*)। কোনো mode, stats, RTDB, Firestore,
+// Index.js বা admin এ কিছু লেখা/পাঠানো হয় না। কাজ শুধু তিনটে:
+// সঠিক দামে entry, sell, settle।
+//
+// দাম: settle হয় tickHistory থেকে ঠিক expiry মুহূর্তের tick দিয়ে
+// (live এর মতোই নিয়ম)। server restart হলে memory খালি থাকে, তখন
+// Redis এর px:hist (৫ ঘণ্টা রাখা হয়) থেকে নেওয়া হয়। দুটোতেই না
+// পেলে পুরো টাকা ফেরত (refund)।
+//
+// kill switch: ENABLE_DEMO_SERVER=on না দিলে সব /demo-* অনুরোধ
+// {fallback:true} ফেরত দেয় আর settle loop কিছুই করে না।
+// ══════════════════════════════════════════════════════════════════
+const DEMO_ON          = (process.env.ENABLE_DEMO_SERVER || 'off').toLowerCase() === 'on';
+const DEMO_START_BAL   = 10000;
+const DEMO_TTL_SEC     = 7 * 24 * 3600;          // ফল ৭ দিন রাখা হয়
+const DEMO_MAX_DUR_MS  = 4 * 3600 * 1000;        // px:hist ৫ ঘণ্টা রাখে, তাই ৪ ঘণ্টা সীমা
+const DEMO_SETTLE_LAG  = 300;                    // expiry এর পর tick পৌঁছানোর সময়
+const DEMO_BAL_KEY     = (uid) => `gv:demo:bal:${uid}`;
+const DEMO_TRADE_KEY   = (tid) => `gv:demo:t:${tid}`;
+const DEMO_DUE_KEY     = 'gv:demo:due';
+
+if (redisPub) {
+  // টাকা কাটা — key না থাকলে শুরুর ব্যালেন্স বসিয়ে তারপর কাটে (atomic)
+  redisPub.defineCommand('gvDemoDeduct', {
+    numberOfKeys: 1,
+    lua: `
+      local bal = redis.call('GET', KEYS[1])
+      if bal == false then redis.call('SET', KEYS[1], ARGV[2]); bal = ARGV[2] end
+      if tonumber(bal) < tonumber(ARGV[1]) then return {0, tostring(bal)} end
+      local nb = redis.call('INCRBYFLOAT', KEYS[1], -tonumber(ARGV[1]))
+      return {1, tostring(nb)}
+    `,
+  });
+  // ট্রেড শেষ করা — শুধু 'live' থাকলে; status + ফল + টাকা যোগ একসাথে
+  redisPub.defineCommand('gvDemoFinish', {
+    numberOfKeys: 2,
+    lua: `
+      if redis.call('HGET', KEYS[1], 'status') ~= 'live' then return {0, '0'} end
+      redis.call('HSET', KEYS[1], 'status', ARGV[1], 'profit', ARGV[3], 'closePrice', ARGV[4], 'settledAt', ARGV[5])
+      if redis.call('EXISTS', KEYS[2]) == 0 then redis.call('SET', KEYS[2], ARGV[6]) end
+      local nb = redis.call('INCRBYFLOAT', KEYS[2], tonumber(ARGV[2]))
+      return {1, tostring(nb)}
+    `,
+  });
+}
+
+function _demoSend(res, code, obj) {
+  res.writeHead(code, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify(obj));
+}
+
+async function _demoAuth(body) {
+  if (!body || !body.idToken) return null;
+  try { return (await admin.auth().verifyIdToken(body.idToken)).uid; }
+  catch (e) { return null; }
+}
+
+async function _demoGetBalance(uid) {
+  const v = await redisPub.get(DEMO_BAL_KEY(uid));
+  return v === null ? DEMO_START_BAL : parseFloat(v);
+}
+
+// ঠিক expiry মুহূর্তের দাম — live এর _applyExpiryPrices এর একই নিয়ম
+// (candle-সীমা হলে সীমার পরের প্রথম tick, নইলে expiry বা তার আগের শেষ tick)
+// ফেরত: { price } বা { wait: true } (tick এখনো আসেনি) বা null (পাওয়া যায়নি)
+async function _demoPriceAt(symbol, expMs) {
+  const nowMs = Date.now();
+  if (expMs % CANDLE_MS === 0) {
+    const t = tickHistory.findFirstTickAtOrAfter(symbol, expMs, 3000);
+    if (t) return { price: t.price };
+    if (nowMs - expMs < 3000) return { wait: true };
+  }
+  const t = tickHistory.findLatestTickAtOrBefore(symbol, expMs);
+  if (t && (expMs - t.timestamp) <= 60000) return { price: t.price };
+  const hp = await _histPriceAt(symbol, expMs);
+  if (hp) return { price: hp };
+  return null;
+}
+
+// ── settle loop ──────────────────────────────────────────────────
+let _demoBusy = false;
+async function _demoSettleTick() {
+  if (!DEMO_ON || !redisPub || !redisReady || _demoBusy) return;
+  _demoBusy = true;
+  try {
+    const due = await redisPub.zrangebyscore(DEMO_DUE_KEY, 0, Date.now() - DEMO_SETTLE_LAG, 'LIMIT', 0, 200);
+    if (!due || due.length === 0) return;
+    const byUser = new Map();   // uid → { items, newBalance }
+
+    for (const tid of due) {
+      const key = DEMO_TRADE_KEY(tid);
+      const t = await redisPub.hgetall(key);
+      if (!t || !t.uid || t.status !== 'live') { await redisPub.zrem(DEMO_DUE_KEY, tid); continue; }
+
+      const expMs  = parseInt(t.expiryMs) || 0;
+      const entry  = parseFloat(t.entryPrice);
+      const amount = parseFloat(t.amount);
+      const payout = parseFloat(t.payoutPercent);
+
+      const px = await _demoPriceAt(t.symbol, expMs);
+      if (px && px.wait) continue;              // পরের ঘুরে আবার দেখা হবে
+
+      let status, credit, profit, closePrice;
+      if (!px) {
+        status = 'refunded'; credit = amount; profit = 0; closePrice = entry;
+        console.warn(`[demo] ${tid} দাম পাওয়া যায়নি — refund (symbol=${t.symbol})`);
+      } else {
+        closePrice = px.price;
+        const isTie = closePrice === entry;
+        const isWin = !isTie && ((t.type === 'up' && closePrice > entry) || (t.type === 'down' && closePrice < entry));
+        status = isTie ? 'refunded' : (isWin ? 'won' : 'lost');
+        profit = isWin ? Number((amount * payout / 100).toFixed(2)) : 0;
+        credit = isTie ? amount : (isWin ? amount + profit : 0);
+      }
+
+      const r = await redisPub.gvDemoFinish(key, DEMO_BAL_KEY(t.uid),
+        status, String(credit), String(profit), String(closePrice), String(Date.now()), String(DEMO_START_BAL));
+      await redisPub.zrem(DEMO_DUE_KEY, tid);
+      if (!r || Number(r[0]) !== 1) continue;   // আগেই sell/settle হয়ে গেছে
+
+      if (!byUser.has(t.uid)) byUser.set(t.uid, { items: [], newBalance: 0 });
+      const u = byUser.get(t.uid);
+      u.items.push({ tradeId: tid, status, profit, closePrice });
+      u.newBalance = parseFloat(r[1]);
+    }
+
+    // ws-server এর settle:{uid} channel — শুধু ওই user এর socket এ যায়
+    for (const [uid, u] of byUser) {
+      redisPub.publish(`settle:${uid}`, JSON.stringify({
+        type: 'settle', demo: true,
+        batchId: `demo_${uid}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
+        items: u.items, newDemoBalance: u.newBalance, timestamp: Date.now(),
+      })).catch(e => console.error('[demo] publish failed:', e.message));
+    }
+  } catch (e) {
+    console.error('[demo] settle loop error:', e.message);
+  } finally {
+    _demoBusy = false;
+  }
+}
+setInterval(_demoSettleTick, 250);
+if (DEMO_ON) console.log('[demo] demo server চালু ✅');
+
+// ── routes ───────────────────────────────────────────────────────
+async function _handleDemoRoute(req, res) {
+  let body;
+  try { body = await _readBody(req); }
+  catch (e) { return _demoSend(res, 400, { error: 'Invalid body' }); }
+
+  if (!DEMO_ON)  return _demoSend(res, 503, { error: 'demo-server-off', fallback: true });
+  if (!redisPub || !redisReady) return _demoSend(res, 503, { error: 'redis-not-ready', fallback: true });
+
+  const uid = await _demoAuth(body);
+  if (!uid) return _demoSend(res, 401, { error: 'Unauthorized' });
+
+  try {
+    // ── POST /demo-balance ─────────────────────────────
+    if (req.url === '/demo-balance') {
+      return _demoSend(res, 200, { success: true, balance: await _demoGetBalance(uid) });
+    }
+
+    // ── POST /demo-place ───────────────────────────────
+    if (req.url === '/demo-place') {
+      const trade   = body.trade || {};
+      const tid     = String(trade.id || '');
+      const symbol  = String(trade.symbol || '');
+      const type    = trade.type;
+      const amount  = parseFloat(trade.amount);
+      const payout  = Math.min(95, Math.max(1, parseFloat(trade.payoutPercent) || 0));
+
+      if (!/^[A-Za-z0-9_-]{4,64}$/.test(tid) || (type !== 'up' && type !== 'down') ||
+          !isFinite(amount) || amount <= 0 || amount > 1e9 || !payout) {
+        return _demoSend(res, 400, { error: 'Invalid trade data' });
+      }
+      // এই server এ যে market চলে না, সেখানে client আগের পথে যাবে
+      if (tickHistory.getHistorySize(symbol) === 0) {
+        return _demoSend(res, 200, { error: 'symbol-not-served', fallback: true });
+      }
+
+      // entry — live /place-trade এর একই অগ্রাধিকার: visible tick → clickTs → server দাম
+      const nowMs = Date.now();
+      let entryPrice = 0;
+      if (trade.visibleTickId !== undefined && trade.visibleTickId !== null) {
+        const tk = tickHistory.findTickById(symbol, trade.visibleTickId);
+        if (tk && Math.abs(nowMs - tk.timestamp) <= 2000) entryPrice = tk.price;
+      }
+      const clickTs = parseInt(trade.clickTs) || 0;
+      if (!entryPrice && clickTs > 0 && Math.abs(nowMs - clickTs) <= 2000) {
+        const tk = tickHistory.findLatestTickAtOrBefore(symbol, clickTs);
+        if (tk && (clickTs - tk.timestamp) <= 2000) entryPrice = tk.price;
+      }
+      if (!entryPrice && _states[symbol] && typeof _states[symbol].price === 'number') entryPrice = _states[symbol].price;
+      if (!entryPrice) {
+        const tk = tickHistory.findLatestTickAtOrBefore(symbol, nowMs);
+        if (tk) entryPrice = tk.price;
+      }
+      if (!entryPrice || entryPrice <= 0) return _demoSend(res, 200, { error: 'price-not-ready', fallback: true });
+
+      // expiry — server নিজে হিসাব করে; client এর মান কাছাকাছি হলে তবেই মানা হয়
+      const duration = parseInt(trade.duration) || 0;
+      let expiryMs   = parseInt(trade.expiryTimestampMs) || 0;
+      if (duration > 0) {
+        const serverExp = nowMs + duration * 1000;
+        if (expiryMs <= nowMs || Math.abs(expiryMs - serverExp) > 5000) expiryMs = serverExp;
+      }
+      if (expiryMs <= nowMs || expiryMs - nowMs > DEMO_MAX_DUR_MS) {
+        return _demoSend(res, 400, { error: 'Invalid expiry' });
+      }
+
+      const key = DEMO_TRADE_KEY(tid);
+      const fresh = await redisPub.hsetnx(key, 'uid', uid);       // একই id দুবার বসবে না
+      if (!fresh) return _demoSend(res, 409, { error: 'Duplicate trade' });
+
+      const d = await redisPub.gvDemoDeduct(DEMO_BAL_KEY(uid), String(amount), String(DEMO_START_BAL));
+      if (!d || Number(d[0]) !== 1) {
+        await redisPub.del(key);
+        return _demoSend(res, 200, { error: 'Insufficient balance', balance: parseFloat(d && d[1]) || 0 });
+      }
+
+      await redisPub.hset(key,
+        'status', 'live', 'symbol', symbol, 'type', type,
+        'amount', String(amount), 'payoutPercent', String(payout),
+        'entryPrice', String(entryPrice), 'placedAt', String(nowMs), 'expiryMs', String(expiryMs));
+      await redisPub.expire(key, DEMO_TTL_SEC);
+      await redisPub.zadd(DEMO_DUE_KEY, expiryMs, tid);
+
+      return _demoSend(res, 200, {
+        success: true, tradeId: tid, entryPrice, expiryTimestampMs: expiryMs,
+        payoutPercent: payout, newBalance: parseFloat(d[1]),
+      });
+    }
+
+    // ── POST /demo-sell ────────────────────────────────
+    // দাম client থেকে নেওয়া হয় না — tradehistorymanager.js এর একই সূত্র
+    // server এ: amount × (payout% − ৫০ − পার হওয়া সেকেন্ড) / ১০০
+    if (req.url === '/demo-sell') {
+      const tid = String(body.tradeId || '');
+      const key = DEMO_TRADE_KEY(tid);
+      const t = await redisPub.hgetall(key);
+      if (!t || t.uid !== uid) return _demoSend(res, 404, { error: 'Trade not found' });
+      if (t.status !== 'live') return _demoSend(res, 409, { error: 'Trade already closed', status: t.status });
+
+      const nowMs  = Date.now();
+      const amount = parseFloat(t.amount);
+      const payout = parseFloat(t.payoutPercent);
+      if ((parseInt(t.expiryMs) - nowMs) <= 15000) return _demoSend(res, 400, { error: 'Sell window is closed' });
+
+      const elapsedSec = (nowMs - parseInt(t.placedAt)) / 1000;
+      const sellPct    = Math.max(0, payout - 50) - elapsedSec;
+      const sellPrice  = Number((amount * sellPct / 100).toFixed(4));
+      if (!(sellPrice > 0)) return _demoSend(res, 400, { error: 'Sell not available' });
+
+      const cur = (_states[t.symbol] && typeof _states[t.symbol].price === 'number') ? _states[t.symbol].price : parseFloat(t.entryPrice);
+      const profit = Number((sellPrice - amount).toFixed(4));
+      const r = await redisPub.gvDemoFinish(key, DEMO_BAL_KEY(uid),
+        'sold', String(sellPrice), String(profit), String(cur), String(nowMs), String(DEMO_START_BAL));
+      if (!r || Number(r[0]) !== 1) return _demoSend(res, 409, { error: 'Trade already closed' });
+      await redisPub.hset(key, 'sellPrice', String(sellPrice));
+      await redisPub.zrem(DEMO_DUE_KEY, tid);
+
+      return _demoSend(res, 200, { success: true, tradeId: tid, sellPrice, profit, closePrice: cur, newBalance: parseFloat(r[1]) });
+    }
+
+    // ── POST /demo-results ─────────────────────────────
+    // নেট ফিরলে বা পাতা খুললে — পেন্ডিং ট্রেডগুলোর ফল + ব্যালেন্স
+    if (req.url === '/demo-results') {
+      const ids = Array.isArray(body.tradeIds) ? body.tradeIds.slice(0, 100) : [];
+      const results = [];
+      for (const raw of ids) {
+        const tid = String(raw || '');
+        if (!/^[A-Za-z0-9_-]{4,64}$/.test(tid)) continue;
+        const t = await redisPub.hgetall(DEMO_TRADE_KEY(tid));
+        if (!t || t.uid !== uid) { results.push({ tradeId: tid, status: 'unknown' }); continue; }
+        results.push({
+          tradeId: tid, status: t.status,
+          entryPrice: parseFloat(t.entryPrice),
+          closePrice: t.closePrice !== undefined ? parseFloat(t.closePrice) : null,
+          profit:     t.profit     !== undefined ? parseFloat(t.profit)     : 0,
+          sellPrice:  t.sellPrice  !== undefined ? parseFloat(t.sellPrice)  : null,
+          expiryTimestampMs: parseInt(t.expiryMs) || 0,
+        });
+      }
+      return _demoSend(res, 200, { success: true, results, balance: await _demoGetBalance(uid) });
+    }
+
+    // ── POST /demo-init ────────────────────────────────
+    // প্রথমবার: Redis এ ব্যালেন্স না থাকলে browser এর পুরনো localStorage
+    // মানটা তুলে নিই (SET NX — আগে থেকে থাকলে কিছুই বদলায় না)
+    if (req.url === '/demo-init') {
+      const lb = parseFloat(body.localBalance);
+      const start = (isFinite(lb) && lb >= 0 && lb <= 1e9) ? lb : DEMO_START_BAL;
+      await redisPub.set(DEMO_BAL_KEY(uid), String(start), 'NX');
+      return _demoSend(res, 200, { success: true, balance: await _demoGetBalance(uid) });
+    }
+
+    // ── POST /demo-reset ───────────────────────────────
+    // accountmanager.js এর resetDemoBalance এর একই নিয়ম: $০.০১ – $১০,০০০
+    if (req.url === '/demo-reset') {
+      const a = parseFloat(body.amountUSD);
+      if (!isFinite(a)) return _demoSend(res, 400, { error: 'Invalid amount' });
+      const amt = Math.min(10000, Math.max(0.01, a));
+      await redisPub.set(DEMO_BAL_KEY(uid), String(amt));
+      return _demoSend(res, 200, { success: true, balance: amt });
+    }
+
+    return _demoSend(res, 404, { error: 'Not found' });
+  } catch (e) {
+    console.error('[demo] route error:', req.url, e.message);
+    return _demoSend(res, 500, { error: 'Server error' });
+  }
+}
+// ══════════════════ [DEMO SERVER] শেষ ══════════════════════════════
+
 http.createServer(async (req, res) => {
   // CORS — client fetch করতে পারবে
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+  // [DEMO SERVER] /demo-* — আলাদা পথ, live এর কোনো route ছোঁয় না
+  if (req.method === 'POST' && req.url && req.url.startsWith('/demo-')) { await _handleDemoRoute(req, res); return; }
 
   // ── GET / — health check ──────────────────────────────
   if (req.method === 'GET' && req.url === '/') {
