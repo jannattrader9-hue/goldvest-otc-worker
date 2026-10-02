@@ -3444,6 +3444,129 @@ http.createServer(async (req, res) => {
     return;
   }
 
+  // ══════════════════════════════════════════════════════════════════
+  // [DEPOSIT APPROVE] POST /admin-approve-deposit  { idToken, docId }
+  //
+  // আগে approve হতো admin এর browser থেকে, তিন ধাপে পরপর: request
+  // "approved", deposits লেখা, তারপর /admin-credit। শেষ ধাপ (credit)
+  // নেট/server এ ব্যর্থ হলে request approved থেকে যেত অথচ user টাকা পেত
+  // না — আর error গিলে ফেলায় কেউ জানতও না, আবার চেষ্টারও পথ ছিল না।
+  // অঙ্ক আর rate ও আসত browser থেকে (rate না পেলে বাঁধা ১২১.৫)।
+  //
+  // এখন সব এখানে, server এর তথ্যে:
+  //   ১. admin যাচাই (token.admin)
+  //   ২. request পড়া — approved হলে "আগেই হয়েছে", pending না হলে বাতিল
+  //   ৩. USD = accountAmount ÷ manualRates[accountCurrency] (server এর rate;
+  //      rate না থাকলে credit হয় না — আন্দাজে টাকা দেওয়া হয় না)
+  //   ৪. credit — Redis এ "এই request credit হয়েছে" চিহ্ন আর টাকা যোগ
+  //      একসাথে, এক ধাপে (Lua)। চিহ্ন থাকলে আর যোগ হয় না।
+  //   ৫. Firestore — request approved + deposits doc + totalDeposits,
+  //      একটা transaction এ। deposits doc এর নাম request থেকে বাঁধা,
+  //      তাই দুবার তৈরি হয় না।
+  //
+  // মাঝপথে যেকোনো ধাপ ব্যর্থ হলে request pending থেকে যায় — admin আবার
+  // Approve চাপলে বাকিটুকু হয়, কিন্তু টাকা কখনো দুবার যায় না (ধাপ ৪ এর
+  // চিহ্নের কারণে)।
+  // ══════════════════════════════════════════════════════════════════
+  if (req.method === 'POST' && req.url === '/admin-approve-deposit') {
+    try {
+      let body;
+      try { body = await _readBody(req); }
+      catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid body' })); return; }
+
+      const { idToken, docId } = body || {};
+      if (!idToken || !docId || typeof docId !== 'string' || docId.length > 200 || docId.includes('/')) {
+        res.writeHead(400); res.end(JSON.stringify({ error: 'Missing fields' })); return;
+      }
+      let decoded;
+      try { decoded = await admin.auth().verifyIdToken(idToken); }
+      catch(e) { res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
+      if (!decoded.admin) { res.writeHead(403); res.end(JSON.stringify({ error: 'Forbidden — admin only' })); return; }
+      if (!redisPub || !redisReady) { res.writeHead(503); res.end(JSON.stringify({ error: 'Redis not ready — try again' })); return; }
+
+      // ── ২. request ──
+      const reqRef  = firestore.collection('depositRequests').doc(docId);
+      const reqSnap = await reqRef.get();
+      if (!reqSnap.exists) { res.writeHead(404); res.end(JSON.stringify({ error: 'Deposit not found' })); return; }
+      const d = reqSnap.data();
+      if (d.status === 'approved') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, already: true })); return;
+      }
+      if (d.status !== 'pending') { res.writeHead(409); res.end(JSON.stringify({ error: 'Already processed' })); return; }
+
+      const uid = d.uid || d.userId;
+      const accountAmount   = Number(d.accountAmount || d.amount || 0);
+      const accountCurrency = d.accountCurrency || 'USD';
+      if (!uid || !(accountAmount > 0)) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid deposit data' })); return; }
+
+      // ── ৩. USD — server এর rate ──
+      let rate = 1;
+      if (accountCurrency !== 'USD') {
+        const cfgSnap = await firestore.collection('settings').doc('currency_config').get();
+        const r = cfgSnap.exists ? Number((cfgSnap.data().manualRates || {})[accountCurrency]) : NaN;
+        if (!isFinite(r) || r <= 0) {
+          res.writeHead(400); res.end(JSON.stringify({ error: `Exchange rate for ${accountCurrency} is not configured` })); return;
+        }
+        rate = r;
+      }
+      const creditUSD = Number((accountAmount / rate).toFixed(4));
+      if (!(creditUSD > 0)) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid amount' })); return; }
+
+      // ── ৪. credit — ঠিক একবার ──
+      const balKey = BAL_KEY_OTC(uid);
+      let startBal = '0';
+      if ((await redisPub.exists(balKey)) === 0) {
+        const us = await firestore.collection('users').doc(uid).get();
+        startBal = String(us.exists ? (us.data().liveBalance || 0) : 0);
+      }
+      const cr = await redisPub.eval(`
+        if redis.call('EXISTS', KEYS[1]) == 1 then
+          return {0, tostring(redis.call('GET', KEYS[2]) or '0')}
+        end
+        if redis.call('EXISTS', KEYS[2]) == 0 then redis.call('SET', KEYS[2], ARGV[2]) end
+        local nb = redis.call('INCRBYFLOAT', KEYS[2], tonumber(ARGV[1]))
+        redis.call('EXPIRE', KEYS[2], 3600)
+        redis.call('SET', KEYS[1], ARGV[1], 'EX', 7776000)
+        return {1, tostring(nb)}
+      `, 2, `gv:dep:credited:${docId}`, balKey, String(creditUSD), startBal);
+      const creditedNow = Number(cr && cr[0]) === 1;
+      await redisPub.set(`gv:bal:dirty:${uid}`, '1', 'EX', 3600);
+      console.log(`[approve-deposit] ${docId} uid=${uid} ${accountAmount} ${accountCurrency} → $${creditUSD} ${creditedNow ? 'credited' : 'আগেই credit হয়েছিল'} newBal=${cr && cr[1]}`);
+
+      // ── ৫. Firestore — একসাথে ──
+      const depRef  = firestore.collection('deposits').doc(`dep_${docId}`);
+      const userRef = firestore.collection('users').doc(uid);
+      const approvedBy = decoded.email || decoded.uid;
+      await firestore.runTransaction(async (tx) => {
+        const [rs, ds] = await Promise.all([tx.get(reqRef), tx.get(depRef)]);
+        if (!rs.exists || rs.data().status !== 'pending') return;   // অন্য কেউ এর মধ্যে শেষ করেছে
+        tx.update(reqRef, { status: 'approved', approvedAt: Date.now(), approvedBy, creditedUSD: creditUSD });
+        if (!ds.exists) {
+          tx.set(depRef, {
+            userId: uid, amount: accountAmount,
+            accountAmount, accountCurrency,
+            payableAmount:   d.payableAmount   || accountAmount,
+            payableCurrency: d.payableCurrency || accountCurrency,
+            method: d.method || 'Unknown', txHash: d.txHash || '',
+            senderAccount: d.senderAccount || '', status: 'approved',
+            approvedAt: Date.now(), approvedBy,
+            depositRequestId: docId, timestamp: d.timestamp || Date.now(),
+            creditedUSD: creditUSD,
+          });
+        }
+        tx.update(userRef, { totalDeposits: admin.firestore.FieldValue.increment(creditUSD) });
+      });
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, creditedUSD: creditUSD, newBalance: parseFloat(cr && cr[1]) }));
+    } catch(e) {
+      console.error('[approve-deposit] error:', e.message);
+      res.writeHead(500); res.end(JSON.stringify({ error: 'Internal error — try Approve again (no double credit)' }));
+    }
+    return;
+  }
+
   // ── POST /sell-trade ─────────────────────────────────────
   if (req.method === 'POST' && req.url === '/sell-trade') {
     try {
