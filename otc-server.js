@@ -924,6 +924,7 @@ function _pushCandleToRedis(id, candle) {
 
 function saveCandle(id, candle) {
   _pushCandleToRedis(id, candle);
+  _htfOnCandle(id, candle);   // [HTF CANDLES] বড় timeframe — switch বন্ধ থাকলে কিছুই করে না
   db.ref(`otc_candles/${id}/candles`).push(candle)
     .then(() => {
       console.log(`[${id}] candle close=${candle.close.toFixed(5)}`);
@@ -932,6 +933,141 @@ function saveCandle(id, candle) {
     })
     .catch(e => console.error(`[${id}] save failed:`, e.message));
 }
+
+// ══════════════════════════════════════════════════════════════════
+// [HTF CANDLES] বড় timeframe এর candle server এই বানিয়ে রাখা
+//
+// কেন: 5m…1d এর candle এতদিন ফোনে ১ মিনিটের candle জোড়া দিয়ে বানানো
+// হতো। কিন্তু Redis এ শুধু শেষ ৫০০টা ১ মিনিটের candle (~৮ ঘণ্টা) থাকে
+// — তাই 1d এ ১টা, 4h এ ২-৩টা candle আসত; পেছনে টানলে RTDB (আমেরিকা,
+// $১/GB) থেকে একটা একটা করে; আর দুই উৎসের জোড়ায় candle ভুল হতো।
+//
+// এখন: প্রতিটা ১ মিনিটের candle বন্ধ হলে (saveCandle) প্রতিটা বড়
+// timeframe এর চলমান candle হালনাগাদ হয়। bucket পেরোলে বন্ধ candle যায়
+// `gv:htf:{tf}:{id}` list এ (শেষ ৫০০টা), চলমান candle থাকে
+// `gv:htflive:{tf}:{id}` এ — restart এ হারায় না। ws-server সেখান থেকে
+// সরাসরি পাঠায়।
+//
+// bucket এর নিয়ম ফোনের _aggregate এর হুবহু একই: time = floor(t/tf)*tf
+// (1d = UTC ০০:০০), open = প্রথম, high = max, low = min, close = শেষ।
+//
+// প্রথম ভরা: প্রতিটা market এ প্রথম candle এলে একবার গত HTF_SEED_DAYS
+// দিনের (default ২) ১ মিনিটের candle RTDB থেকে এনে ভরা — সব market
+// মিলিয়ে ~১০MB, RTDB এর দৈনিক ফ্রি সীমার ভেতরে। market গুলো একটা একটা
+// করে, মাঝে বিরতি। শেষ হলে `gv:htf:seeded:{id}` চিহ্ন — আর কখনো না।
+// ভরা চলাকালীন আসা candle অপেক্ষায় থাকে, পরে ক্রমে যোগ হয়।
+//
+// একই মিনিট দুবার গোনা হয় না: প্রতিটা চলমান candle মনে রাখে শেষ কোন
+// মিনিট যোগ হয়েছে (lastMin); তার সমান বা আগের candle বাদ।
+//
+// kill switch: ENABLE_HTF_CANDLES=on না দিলে কিছুই চলে না। এখানে কোনো
+// error হলে শুধু log — দাম, candle সংরক্ষণ, settle কিছুই থামে না।
+// ══════════════════════════════════════════════════════════════════
+const HTF_ON        = (process.env.ENABLE_HTF_CANDLES || 'off').toLowerCase() === 'on';
+const HTF_SEED_DAYS = Math.max(0, Math.min(7, parseInt(process.env.HTF_SEED_DAYS || '2', 10) || 0));
+const HTF_MAX       = 500;
+const HTF_TFS       = { '2m': 120, '3m': 180, '5m': 300, '10m': 600, '15m': 900, '30m': 1800, '1h': 3600, '4h': 14400, '1d': 86400 };
+
+const _htfLive    = {};   // `${tf}:${id}` → চলমান candle (memory cache)
+const _htfChain   = {};   // id → promise — একটা market এর candle ক্রমে
+const _htfSeeded  = {};   // id → true (ভরা শেষ)
+const _htfPending = {};   // id → ভরা চলাকালীন আসা candle
+let   _htfSeedQ   = Promise.resolve();   // market গুলো একটা একটা করে ভরা
+
+function _htfNum(v) { const n = Number(v); return isFinite(n) ? n : null; }
+
+async function _htfGetLive(tf, id) {
+  const k = `${tf}:${id}`;
+  if (_htfLive[k] !== undefined) return _htfLive[k];
+  try {
+    const raw = await redisPub.get(`gv:htflive:${tf}:${id}`);
+    _htfLive[k] = raw ? JSON.parse(raw) : null;
+  } catch (e) { _htfLive[k] = null; }
+  return _htfLive[k];
+}
+
+// একটা ১ মিনিটের candle সব timeframe এ যোগ করা
+async function _htfApply(id, c) {
+  const t = _htfNum(c.time), o = _htfNum(c.open), h = _htfNum(c.high), l = _htfNum(c.low), cl = _htfNum(c.close);
+  if (t === null || o === null || h === null || l === null || cl === null) return;
+  const dec = _htfNum(c.decimals);
+
+  for (const tf of Object.keys(HTF_TFS)) {
+    const sec    = HTF_TFS[tf];
+    const bucket = Math.floor(t / sec) * sec;
+    let live     = await _htfGetLive(tf, id);
+    if (live && t <= live.lastMin) continue;            // আগেই গোনা হয়েছে
+
+    if (!live || bucket > live.time) {
+      if (live) {
+        const closed = { time: live.time, open: live.open, high: live.high, low: live.low, close: live.close };
+        if (live.decimals !== null && live.decimals !== undefined) closed.decimals = live.decimals;
+        const lk = `gv:htf:${tf}:${id}`;
+        await redisPub.multi().rpush(lk, JSON.stringify(closed)).ltrim(lk, -HTF_MAX, -1).exec();
+      }
+      live = { time: bucket, open: o, high: h, low: l, close: cl, decimals: dec, lastMin: t };
+    } else if (bucket === live.time) {
+      live.high = Math.max(live.high, h);
+      live.low  = Math.min(live.low, l);
+      live.close = cl;
+      if (dec !== null) live.decimals = dec;
+      live.lastMin = t;
+    } else {
+      continue;                                          // bucket এর আগের (দেরিতে আসা) — বাদ
+    }
+    _htfLive[`${tf}:${id}`] = live;
+    await redisPub.set(`gv:htflive:${tf}:${id}`, JSON.stringify(live));
+  }
+}
+
+// গত HTF_SEED_DAYS দিনের ১ মিনিটের candle RTDB থেকে এনে ভরা — একবারই
+async function _htfSeed(id) {
+  try {
+    if (HTF_SEED_DAYS > 0) {
+      const n = HTF_SEED_DAYS * 1440;
+      const t0 = Date.now();
+      const snap = await db.ref(`otc_candles/${id}/candles`).orderByKey().limitToLast(n).once('value');
+      const list = snap.exists() ? Object.values(snap.val()).filter(x => x && typeof x.time === 'number').sort((a, b) => a.time - b.time) : [];
+      for (const c of list) await _htfApply(id, c);
+      console.log(`[htf] ${id} প্রথম ভরা শেষ — ${list.length}টা ১ মিনিটের candle (${Date.now() - t0}ms)`);
+    }
+    const pend = (_htfPending[id] || []).sort((a, b) => a.time - b.time);
+    delete _htfPending[id];
+    for (const c of pend) await _htfApply(id, c);
+    await redisPub.set(`gv:htf:seeded:${id}`, '1');
+    _htfSeeded[id] = true;
+  } catch (e) {
+    console.error(`[htf] ${id} প্রথম ভরা ব্যর্থ — পরের candle এ আবার চেষ্টা:`, e.message);
+    _htfSeeded[id] = undefined;   // আবার চেষ্টা হবে; অপেক্ষার candle রেখে দিই
+  }
+}
+
+// saveCandle থেকে ডাকা — কখনো throw করে না
+function _htfOnCandle(id, candle) {
+  if (!HTF_ON || !redisReady || !candle) return;
+  _htfChain[id] = (_htfChain[id] || Promise.resolve()).then(async () => {
+    if (_htfSeeded[id] === true) { await _htfApply(id, candle); return; }
+
+    // ভরা শেষ না হওয়া পর্যন্ত candle অপেক্ষায় (সর্বোচ্চ ২০০)
+    (_htfPending[id] = _htfPending[id] || []).push(candle);
+    if (_htfPending[id].length > 200) _htfPending[id].shift();
+    if (_htfSeeded[id] === 'running') return;
+
+    if (await redisPub.get(`gv:htf:seeded:${id}`)) {     // আগের boot এ ভরা হয়ে গেছে
+      _htfSeeded[id] = true;
+      const pend = _htfPending[id].sort((a, b) => a.time - b.time);
+      delete _htfPending[id];
+      for (const c of pend) await _htfApply(id, c);
+      return;
+    }
+    _htfSeeded[id] = 'running';
+    _htfSeedQ = _htfSeedQ
+      .then(() => _htfSeed(id))
+      .then(() => new Promise(r => setTimeout(r, 2000)));  // market এর মাঝে বিরতি
+  }).catch(e => console.error(`[htf] ${id} error:`, e.message));
+}
+if (HTF_ON) console.log(`[htf] বড় timeframe candle চালু ✅ (seed ${HTF_SEED_DAYS} দিন)`);
+// ══════════════════ [HTF CANDLES] শেষ ══════════════════════════════
 
 // ══════════════════════════════════════════════════════════════════════
 // [BILL — VIEWER GATING] যে market কেউ দেখছে না, তার tick-by-tick RTDB
