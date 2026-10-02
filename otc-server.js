@@ -3714,6 +3714,14 @@ http.createServer(async (req, res) => {
       }
       const userId = decoded.uid;
 
+      // [NP FIX] সীমা — প্রতি user মিনিটে সর্বোচ্চ ৫টা payment তৈরি
+      if (redisPub && redisReady) {
+        const rlKey = `gv:np:rl:${userId}`;
+        const n = await redisPub.incr(rlKey);
+        if (n === 1) await redisPub.expire(rlKey, 60);
+        if (n > 5) { res.writeHead(429); res.end(JSON.stringify({ error: 'Too many requests — please wait a minute' })); return; }
+      }
+
       // NOWPayments — Create Payment
       const npRes = await fetch('https://api.nowpayments.io/v1/payment', {
         method: 'POST',
@@ -3795,7 +3803,10 @@ http.createServer(async (req, res) => {
       hmac.update(JSON.stringify(sortedBody));
       const expectedSig = hmac.digest('hex');
 
-      if (expectedSig !== receivedSig) {
+      // [NP FIX] সাধারণ !== তুলনা কত অক্ষর মিলল তার সময় ফাঁস করে — timingSafeEqual
+      const _a = Buffer.from(String(expectedSig), 'utf8');
+      const _b = Buffer.from(String(receivedSig), 'utf8');
+      if (_a.length !== _b.length || !crypto.timingSafeEqual(_a, _b)) {
         console.warn('[nowpayments-webhook] signature mismatch — possible forged request');
         res.writeHead(401); res.end('Invalid signature'); return;
       }
@@ -3809,63 +3820,85 @@ http.createServer(async (req, res) => {
 
       console.log(`[nowpayments-webhook] paymentId=${payment_id} status=${payment_status}`);
 
-      // শুধু 'finished' status এ balance credit করো
+      // ══════════════════════════════════════════════════════════════
+      // [NP FIX] credit — ঠিক একবার, crash হলেও হারায় না
+      //
+      // আগে: Firestore এ আগে 'finished' চিহ্ন, তারপর Redis এ টাকা। মাঝে
+      // server পড়ে গেলে payment 'finished' থাকত অথচ টাকা যোগ হতো না —
+      // NOWPayments আবার পাঠালেও "already processed" বলে বাদ পড়ত।
+      //
+      // এখন: Redis এ "এই payment credit হয়েছে" চিহ্ন আর টাকা যোগ একসাথে,
+      // এক ধাপে (Lua) — তারপর Firestore এ credited:true। মাঝে crash হলে
+      // NOWPayments এর পরের চেষ্টায় আবার চলে; Redis এর চিহ্ন থাকায় টাকা
+      // দ্বিতীয়বার যায় না, শুধু Firestore এর লেখাটা শেষ হয়।
+      //
+      // অঙ্ক নেওয়া হয় আমাদের নিজের record (amountUSD) থেকে — IPN এর
+      // price_amount শুধু record না থাকলে।
+      //
+      // পুরনো payment (এই বদলের আগে 'finished', credited চিহ্ন নেই) —
+      // পুরনো কোড সেগুলোতে টাকা দিয়ে দিয়েছে; আবার দেওয়া হয় না।
+      // ══════════════════════════════════════════════════════════════
+      const payDocRef = firestore.collection('cryptoPayments').doc(String(payment_id));
+      const paySnap   = await payDocRef.get();
+      if (!paySnap.exists) {
+        console.warn(`[nowpayments-webhook] paymentId=${payment_id} — no matching record found`);
+        res.writeHead(200); res.end('OK'); return;
+      }
+      const payData = paySnap.data();
+
       if (payment_status === 'finished') {
-        const payDocRef = firestore.collection('cryptoPayments').doc(String(payment_id));
-
-        // Transaction দিয়ে atomic check-and-mark — duplicate webhook race condition প্রতিরোধ করে
-        let shouldCredit = false;
-        let uid = null;
-        let creditAmt = 0;
-
-        await firestore.runTransaction(async (tx) => {
-          const payDoc = await tx.get(payDocRef);
-
-          if (!payDoc.exists) {
-            console.warn(`[nowpayments-webhook] paymentId=${payment_id} — no matching record found`);
-            return;
-          }
-
-          const payData = payDoc.data();
-
-          if (payData.status === 'finished') {
-            console.log(`[nowpayments-webhook] paymentId=${payment_id} already processed — skip`);
-            return;
-          }
-
-          uid = payData.uid;
-          creditAmt = parseFloat(price_amount) || payData.amountUSD;
-          shouldCredit = true;
-
-          // এখনই status 'finished' মার্ক করো — পরবর্তী duplicate webhook এই check এ আটকে যাবে
-          tx.update(payDocRef, {
-            status:         'finished',
-            creditedAmount: creditAmt,
-            finishedAt:     admin.firestore.FieldValue.serverTimestamp(),
-          });
-        });
-
-        if (shouldCredit && uid) {
-          // Redis এ USD credit (transaction এর বাইরে — Redis Firestore transaction এ অংশ নেয় না)
-          const balKey = BAL_KEY_OTC(uid);
-          let currentBal = await redisPub.get(balKey);
-          if (currentBal === null) {
-            const userSnap = await firestore.collection('users').doc(uid).get();
-            const bal = userSnap.exists ? (userSnap.data().liveBalance || 0) : 0;
-            await redisPub.set(balKey, bal.toString(), 'EX', 3600);
-          }
-
-          const newBal = await redisPub.incrbyfloat(balKey, creditAmt);
-          await redisPub.expire(balKey, 3600);
-          await redisPub.set(`gv:bal:dirty:${uid}`, '1', 'EX', 3600);
-
-          console.log(`[nowpayments-webhook] uid=${uid} paymentId=${payment_id} credited=${creditAmt} newBal=${newBal}`);
+        if (payData.credited === true || (payData.status === 'finished' && payData.credited === undefined)) {
+          console.log(`[nowpayments-webhook] paymentId=${payment_id} already credited — skip`);
+          res.writeHead(200); res.end('OK'); return;
         }
+        const uid       = payData.uid;
+        const creditAmt = Number(payData.amountUSD) > 0 ? Number(payData.amountUSD) : parseFloat(price_amount);
+        if (!uid || !(creditAmt > 0)) {
+          console.error(`[nowpayments-webhook] paymentId=${payment_id} — invalid uid/amount, not credited`);
+          res.writeHead(200); res.end('OK'); return;
+        }
+        if (!redisPub || !redisReady) { res.writeHead(503); res.end('Redis not ready'); return; }   // NOWPayments আবার পাঠাবে
 
-      } else {
-        // অন্য status (waiting, confirming, partially_paid, failed, expired) — শুধু log/track করো
-        const payDocRef = firestore.collection('cryptoPayments').doc(String(payment_id));
-        await payDocRef.update({ status: payment_status || 'unknown' }).catch(() => {});
+        const balKey = BAL_KEY_OTC(uid);
+        let startBal = '0';
+        if ((await redisPub.exists(balKey)) === 0) {
+          const userSnap = await firestore.collection('users').doc(uid).get();
+          startBal = String(userSnap.exists ? (userSnap.data().liveBalance || 0) : 0);
+        }
+        const cr = await redisPub.eval(`
+          if redis.call('EXISTS', KEYS[1]) == 1 then
+            return {0, tostring(redis.call('GET', KEYS[2]) or '0')}
+          end
+          if redis.call('EXISTS', KEYS[2]) == 0 then redis.call('SET', KEYS[2], ARGV[2]) end
+          local nb = redis.call('INCRBYFLOAT', KEYS[2], tonumber(ARGV[1]))
+          redis.call('EXPIRE', KEYS[2], 3600)
+          redis.call('SET', KEYS[1], ARGV[1], 'EX', 7776000)
+          return {1, tostring(nb)}
+        `, 2, `gv:np:credited:${payment_id}`, balKey, String(creditAmt), startBal);
+        await redisPub.set(`gv:bal:dirty:${uid}`, '1', 'EX', 3600);
+
+        await payDocRef.update({
+          status:         'finished',
+          credited:       true,
+          creditedAmount: creditAmt,
+          finishedAt:     admin.firestore.FieldValue.serverTimestamp(),
+        });
+        console.log(`[nowpayments-webhook] uid=${uid} paymentId=${payment_id} ${Number(cr && cr[0]) === 1 ? 'credited' : 'আগেই credit হয়েছিল'}=${creditAmt} newBal=${cr && cr[1]}`);
+
+      } else if (payData.status !== 'finished') {
+        // অন্য status (waiting, confirming, partially_paid, failed, expired) —
+        // শুধু হালনাগাদ। 'finished' হয়ে যাওয়া payment কে দেরিতে আসা পুরনো
+        // status আর নামিয়ে দেয় না।
+        const upd = { status: payment_status || 'unknown' };
+        // [NP FIX] কম পাঠানো — টাকা আটকে থাকে, admin কে জানাতে চিহ্ন
+        if (payment_status === 'partially_paid') {
+          upd.needsReview  = true;
+          upd.actuallyPaid = body.actually_paid !== undefined ? body.actually_paid : null;
+          upd.payAmount    = body.pay_amount    !== undefined ? body.pay_amount    : null;
+          upd.payCurrency  = body.pay_currency  || null;
+          console.warn(`[nowpayments-webhook] paymentId=${payment_id} PARTIALLY PAID — ${upd.actuallyPaid}/${upd.payAmount} ${upd.payCurrency} — admin review দরকার`);
+        }
+        await payDocRef.update(upd).catch(() => {});
       }
 
       res.writeHead(200); res.end('OK');
