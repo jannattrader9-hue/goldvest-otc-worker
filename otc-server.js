@@ -3846,17 +3846,48 @@ http.createServer(async (req, res) => {
       }
       const payData = paySnap.data();
 
-      if (payment_status === 'finished') {
-        if (payData.credited === true || (payData.status === 'finished' && payData.credited === undefined)) {
-          console.log(`[nowpayments-webhook] paymentId=${payment_id} already credited — skip`);
+      // ══════════════════════════════════════════════════════════════
+      // [NP AMOUNT] যতটা আসলে এসেছে, ততটাই credit
+      //
+      // সমস্যা: Binance এর মতো exchange network fee পাঠানো অঙ্ক থেকেই কাটে
+      // — user দেখানো অঙ্ক হুবহু লিখলেও ০.০১ কম পৌঁছায় → "partially_paid"
+      // → আগে কিছুই credit হতো না। আবার বেশি পাঠালে বাড়তিটা হারাত।
+      //
+      // এখন: ratio = এসেছে (actually_paid) ÷ আসার কথা (pay_amount)
+      //   • ratio ≥ ০.৯৮        → পুরো অঙ্ক (২% পর্যন্ত ঘাটতি = network fee)
+      //   • ০ < ratio < ০.৯৮   → আনুপাতিক (amountUSD × ratio)
+      //   • ratio > ১           → বাড়তিসহ, সর্বোচ্চ ২ গুণ পর্যন্ত
+      //   • ২% এর বেশি ঘাটতি বা ৫০% এর বেশি বাড়তি → needsReview (admin দেখবে)
+      //
+      // credit হয় "এ পর্যন্ত মোট" হিসেবে: আগে আংশিক credit হয়ে থাকলে
+      // শুধু বাকিটুকু যোগ হয় — user পরে বাকি টাকা পাঠালেও (partially →
+      // finished) দুবার যায় না, কমও যায় না।
+      // ══════════════════════════════════════════════════════════════
+      const _creditable = payment_status === 'finished' || payment_status === 'partially_paid';
+      if (_creditable) {
+        // পুরনো payment (এই বদলের আগে 'finished', credited চিহ্ন নেই) — আবার না
+        if (payData.status === 'finished' && payData.credited === undefined) {
+          console.log(`[nowpayments-webhook] paymentId=${payment_id} legacy finished — skip`);
           res.writeHead(200); res.end('OK'); return;
         }
-        const uid       = payData.uid;
-        const creditAmt = Number(payData.amountUSD) > 0 ? Number(payData.amountUSD) : parseFloat(price_amount);
-        if (!uid || !(creditAmt > 0)) {
-          console.error(`[nowpayments-webhook] paymentId=${payment_id} — invalid uid/amount, not credited`);
+        const uid     = payData.uid;
+        const baseUSD = Number(payData.amountUSD) > 0 ? Number(payData.amountUSD) : parseFloat(price_amount);
+        const paid    = parseFloat(body.actually_paid);
+        const due     = parseFloat(body.pay_amount) || parseFloat(payData.payAmount);
+        let ratio;
+        if (isFinite(paid) && paid > 0 && isFinite(due) && due > 0) ratio = paid / due;
+        else ratio = payment_status === 'finished' ? 1 : null;   // তথ্য নেই: finished = পুরো, partial = অজানা
+
+        if (!uid || !(baseUSD > 0) || ratio === null) {
+          await payDocRef.update({ status: payment_status, needsReview: true }).catch(() => {});
+          console.error(`[nowpayments-webhook] paymentId=${payment_id} — uid/amount/ratio অজানা, credit হয়নি, admin review`);
           res.writeHead(200); res.end('OK'); return;
         }
+
+        const effRatio  = ratio >= 0.98 ? Math.max(1, Math.min(ratio, 2)) : ratio;
+        const targetUSD = Number((baseUSD * effRatio).toFixed(4));
+        const review    = ratio < 0.98 || ratio > 1.5;
+
         if (!redisPub || !redisReady) { res.writeHead(503); res.end('Redis not ready'); return; }   // NOWPayments আবার পাঠাবে
 
         const balKey = BAL_KEY_OTC(uid);
@@ -3865,40 +3896,44 @@ http.createServer(async (req, res) => {
           const userSnap = await firestore.collection('users').doc(uid).get();
           startBal = String(userSnap.exists ? (userSnap.data().liveBalance || 0) : 0);
         }
+        // KEYS[1] = এ পর্যন্ত কত credit হয়েছে; শুধু (লক্ষ্য − আগে দেওয়া) যোগ হয়
         const cr = await redisPub.eval(`
-          if redis.call('EXISTS', KEYS[1]) == 1 then
-            return {0, tostring(redis.call('GET', KEYS[2]) or '0')}
+          local done  = tonumber(redis.call('GET', KEYS[1]) or '0')
+          local delta = tonumber(ARGV[1]) - done
+          if delta <= 0.0001 then
+            return {'0', tostring(redis.call('GET', KEYS[2]) or '0'), tostring(done)}
           end
           if redis.call('EXISTS', KEYS[2]) == 0 then redis.call('SET', KEYS[2], ARGV[2]) end
-          local nb = redis.call('INCRBYFLOAT', KEYS[2], tonumber(ARGV[1]))
+          local nb = redis.call('INCRBYFLOAT', KEYS[2], delta)
           redis.call('EXPIRE', KEYS[2], 3600)
           redis.call('SET', KEYS[1], ARGV[1], 'EX', 7776000)
-          return {1, tostring(nb)}
-        `, 2, `gv:np:credited:${payment_id}`, balKey, String(creditAmt), startBal);
-        await redisPub.set(`gv:bal:dirty:${uid}`, '1', 'EX', 3600);
+          return {tostring(delta), tostring(nb), ARGV[1]}
+        `, 2, `gv:np:credited:${payment_id}`, balKey, String(targetUSD), startBal);
+        const delta = parseFloat(cr && cr[0]) || 0;
+        if (delta > 0) await redisPub.set(`gv:bal:dirty:${uid}`, '1', 'EX', 3600);
 
-        await payDocRef.update({
-          status:         'finished',
+        const upd = {
+          status:         payment_status,
           credited:       true,
-          creditedAmount: creditAmt,
-          finishedAt:     admin.firestore.FieldValue.serverTimestamp(),
-        });
-        console.log(`[nowpayments-webhook] uid=${uid} paymentId=${payment_id} ${Number(cr && cr[0]) === 1 ? 'credited' : 'আগেই credit হয়েছিল'}=${creditAmt} newBal=${cr && cr[1]}`);
+          creditedAmount: parseFloat(cr && cr[2]) || targetUSD,
+          paidRatio:      Number(ratio.toFixed(4)),
+          actuallyPaid:   isFinite(paid) ? paid : null,
+          payAmount:      isFinite(due)  ? due  : null,
+          payCurrency:    body.pay_currency || payData.payCurrency || null,
+          creditedAt:     admin.firestore.FieldValue.serverTimestamp(),
+        };
+        if (review) upd.needsReview = true;
+        if (payment_status === 'finished') upd.finishedAt = admin.firestore.FieldValue.serverTimestamp();
+        await payDocRef.update(upd);
+
+        console.log(`[nowpayments-webhook] uid=${uid} paymentId=${payment_id} status=${payment_status} ratio=${ratio.toFixed(4)} target=$${targetUSD} +$${delta} newBal=${cr && cr[1]}${review ? ' — REVIEW' : ''}`);
 
       } else if (payData.status !== 'finished') {
-        // অন্য status (waiting, confirming, partially_paid, failed, expired) —
+        // অন্য status (waiting, confirming, sending, failed, expired) —
         // শুধু হালনাগাদ। 'finished' হয়ে যাওয়া payment কে দেরিতে আসা পুরনো
         // status আর নামিয়ে দেয় না।
-        const upd = { status: payment_status || 'unknown' };
-        // [NP FIX] কম পাঠানো — টাকা আটকে থাকে, admin কে জানাতে চিহ্ন
-        if (payment_status === 'partially_paid') {
-          upd.needsReview  = true;
-          upd.actuallyPaid = body.actually_paid !== undefined ? body.actually_paid : null;
-          upd.payAmount    = body.pay_amount    !== undefined ? body.pay_amount    : null;
-          upd.payCurrency  = body.pay_currency  || null;
-          console.warn(`[nowpayments-webhook] paymentId=${payment_id} PARTIALLY PAID — ${upd.actuallyPaid}/${upd.payAmount} ${upd.payCurrency} — admin review দরকার`);
-        }
-        await payDocRef.update(upd).catch(() => {});
+        // (partially_paid এখন উপরে আনুপাতিক credit পায়)
+        await payDocRef.update({ status: payment_status || 'unknown' }).catch(() => {});
       }
 
       res.writeHead(200); res.end('OK');
