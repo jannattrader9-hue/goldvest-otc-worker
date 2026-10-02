@@ -3839,12 +3839,62 @@ http.createServer(async (req, res) => {
       // পুরনো কোড সেগুলোতে টাকা দিয়ে দিয়েছে; আবার দেওয়া হয় না।
       // ══════════════════════════════════════════════════════════════
       const payDocRef = firestore.collection('cryptoPayments').doc(String(payment_id));
-      const paySnap   = await payDocRef.get();
+      let   paySnap   = await payDocRef.get();
+
+      // ══════════════════════════════════════════════════════════════
+      // [NP CHILD] একই ঠিকানায় দ্বিতীয়বার পাঠানো / ভুল coin পাঠানো
+      //
+      // NOWPayments তখন নতুন payment_id বানায়, সাথে parent_payment_id
+      // (মূল payment) পাঠায়। আমাদের কাছে নতুন ID এর record থাকে না —
+      // আগে "no matching record" বলে বাদ পড়ত, user টাকা পেত না।
+      //
+      // এখন মূল payment থেকে user খুঁজে নতুন ID এর record বানাই:
+      //   • stablecoin (USDT/USDC/DAI/TUSD…), মূলটার মতোই coin →
+      //     এসেছে যত, তত USD (১ stablecoin ≈ $১) — নিচের সাধারণ পথে
+      //     credit হয় (ঠিক একবার, আগের মতোই)
+      //   • অন্য coin (BTC, ETH…) বা coin বদলে গেছে → দাম ওঠানামা করে,
+      //     আন্দাজে credit না — needsReview, admin দেখে হাতে দেবে
+      // ══════════════════════════════════════════════════════════════
+      if (!paySnap.exists && body.parent_payment_id) {
+        const parentSnap = await firestore.collection('cryptoPayments').doc(String(body.parent_payment_id)).get();
+        if (parentSnap.exists) {
+          const parent   = parentSnap.data();
+          const childCur = String(body.pay_currency || '').toLowerCase();
+          const parCur   = String(parent.payCurrency || '').toLowerCase();
+          const isStable = /^(usdt|usdc|dai|tusd|busd|usdp|fdusd)/.test(childCur);
+          const paidNow  = parseFloat(body.actually_paid);
+          const auto     = isStable && childCur === parCur;
+          const rec = {
+            uid:             parent.uid,
+            parentPaymentId: String(body.parent_payment_id),
+            payCurrency:     childCur || null,
+            status:          payment_status || 'waiting',
+            isChild:         true,
+            autoStable:      auto,   // true হলে অঙ্ক প্রতিবার IPN এর actually_paid থেকে
+            createdAt:       admin.firestore.FieldValue.serverTimestamp(),
+          };
+          if (!auto) {
+            rec.needsReview  = true;
+            rec.reviewReason = 'different coin';
+            rec.actuallyPaid = isFinite(paidNow) ? paidNow : null;
+          }
+          await payDocRef.set(rec, { merge: true });
+          console.warn(`[nowpayments-webhook] paymentId=${payment_id} CHILD of ${body.parent_payment_id} uid=${parent.uid} ${childCur} paid=${paidNow} ${auto ? 'auto-credit' : 'ADMIN REVIEW'}`);
+          if (!auto) { res.writeHead(200); res.end('OK'); return; }
+          paySnap = await payDocRef.get();
+        }
+      }
+
       if (!paySnap.exists) {
         console.warn(`[nowpayments-webhook] paymentId=${payment_id} — no matching record found`);
         res.writeHead(200); res.end('OK'); return;
       }
       const payData = paySnap.data();
+      // [NP CHILD] admin review এর অপেক্ষায় থাকা child — নিজে থেকে credit না
+      if (payData.isChild && !payData.autoStable) {
+        await payDocRef.update({ status: payment_status || payData.status }).catch(() => {});
+        res.writeHead(200); res.end('OK'); return;
+      }
 
       // ══════════════════════════════════════════════════════════════
       // [NP AMOUNT] যতটা আসলে এসেছে, ততটাই credit
@@ -3871,9 +3921,13 @@ http.createServer(async (req, res) => {
           res.writeHead(200); res.end('OK'); return;
         }
         const uid     = payData.uid;
-        const baseUSD = Number(payData.amountUSD) > 0 ? Number(payData.amountUSD) : parseFloat(price_amount);
         const paid    = parseFloat(body.actually_paid);
-        const due     = parseFloat(body.pay_amount) || parseFloat(payData.payAmount);
+        // [NP CHILD] stablecoin child — চাওয়া অঙ্ক নেই; যা এসেছে সেটাই USD (ratio ১)
+        const _child  = payData.isChild && payData.autoStable;
+        const baseUSD = _child ? paid
+                      : (Number(payData.amountUSD) > 0 ? Number(payData.amountUSD) : parseFloat(price_amount));
+        const due     = _child ? paid
+                      : (parseFloat(body.pay_amount) || parseFloat(payData.payAmount));
         let ratio;
         if (isFinite(paid) && paid > 0 && isFinite(due) && due > 0) ratio = paid / due;
         else ratio = payment_status === 'finished' ? 1 : null;   // তথ্য নেই: finished = পুরো, partial = অজানা
