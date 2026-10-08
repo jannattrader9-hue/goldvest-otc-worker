@@ -58,6 +58,11 @@ const CFG = {
   bias:    num(process.env.ENG_BIAS,     0.008),     // trend পক্ষপাত
   session: num(process.env.ENG_SESSION,  0.55),     // দিনের ছন্দ
   maxStep: num(process.env.ENG_MAX_STEP, 0.0015),   // safety ±০.১৫%/tick
+  // [STEP %] পায়ের এক "একক" = দাম × step। আগে এক একক ছিল ১ pip — তাই
+  // ছোট দাম + বেশি দশমিকের market এ (INR/USD, MXN/USD, AUD/USD…) candle
+  // আসলের চেয়ে ৫-১০০ গুণ বড় হতো, আর বড় দামের market এ ছোট। এখন সব
+  // market এ candle এর মাপ দামের অনুপাতে একই রকম।
+  step:    num(process.env.ENG_STEP,     0.0000025),
 
   // [REFERENCE ANCHOR] দাম সময়ের সাথে real-world থেকে দূরে সরে না যায়
   // তার জন্য মৃদু, দীর্ঘমেয়াদী টান। কাছাকাছি (anchorBand এর মধ্যে)
@@ -157,7 +162,14 @@ function nextPrice(st, now = Date.now(), over) {
   mag *= Math.min(Math.max(scale, 0.1), 5);   // নিরাপত্তা সীমা
 
   const pip = Math.pow(10, -st.decimals);
-  let delta = dir * pip * mag;
+  /* [STEP %] পা = mag একক × (দাম × step), তারপর pip এ রূপান্তর।
+     ভগ্নাংশ pip ভারসাম্য রেখে গোল (যেমন ০.৪ pip → ৪০% বার ১ pip, বাকি
+     সময় ০) — গড় ঠিক থাকে, কোনো দিকে ঝোঁক তৈরি হয় না। ০ মানে এই
+     tick এ দাম নড়ল না (আসল বাজারেও এমন হয়)। */
+  const pipsF = mag * (st.price * CFG.step) / pip;
+  let pips = Math.floor(pipsF);
+  if (Math.random() < pipsF - pips) pips++;
+  let delta = dir * pip * pips;
 
   /* ── [REFERENCE ANCHOR] দূরে সরে গেলে মৃদু টান — অপরিবর্তিত রাখা
      হলো, real-world price থেকে বেশি দূরে সরে না যাওয়ার নিরাপত্তার
@@ -177,6 +189,11 @@ function nextPrice(st, now = Date.now(), over) {
       delta += Math.sign(want) * Math.min(Math.abs(want), cap);
     }
   }
+
+  /* [MAX STEP] ±০.১৫%/tick এর সীমা — এতদিন ঘোষণা করা ছিল, কিন্তু
+     কোথাও প্রয়োগ হতো না */
+  const lim = st.price * CFG.maxStep;
+  if (Math.abs(delta) > lim) delta = Math.sign(delta) * Math.max(pip, Math.floor(lim / pip) * pip);
 
   st.price = Math.max(st.price + delta, 1e-8);
   st.price = Number(st.price.toFixed(st.decimals));
@@ -210,4 +227,3 @@ function nextDelay(st, over) {
 
 
 module.exports = { createState, nextPrice, nextDelay, sessionMul, CFG };
-
