@@ -62,13 +62,12 @@ const CFG = {
   // ছোট দাম + বেশি দশমিকের market এ (INR/USD, MXN/USD, AUD/USD…) candle
   // আসলের চেয়ে ৫-১০০ গুণ বড় হতো, আর বড় দামের market এ ছোট। এখন সব
   // market এ candle এর মাপ দামের অনুপাতে একই রকম।
-  // [TICK 500ms] tick এর ফাঁক আগের দ্বিগুণ ঘন (গড় ~১০৩০ms → ~৫০০ms),
-  // তাই প্রতি মিনিটে tick ~৬৩ → ~১২০। candle এর মাপ একই রাখতে পা
-  // √(৬৩/১২০) ≈ ০.৭৩ গুণ ছোট: ০.০০০০০২৫ → ০.০০০০০১৮ (১ মিনিটে ~০.০৩%)।
-  step:    num(process.env.ENG_STEP,     0.0000018),
-  // tick এর ফাঁক (ms) — Pocket Option মাপা: প্রায় নিয়মিত ~৫০০ms
-  delayMin: num(process.env.ENG_DELAY_MIN, 450),
-  delayMax: num(process.env.ENG_DELAY_MAX, 550),
+  // [TICK 600ms] tick এর ফাঁক গড় ~৬০০ms (৫৫০-৬৫০) — ৫০০ms সংস্করণের
+  // চেয়ে একটু ধীর। প্রতি মিনিটে tick ~১০০। candle এর মাপ একই (১ মিনিটে
+  // ~০.০৩%) রাখতে পা = ০.০০০০০২৫ × √(৬৩/১০০) ≈ ০.০০০০০২।
+  step:    num(process.env.ENG_STEP,     0.000002),
+  delayMin: num(process.env.ENG_DELAY_MIN, 550),
+  delayMax: num(process.env.ENG_DELAY_MAX, 650),
 
   // [REFERENCE ANCHOR] দাম সময়ের সাথে real-world থেকে দূরে সরে না যায়
   // তার জন্য মৃদু, দীর্ঘমেয়াদী টান। কাছাকাছি (anchorBand এর মধ্যে)
@@ -227,10 +226,10 @@ function nextDelay(st, over) {
   // কখনো interrupt হয় না (animation compromise হওয়ার সুযোগই নেই)।
   // দিক-নির্বাচন (nextPrice এর ৫০/৫০) এখানে অপরিবর্তিত — তাই সব
   // expiry তেই দাম আগের মতোই সম্পূর্ণ unpredictable থাকে।
-  // [TICK 500ms] আগে ৫৫০-১৩৫০ms (গড় ~১০৩০, অনিয়মিত) — chart এর glide
+  // [TICK 600ms] আগে ৫৫০-১৩৫০ms (গড় ~১০৩০, অনিয়মিত) — chart এর glide
   // ~২৮০ms এ শেষ হয়ে বাকি সময় স্থির থাকত, তাই চলা ভারী আর এলোমেলো
-  // লাগত। এখন Pocket Option এর মতো প্রায় নিয়মিত ~৫০০ms।
-  // সর্বনিম্ন ফাঁক (৪৫০ms) এখনো glide (~২৮০ms) এর চেয়ে বড় — glide
+  // লাগত। এখন প্রায় নিয়মিত ~৬০০ms (৫৫০-৬৫০)।
+  // সর্বনিম্ন ফাঁক (৫৫০ms) glide (~২৮০ms) এর চেয়ে বড় — glide
   // মাঝপথে কাটা পড়ে না। দিক-নির্বাচন (৫০/৫০) অপরিবর্তিত।
   return CFG.delayMin + Math.random() * (CFG.delayMax - CFG.delayMin);
 }
