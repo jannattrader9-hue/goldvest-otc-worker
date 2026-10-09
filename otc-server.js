@@ -2112,6 +2112,17 @@ function tickOTC(id) {
         state.price = snapped;
         state._eng.price = snapped;
         state.candleOpen = state.candleHigh = state.candleLow = snapped;
+        // [BREAKER] এই reference fetch async — ততক্ষণে প্রথম কয়েকটা tick
+        // পুরনো দামে breaker এর জানালায় ঢুকে গেছে। তারপর এই ইচ্ছাকৃত লাফকে
+        // breaker "১০ মিনিটে ৮-১০% সরা" ভেবে market pause করে দিত (deploy
+        // এর পর USD/ARS, USD/CHF ঠিক এভাবেই)। লাফটা আমাদের নিজেদের সংশোধন,
+        // অস্বাভাবিকতা নয় — তাই জানালা নতুন দাম থেকে আবার শুরু।
+        const bk = _breaker[id];
+        if (bk && !bk.paused) {
+          bk.buf = [];
+          bk.lastPrice  = snapped;
+          bk.lastMoveAt = bk.lastTickAt = Date.now();
+        }
       }
     }).catch(() => {});
     state._refRefreshAt = Date.now() + 3600000;   // ১ ঘণ্টা পর হালকা refresh
