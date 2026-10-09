@@ -1715,6 +1715,10 @@ const _MARKET_DECIMALS = {
   USDCADOTC: 5, USDCHFOTC: 5, USDCOPOTC: 2, USDEGPOTC: 4,
   USDIDROTC: 2, USDJPYOTC: 3, USDNGNOTC: 2, USDPHPOTC: 4,
   USDPKROTC: 3,
+  // [USD/INR, USD/MXN — সঠিক দিকে] পুরনো INRUSDOTC/MXNUSDOTC আসলে উল্টো
+  // (INR/USD ≈ ০.০১১) ছিল — এত ছোট দামে ৫ ঘরে পা এক pip ও হতো না, তাই
+  // দাম ৩০s+ জমে থাকত। সঠিক দিকে দাম ~৮৮ / ~১৮, তাই স্বাভাবিক নড়ে।
+  USDINROTC: 3, USDMXNOTC: 4,
 
   // ── Binance feed (real crypto) ────────────────────────────────
   // এগুলোর দাম Binance থেকে আসে, তাই ঘরও Binance এর tickSize
@@ -1804,6 +1808,7 @@ const _OTC_PAIR_MAP = {
   USDIDROTC: ['USD', 'IDR'], USDJPYOTC: ['USD', 'JPY'],
   USDNGNOTC: ['USD', 'NGN'], USDPHPOTC: ['USD', 'PHP'],
   USDPKROTC: ['USD', 'PKR'],
+  USDINROTC: ['USD', 'INR'], USDMXNOTC: ['USD', 'MXN'],
   USDTBDT:   ['USD', 'BDT'],
 };
 
@@ -3275,7 +3280,7 @@ http.createServer(async (req, res) => {
       const newBal = newBalance;
       await redisPub.set(`gv:bal:dirty:${userId}`, '1', 'EX', 3600);
 
-      console.log(`[place-trade] userId=${userId} tradeId=${tradeId} amount=${amount} newBal=${newBal} reservationId=${reservationId}`);
+      console.log(`[place-trade] ${trade.symbol} userId=${userId} tradeId=${tradeId} amount=${amount} newBal=${newBal} reservationId=${reservationId}`);   // [LOG] symbol যোগ — কোন market এর trade, log এ খুঁজে পাওয়া যায়
 
       // 4. Redis Hash এ trade data save — settler <1ms এ পাবে
       await redisPub.hset(TRADE_KEY_OTC(tradeId),
