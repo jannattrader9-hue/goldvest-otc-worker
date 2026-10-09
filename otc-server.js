@@ -2573,6 +2573,15 @@ function watchFirestoreMarkets() {
           _breakerReset(id);
           console.log(`[BREAKER] ${id} RESUMED via markets doc (admin)`);
         }
+        // [BREAKER RESTORE] server restart/deploy এর পর মেমোরি খালি হয়ে যায়,
+        // অথচ Firestore এ এখনো paused — তখন /place-trade ট্রেড নিয়ে নিত।
+        // Firestore এর অবস্থাই সত্য: আবার paused ধরে নিই।
+        if (data.tradingPaused === true && !_breakerPaused.has(id)) {
+          const b = _breaker[id] || (_breaker[id] = { buf: [] });
+          b.paused = true; b.reason = data.pauseReason || 'restored from Firestore'; b.since = Date.now();
+          _breakerPaused.add(id);
+          console.warn(`[BREAKER] ${id} pause restored from markets doc`);
+        }
         if (data.visible === false) { stopSymbol(id); return; }
         if (data.feed === 'twelvedata') await initForex(id);
         else if (data.otc || data.feed === 'otc-engine' || data.feed === 'usdtbdt-engine')
@@ -2895,6 +2904,11 @@ async function _handleDemoRoute(req, res) {
       if (!/^[A-Za-z0-9_-]{4,64}$/.test(tid) || (type !== 'up' && type !== 'down') ||
           !isFinite(amount) || amount <= 0 || amount > 1e9 || !payout) {
         return _demoSend(res, 400, { error: 'Invalid trade data' });
+      }
+      // [BREAKER] paused market এ demo ট্রেডও নয় (live এর মতোই)। 200 দিই কারণ
+      // demoServerPost non-2xx পেলে null (নেট সমস্যা) ধরতে পারে।
+      if (_breakerPaused.has(symbol)) {
+        return _demoSend(res, 200, { error: 'market_paused', message: 'This market is temporarily unavailable. Please try again shortly.' });
       }
       // এই server এ যে market চলে না, সেখানে client আগের পথে যাবে
       if (tickHistory.getHistorySize(symbol) === 0) {
