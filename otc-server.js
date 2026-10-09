@@ -25,6 +25,141 @@ const firestore = admin.firestore();
 
 const MODE_B_ENABLED = (process.env.ENABLE_MODE_B || 'on').toLowerCase() !== 'off';
 
+// ══════════════════════════════════════════════════════════════════════
+// [CIRCUIT BREAKER] অস্বাভাবিক market নিজে থেকে ধরা → নতুন ট্রেড বন্ধ +
+// admin কে জানানো। পুরোটাই server এর মেমোরিতে চলে (কোনো Firestore read
+// নেই), তাই খরচ প্রায় শূন্য। শুধু auto মোডে — manual/Mode B তে দাম ইচ্ছা
+// করেই একদিকে যায়, তখন পাহারা বন্ধ (নইলে ভুল সংকেত আসত)।
+//
+// তিনটা পাহারা, যেকোনোটা হলেই ওই market pause:
+//   ১. দূরত্ব  — শেষ ১০ মিনিটে দাম নিজের স্বাভাবিকের ৪ গুণের বেশি সরলে
+//               (crash, spike, একটানা একদিকে চলা — সব এতে ধরা পড়ে)
+//   ২. জমে যাওয়া — ৩০ সেকেন্ড দাম একটুও না নড়লে (feed/engine আটকে গেছে)
+//   ৩. tick-খরা — ৯০ সেকেন্ডে একটাও tick না এলে (engine থেমে গেছে)
+//
+// সব সীমা Railway env দিয়ে বদলানো যায়; BREAKER_ENABLED=off এ পুরো বন্ধ।
+// ══════════════════════════════════════════════════════════════════════
+const BREAKER_ENABLED  = (process.env.BREAKER_ENABLED || 'on').toLowerCase() !== 'off';
+const BREAKER_WINDOW_MS= (parseInt(process.env.BREAKER_WINDOW_SEC) || 600) * 1000;  // ১০ মিনিট
+const BREAKER_MULT     = parseFloat(process.env.BREAKER_MULTIPLIER) || 4;           // স্বাভাবিকের ×৪
+const BREAKER_STALL_MS = (parseInt(process.env.BREAKER_STALL_SEC) || 30) * 1000;    // দাম না নড়া
+const BREAKER_NOTICK_MS= (parseInt(process.env.BREAKER_NOTICK_SEC) || 90) * 1000;   // tick-খরা
+
+// প্রতি market এর স্বাভাবিক ১০-মিনিট সরা (%) — engine-test এ মাপা সর্বোচ্চের
+// কাছাকাছি, একটু উপরে রাখা। তালিকায় না থাকা market এ কড়া ডিফল্ট (০.৪%)
+// ব্যবহার হয়, তাই নতুন market (যেমন USD/BDT) ভুলে বাদ পড়লেও পাহারায় থাকে।
+const _BREAKER_NORMAL_PCT = {
+  INRUSDOTC: 1.6, MXNUSDOTC: 0.75,
+  // বাকি সব সাধারণ market ~০.৩৫% — ডিফল্টেই ধরা পড়ে, আলাদা লেখার দরকার নেই
+};
+const _BREAKER_DEFAULT_PCT = 0.4;
+function _breakerLimitPct(id) {
+  return (_BREAKER_NORMAL_PCT[id] || _BREAKER_DEFAULT_PCT) * BREAKER_MULT;
+}
+
+// market → { buf:[{t,p}], lastMoveAt, lastTickAt, paused, reason, since }
+const _breaker = {};
+const _breakerPaused = new Set();   // দ্রুত দেখার জন্য — /place-trade এটাই দেখে
+
+function _breakerReset(id) { delete _breaker[id]; _breakerPaused.delete(id); }
+
+// প্রতি tick এ ডাকা হয় (auto মোডে)। অস্বাভাবিক হলে market pause করে।
+function _breakerOnTick(id, price, ctrlMode) {
+  if (!BREAKER_ENABLED) return;
+  // শুধু auto — manual/trade-based এ দাম ইচ্ছাকৃত, পাহারা বন্ধ
+  if (ctrlMode && ctrlMode !== 'auto') { _breaker[id] && (_breaker[id].buf = []); return; }
+
+  const now = Date.now();
+  let b = _breaker[id];
+  if (!b) { b = _breaker[id] = { buf: [], lastPrice: price, lastMoveAt: now, lastTickAt: now, paused: false }; }
+
+  // ২. জমে যাওয়া — দাম বদলালে ঘড়ি রিসেট
+  if (price !== b.lastPrice) { b.lastMoveAt = now; b.lastPrice = price; }
+  b.lastTickAt = now;
+
+  if (b.paused) return;   // ইতিমধ্যে pause — admin আবার চালু করবে
+
+  // ১. দূরত্ব — ১০ মিনিটের জানালায় সর্বোচ্চ-সর্বনিম্ন
+  b.buf.push({ t: now, p: price });
+  while (b.buf.length && b.buf[0].t < now - BREAKER_WINDOW_MS) b.buf.shift();
+  let hi = -Infinity, lo = Infinity;
+  for (const x of b.buf) { if (x.p > hi) hi = x.p; if (x.p < lo) lo = x.p; }
+  if (lo > 0) {
+    const movePct = (hi - lo) / lo * 100;
+    if (movePct > _breakerLimitPct(id)) {
+      _breakerTrip(id, `price moved ${movePct.toFixed(2)}% in ${Math.round(BREAKER_WINDOW_MS/60000)} min (limit ${_breakerLimitPct(id).toFixed(2)}%)`);
+      return;
+    }
+  }
+
+  // ২. জমে যাওয়া
+  if (now - b.lastMoveAt > BREAKER_STALL_MS) {
+    _breakerTrip(id, `price frozen for ${Math.round((now - b.lastMoveAt)/1000)}s`);
+    return;
+  }
+}
+
+// আলাদা timer — tick একদম বন্ধ হয়ে গেলে _breakerOnTick ডাকাই হয় না,
+// তাই এটা বাইরে থেকে পাহারা দেয়।
+function _breakerCheckNoTick() {
+  if (!BREAKER_ENABLED) return;
+  const now = Date.now();
+  for (const id of _activeMarkets) {
+    if (_states[id]?.type !== 'otc') continue;
+    if ((_controls[id]?.mode || 'auto') !== 'auto') continue;
+    const b = _breaker[id];
+    if (!b || b.paused) continue;
+    if (now - b.lastTickAt > BREAKER_NOTICK_MS) {
+      _breakerTrip(id, `no ticks for ${Math.round((now - b.lastTickAt)/1000)}s`);
+    }
+  }
+}
+
+function _breakerTrip(id, reason) {
+  const b = _breaker[id] || (_breaker[id] = {});
+  if (b.paused) return;
+  b.paused = true;
+  b.reason = reason;
+  b.since  = Date.now();
+  _breakerPaused.add(id);
+  console.error(`[BREAKER] ${id} PAUSED — ${reason}`);
+
+  // markets/{id} এ pause চিহ্ন (Firestore) — user পাতা "unavailable" দেখায়
+  firestore.collection('markets').doc(id).set({
+    tradingPaused:     true,
+    pauseReason:       reason,
+    pausedAt:          admin.firestore.FieldValue.serverTimestamp(),
+    pauseAutoDetected: true,
+  }, { merge: true }).catch(e => console.error(`[BREAKER] ${id} markets write failed:`, e.message));
+
+  // admin notification — notifications collection (admin panel পড়ে)
+  firestore.collection('notifications').add({
+    type:      'market_paused',
+    severity:  'critical',
+    symbol:    id,
+    title:     `⚠ Market auto-paused: ${id}`,
+    message:   `${id} trading was automatically paused. Reason: ${reason}. Review and resume from Markets.`,
+    reason:    reason,
+    read:      false,
+    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+  }).catch(e => console.error(`[BREAKER] ${id} notification failed:`, e.message));
+}
+
+// admin "resume" করলে ডাকা হয় (নিচে /admin/resume-market route থেকে)
+function _breakerResume(id) {
+  _breakerReset(id);
+  firestore.collection('markets').doc(id).set({
+    tradingPaused:     false,
+    pauseReason:       admin.firestore.FieldValue.delete(),
+    pausedAt:          admin.firestore.FieldValue.delete(),
+    pauseAutoDetected: admin.firestore.FieldValue.delete(),
+    resumedAt:         admin.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true }).catch(e => console.error(`[BREAKER] ${id} resume write failed:`, e.message));
+  console.log(`[BREAKER] ${id} RESUMED by admin`);
+}
+
+setInterval(_breakerCheckNoTick, 15000);   // প্রতি ১৫s এ tick-খরা দেখা
+
 // ── NOWPayments crypto currencies cache ──
 let _cryptoCurrenciesCache = null;
 let _cryptoCurrenciesCacheTime = 0;
@@ -2019,6 +2154,9 @@ function tickOTC(id) {
   // দুটোই এই একই history থেকে resolve হবে।
   tickHistory.recordTick(id, state._eng.tickId, Date.now(), state.price);
 
+  // [BREAKER] অস্বাভাবিক market পাহারা (auto মোডে) — pause করলে নিচে আর কিছু নয়
+  _breakerOnTick(id, state.price, ctrl.mode || 'auto');
+
   _tickTail(id, state);
 }
 
@@ -2364,6 +2502,7 @@ function stopSymbol(id) {
   if (!_activeMarkets.has(id)) return;
   _activeMarkets.delete(id);
   delete _states[id]; delete _controls[id]; delete _forexPrices[id]; delete _tradeStats[id];
+  _breakerReset(id);   // [BREAKER] market সরে গেলে পাহারার মেমোরিও পরিষ্কার
   delete _openPrice24h[id];
   db.ref(`otc_candles/${id}/live`).set(null).catch(()=>{});
   for (const { label } of SUB_INTERVALS) {
@@ -2886,6 +3025,14 @@ http.createServer(async (req, res) => {
         res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid trade data' })); return;
       }
 
+      // [BREAKER] এই market নিজে থেকে pause হয়ে থাকলে নতুন ট্রেড নেওয়া হবে না।
+      // ট্রেড server দিয়েই খোলে, তাই এখানে আটকালে কেউ পাশ কাটাতে পারে না।
+      if (_breakerPaused.has(trade.symbol)) {
+        res.writeHead(423);
+        res.end(JSON.stringify({ error: 'market_paused', message: 'This market is temporarily unavailable. Please try again shortly.' }));
+        return;
+      }
+
       // ── [SECURITY] entry price server এর engine থেকে ─────────────────
       // আগে client এর পাঠানো entryPrice সরাসরি বসত — browser এর কোড বদলে
       // যেকেউ নিজের পছন্দমতো দাম পাঠিয়ে প্রায় নিশ্চিত জেতা trade বানাতে
@@ -3388,6 +3535,28 @@ http.createServer(async (req, res) => {
 
   // ── POST /admin-credit ───────────────────────────────────
   // Admin panel থেকে deposit approve বা withdrawal reject করলে call হয়।
+  // ── POST /admin/resume-market — breaker-paused market আবার চালু (admin only) ──
+  if (req.method === 'POST' && req.url === '/admin/resume-market') {
+    try {
+      let body;
+      try { body = await _readBody(req); }
+      catch(e) { res.writeHead(400); res.end(JSON.stringify({ error: 'Invalid body' })); return; }
+      const { idToken, symbol } = body;
+      if (!idToken) { res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
+      let decoded;
+      try { decoded = await admin.auth().verifyIdToken(idToken); }
+      catch(e) { res.writeHead(401); res.end(JSON.stringify({ error: 'Unauthorized' })); return; }
+      if (!decoded.admin) { res.writeHead(403); res.end(JSON.stringify({ error: 'Forbidden — admin only' })); return; }
+      if (!symbol) { res.writeHead(400); res.end(JSON.stringify({ error: 'Missing symbol' })); return; }
+      _breakerResume(symbol);
+      res.writeHead(200); res.end(JSON.stringify({ success: true, symbol }));
+    } catch (e) {
+      console.error('[BREAKER] resume route error:', e.message);
+      res.writeHead(500); res.end(JSON.stringify({ error: 'Internal error' }));
+    }
+    return;
+  }
+
   // adminSecret নেই — Firebase idToken + admin custom claim verify করা হয়।
   if (req.method === 'POST' && req.url === '/admin-credit') {
     try {
