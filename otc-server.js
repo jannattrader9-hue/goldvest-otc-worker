@@ -2516,6 +2516,14 @@ function watchFirestoreMarkets() {
     snap.docChanges().forEach(async change => {
       const data = change.doc.data(), id = change.doc.id;
       if (change.type === 'added' || change.type === 'modified') {
+        // [BREAKER] admin Firestore এ tradingPaused:false করলে — মেমোরির
+        // pause ছেড়ে market আবার স্বাভাবিক পাহারায় ফেরে। (Firestore এর
+        // merge লেখা _breakerTrip/_breakerResume নিজেও করে; এটা admin এর
+        // সরাসরি resume লেখা ধরার জন্য।)
+        if (data.tradingPaused === false && _breakerPaused.has(id)) {
+          _breakerReset(id);
+          console.log(`[BREAKER] ${id} RESUMED via markets doc (admin)`);
+        }
         if (data.visible === false) { stopSymbol(id); return; }
         if (data.feed === 'twelvedata') await initForex(id);
         else if (data.otc || data.feed === 'otc-engine' || data.feed === 'usdtbdt-engine')
