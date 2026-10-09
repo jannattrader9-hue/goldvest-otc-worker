@@ -143,6 +143,9 @@ function _breakerTrip(id, reason) {
     read:      false,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   }).catch(e => console.error(`[BREAKER] ${id} notification failed:`, e.message));
+
+  // চলমান ট্রেডগুলো সাথে সাথে refund — কেউ যেন ঝুলে না থাকে
+  _breakerRefundOpenTrades(id);
 }
 
 // admin "resume" করলে ডাকা হয় (নিচে /admin/resume-market route থেকে)
@@ -159,6 +162,52 @@ function _breakerResume(id) {
 }
 
 setInterval(_breakerCheckNoTick, 15000);   // প্রতি ১৫s এ tick-খরা দেখা
+
+// [BREAKER REFUND] market pause হলে ওই market এর সব চলমান (live) ট্রেড
+// সাথে সাথে refund — জয়/হার হিসাব নয়, শুধু যা কাটা হয়েছিল তা ফেরত।
+// কৌশল: ট্রেডগুলো closePrice = entryPrice দিয়ে settler এ পাঠাই। settler
+// এ entry==close মানে "tie" → refund (trade.amount ফেরত)। এতে নতুন কোনো
+// credit-পথ বানাতে হয় না, আর settler এর atomic claim (gvClaimTrade)
+// থাকায় একই ট্রেড দুবার refund হয় না — settler আগে ধরলে এখান থেকে skip,
+// এখান থেকে আগে গেলে settler skip। refunded ট্রেড history তে "refunded"
+// দেখায়, যা trading rules 7.2 এর সাথে মেলে।
+async function _breakerRefundOpenTrades(symbol) {
+  try {
+    const snap = await db.ref('settlement_queue').once('value');
+    if (!snap.exists()) return;
+    const refunds = [];
+    snap.forEach(timeNode => {
+      const expiryTimestamp = parseInt(timeNode.key);
+      timeNode.forEach(userNode => {
+        const userId = userNode.key;
+        userNode.forEach(tradeNode => {
+          const t = tradeNode.val();
+          if (t.symbol !== symbol) return;
+          if (t.accountType !== 'live') return;
+          const entry = (t.entryPrice && t.entryPrice > 0) ? t.entryPrice
+                        : (_states[symbol]?.price || 0);
+          refunds.push({
+            userId, tradeId: tradeNode.key,
+            closePrice: entry, preAdjusted: true,   // settler দাম আবার খুঁজবে না
+            type: t.type || '', amount: t.amount || 0,
+            expiryTimestamp, expiryTimestampMs: t.expiryTimestampMs || 0,
+          });
+        });
+      });
+    });
+    if (refunds.length === 0) { console.log(`[BREAKER] ${symbol} — কোনো চলমান ট্রেড নেই`); return; }
+
+    console.log(`[BREAKER] ${symbol} — ${refunds.length}টি চলমান ট্রেড refund করা হচ্ছে`);
+    // settler এর একই পথে পাঠাই (closePrice=entry → tie → refund)
+    await _batchSettleAndBroadcast(symbol, refunds, refunds[0].closePrice);
+    // queue থেকে মুছে দিই, যাতে পরে আবার settle না হয়
+    await Promise.allSettled(refunds.map(t =>
+      db.ref(`settlement_queue/${t.expiryTimestamp}/${t.userId}/${t.tradeId}`).remove()
+    ));
+  } catch (e) {
+    console.error(`[BREAKER] ${symbol} refund failed:`, e.message);
+  }
+}
 
 // ── NOWPayments crypto currencies cache ──
 let _cryptoCurrenciesCache = null;
