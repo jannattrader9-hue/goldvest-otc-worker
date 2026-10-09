@@ -932,6 +932,14 @@ async function _settleDueTradesFromRTDB() {
           if (t.accountType !== 'live') return;
           const key = `${userId}/${tradeNode.key}`;
           if (_rtdbSettledKeys.has(key)) return;
+          // [DUP GUARD] memory/candle path এই trade এইমাত্র settle করেছে বা
+          // করছে (তারা _pendingSettle এ বসায়)। RTDB থেকে queue মোছার আগের
+          // পুরনো snapshot এলে একই trade দ্বিতীয়বার push হতো — log এ
+          // [tick-settle] এর ~৮s পর [rtdb-tick-settle] অন্য closePrice নিয়ে।
+          // settler এর lock দ্বিতীয়টা ফেলে দিত, তাই টাকার ক্ষতি ছিল না,
+          // কিন্তু কাজ দুবার হতো। ৩০s পর pending মুছে যায়, তখনো queue তে
+          // থাকলে (আসলেই হারানো trade) এই path উদ্ধার করবে।
+          if (_pendingSettle.has(key)) return;
           if (_candleSettlingSymbols.has(t.symbol)) return;
           const state = _states[t.symbol];
           if (!state || typeof state.price !== 'number') return;
