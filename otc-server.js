@@ -1726,7 +1726,7 @@ const _MARKET_DECIMALS = {
   // [USD/INR, USD/MXN — সঠিক দিকে] পুরনো INRUSDOTC/MXNUSDOTC আসলে উল্টো
   // (INR/USD ≈ ০.০১১) ছিল — এত ছোট দামে ৫ ঘরে পা এক pip ও হতো না, তাই
   // দাম ৩০s+ জমে থাকত। সঠিক দিকে দাম ~৮৮ / ~১৮, তাই স্বাভাবিক নড়ে।
-  USDINROTC: 3, USDMXNOTC: 4,
+  USDINROTC: 4, USDMXNOTC: 4,   // INR ৪ ঘর — Quotex এর USD/INR (OTC) এর সাথে মিল (user এর screenshot: 104.9281)
 
   // ── Binance feed (real crypto) ────────────────────────────────
   // এগুলোর দাম Binance থেকে আসে, তাই ঘরও Binance এর tickSize
